@@ -40053,6 +40053,40 @@ async fn test_diff_review_button_shown_when_ai_enabled(cx: &mut TestAppContext) 
     });
 }
 
+#[gpui::test]
+async fn test_stack_review_mode_is_editor_local(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "file.txt": "hello\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace");
+    let cx = &mut VisualTestContext::from_window(*window, cx);
+    let editor = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(
+                PathBuf::from(path!("/root/file.txt")),
+                OpenOptions::default(),
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("open file")
+        .downcast::<Editor>()
+        .expect("editor");
+
+    editor.update(cx, |editor, cx| {
+        assert!(!editor.is_stack_review());
+        editor.set_stack_review_mode(true, cx);
+        assert!(editor.is_stack_review());
+        assert!(!editor.lsp_data_enabled());
+    });
+}
+
 /// Helper function to create a DiffHunkKey for testing.
 /// Uses Anchor::Min as a placeholder anchor since these tests don't need
 /// real buffer positioning.
@@ -40306,6 +40340,138 @@ fn test_diff_review_overlay_dismiss_via_cancel(cx: &mut TestAppContext) {
     editor
         .update(cx, |editor, _window, _cx| {
             assert!(editor.diff_review_overlays.is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_stack_review_cancel_keeps_overlays_with_saved_comments(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let overlay = editor.diff_review_overlays.first().expect("review overlay");
+            let hunk_key = overlay.hunk_key.clone();
+            let anchor_range = overlay.anchor_range.clone();
+            editor.add_review_comment(hunk_key, "Keep this visible".into(), anchor_range, cx);
+            editor.set_stack_review_mode(true, cx);
+            editor.dismiss_menus_and_popups(true, window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert!(!editor.diff_review_overlays[0].composer_visible);
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            assert_eq!(
+                editor.hunk_comment_count(&editor.diff_review_overlays[0].hunk_key, &snapshot),
+                1
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_stack_review_submit_keeps_comment_inline_and_hides_composer(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.set_stack_review_mode(true, cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Persist inline", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            assert!(!editor.diff_review_overlays[0].composer_visible);
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            let comments =
+                editor.comments_for_hunk(&editor.diff_review_overlays[0].hunk_key, &snapshot);
+            assert_eq!(comments[0].comment, "Persist inline");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_stack_review_reply_persists_parent_and_author(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.set_stack_review_mode(true, cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Parent", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            editor.reply_to_review_comment(
+                &crate::actions::ReplyToReviewComment { id: 0 },
+                window,
+                cx,
+            );
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Reply", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            editor.reply_to_review_comment(
+                &crate::actions::ReplyToReviewComment { id: 1 },
+                window,
+                cx,
+            );
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Nested reply", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+        })
+        .unwrap();
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            let comments = &editor.stored_review_comments[0].1;
+            assert_eq!(comments.len(), 3);
+            assert_eq!(comments[0].author.name, "You");
+            assert_eq!(comments[0].reply_to, None);
+            assert_eq!(comments[1].author.name, "You");
+            assert_eq!(comments[1].reply_to, Some(0));
+            assert_eq!(comments[2].author.name, "You");
+            assert_eq!(comments[2].reply_to, Some(1));
+
+            let items = crate::git::stack_review_thread_items(comments.clone(), Some(1));
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        crate::git::StackReviewThreadItem::Comment { comment, depth } => {
+                            format!("comment:{}:{depth}", comment.id)
+                        }
+                        crate::git::StackReviewThreadItem::Composer { depth } => {
+                            format!("composer:{depth}")
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                ["comment:0:0", "comment:1:1", "composer:2", "comment:2:2"]
+            );
         })
         .unwrap();
 }
@@ -40857,7 +41023,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         };
 
         // No comments: base height of 2
-        let height_no_comments = editor.calculate_overlay_height(&key, true, &snapshot);
+        let height_no_comments = editor.calculate_overlay_height(&key, true, true, &snapshot);
         assert_eq!(
             height_no_comments, 2,
             "Base height should be 2 with no comments"
@@ -40869,7 +41035,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
 
         // With comments expanded: base (2) + header (1) + 2 per comment
-        let height_expanded = editor.calculate_overlay_height(&key, true, &snapshot);
+        let height_expanded = editor.calculate_overlay_height(&key, true, true, &snapshot);
         assert_eq!(
             height_expanded,
             2 + 1 + 2, // base + header + 1 comment * 2
@@ -40877,7 +41043,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         );
 
         // With comments collapsed: base (2) + header (1)
-        let height_collapsed = editor.calculate_overlay_height(&key, false, &snapshot);
+        let height_collapsed = editor.calculate_overlay_height(&key, false, true, &snapshot);
         assert_eq!(
             height_collapsed,
             2 + 1, // base + header only
@@ -40891,7 +41057,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
 
         // With 3 comments expanded
-        let height_3_expanded = editor.calculate_overlay_height(&key, true, &snapshot);
+        let height_3_expanded = editor.calculate_overlay_height(&key, true, true, &snapshot);
         assert_eq!(
             height_3_expanded,
             2 + 1 + (3 * 2), // base + header + 3 comments * 2
@@ -40899,11 +41065,39 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         );
 
         // Collapsed height stays the same regardless of comment count
-        let height_3_collapsed = editor.calculate_overlay_height(&key, false, &snapshot);
+        let height_3_collapsed = editor.calculate_overlay_height(&key, false, true, &snapshot);
         assert_eq!(
             height_3_collapsed,
             2 + 1, // base + header only
             "Height with 3 comments collapsed should be same as 1 comment collapsed"
+        );
+
+        editor.add_review_comment(
+            key.clone(),
+            "First line\nSecond line\nThird line".to_string(),
+            anchor..anchor,
+            cx,
+        );
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(
+            editor.calculate_overlay_height(&key, true, false, &snapshot),
+            1 + (3 * 2) + 4,
+            "Multiline comments must reserve one body line per explicit line"
+        );
+
+        let height_before_long_comment =
+            editor.calculate_overlay_height(&key, true, false, &snapshot);
+        editor.add_review_comment(
+            key.clone(),
+            "A long external review comment that must wrap across several visual lines instead of overlapping the next editor row. ".repeat(4),
+            anchor..anchor,
+            cx,
+        );
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert!(
+            editor.calculate_overlay_height(&key, true, false, &snapshot)
+                >= height_before_long_comment + 8,
+            "Soft-wrapped comments must reserve conservative visual-line space"
         );
     });
 }

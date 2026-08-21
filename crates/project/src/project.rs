@@ -4811,6 +4811,28 @@ impl Project {
         self.worktree_store.read(cx).find_worktree(abs_path, cx)
     }
 
+    pub fn historic_file_for_absolute_path(
+        &self,
+        abs_path: &Path,
+        was_deleted: bool,
+        cx: &App,
+    ) -> Option<Arc<dyn language::File>> {
+        let (worktree, path) = self.find_worktree(abs_path, cx)?;
+        let (entry_id, is_private) = worktree
+            .read(cx)
+            .entry_for_path(&path)
+            .map(|entry| (Some(entry.id), entry.is_private))
+            .unwrap_or((None, false));
+        Some(Arc::new(File {
+            is_local: worktree.read(cx).is_local(),
+            worktree,
+            path,
+            disk_state: DiskState::Historic { was_deleted },
+            entry_id,
+            is_private,
+        }))
+    }
+
     pub fn is_shared(&self) -> bool {
         match &self.client_state {
             ProjectClientState::Shared { .. } => true,

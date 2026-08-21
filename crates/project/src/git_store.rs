@@ -8792,6 +8792,71 @@ impl Repository {
         })
     }
 
+    pub fn inspect_stack_ancestry(
+        &mut self,
+        snapshot: git::stack_review::StackSnapshot,
+    ) -> oneshot::Receiver<Result<Vec<git::stack_review::StackLayerAncestry>>> {
+        self.send_job(
+            "inspect_stack_ancestry",
+            None,
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        git::stack_review::inspect_stack_ancestry(backend.as_ref(), &snapshot).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        bail!("stack review is only available for local repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn stack_review_diff(
+        &mut self,
+        base_ref: String,
+        head_ref: String,
+    ) -> oneshot::Receiver<Result<git::stack_review::StackReviewDiff>> {
+        self.send_job("stack_review_diff", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    git::stack_review::load_stack_diff(backend.as_ref(), &base_ref, &head_ref).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("stack review is only available for local repositories")
+                }
+            }
+        })
+    }
+
+    pub fn stack_review_diff_since(
+        &mut self,
+        base_ref: String,
+        head_ref: String,
+        author_timestamp: i64,
+    ) -> oneshot::Receiver<Result<git::stack_review::StackReviewDiff>> {
+        self.send_job(
+            "stack_review_diff_since",
+            None,
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        git::stack_review::load_stack_diff_since(
+                            backend.as_ref(),
+                            &base_ref,
+                            &head_ref,
+                            author_timestamp,
+                        )
+                        .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        bail!("stack review is only available for local repositories")
+                    }
+                }
+            },
+        )
+    }
+
     pub fn diff_tree(
         &mut self,
         diff_type: DiffTreeType,

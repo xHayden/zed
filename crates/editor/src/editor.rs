@@ -988,6 +988,7 @@ pub struct Editor {
     show_bookmarks: Option<bool>,
     show_breakpoints: Option<bool>,
     show_diff_review_button: bool,
+    is_stack_review: bool,
     show_wrap_guides: Option<bool>,
     show_indent_guides: Option<bool>,
     buffers_with_disabled_indent_guides: HashSet<BufferId>,
@@ -2307,6 +2308,7 @@ impl Editor {
             show_bookmarks: None,
             show_breakpoints: None,
             show_diff_review_button: false,
+            is_stack_review: false,
             show_wrap_guides: None,
             show_indent_guides,
             buffers_with_disabled_indent_guides: HashSet::default(),
@@ -3368,8 +3370,12 @@ impl Editor {
             dismissed = true;
         }
         if !self.diff_review_overlays.is_empty() {
-            self.dismiss_all_diff_review_overlays(cx);
-            dismissed = true;
+            if self.is_stack_review {
+                dismissed |= self.dismiss_stack_review_comment_composers(window, cx);
+            } else {
+                self.dismiss_all_diff_review_overlays(cx);
+                dismissed = true;
+            }
         }
 
         if self.mode.is_full() && self.has_active_diagnostic_group() {

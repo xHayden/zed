@@ -1,3 +1,7 @@
+## Experimental Stack Review
+
+This fork adds a local, read-only stacked-branch review view that compares frozen Git objects, excludes merge-only files, and never checks out or mutates refs. Add `"feature_flags": { "stack-review": "on" }` to Zed's settings, build with `cargo build -p zed --features gpui_platform/runtime_shaders`, and launch `./target/debug/zed /path/to/repository`. On a checked-out stack branch, run `git: review stack` from the command palette, then choose immutable **From** and **To** boundaries or use the Whole Stack and Current PR shortcuts. Stack topology and GitHub comments are discovered once when needed and cached under `.git/zed-stack-review/`; file inventory, diffs, filtering, and navigation use local Git objects.
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

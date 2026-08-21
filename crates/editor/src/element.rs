@@ -521,6 +521,7 @@ impl EditorElement {
         register_action(editor, window, Editor::submit_diff_review_comment_action);
         register_action(editor, window, Editor::edit_review_comment);
         register_action(editor, window, Editor::delete_review_comment);
+        register_action(editor, window, Editor::reply_to_review_comment);
         register_action(editor, window, Editor::confirm_edit_review_comment_action);
         register_action(editor, window, Editor::cancel_edit_review_comment_action);
         register_action(editor, window, Editor::go_to_previous_change);
@@ -2541,7 +2542,7 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         cx: &App,
     ) -> Option<(DisplayRow, Option<u32>)> {
-        if !cx.has_flag::<DiffReviewFeatureFlag>() {
+        if !self.editor.read(cx).is_stack_review() && !cx.has_flag::<DiffReviewFeatureFlag>() {
             return None;
         }
 

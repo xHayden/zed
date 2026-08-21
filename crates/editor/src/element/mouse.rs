@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use collections::HashMap;
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
+
 use gpui::{
     AnyElement, App, AvailableSpace, ClickEvent, Context, DefiniteLength, DispatchPhase, Element,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
@@ -112,13 +113,14 @@ impl EditorElement {
             }
         }
 
-        // Handle diff review indicator when gutter is hovered in diff mode with AI enabled
+        // Stack Review comments are local; the legacy diff-review path remains AI-gated.
         let show_diff_review = editor.show_diff_review_button()
-            && cx.has_flag::<DiffReviewFeatureFlag>()
-            && !DisableAiSettings::is_ai_disabled_for_buffer(
-                editor.buffer.read(cx).as_singleton().as_ref(),
-                cx,
-            );
+            && (editor.is_stack_review()
+                || (cx.has_flag::<DiffReviewFeatureFlag>()
+                    && !DisableAiSettings::is_ai_disabled_for_buffer(
+                        editor.buffer.read(cx).as_singleton().as_ref(),
+                        cx,
+                    )));
 
         let diff_review_indicator = if gutter_hovered && show_diff_review {
             let is_visible = editor

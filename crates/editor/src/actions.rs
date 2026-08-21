@@ -1007,6 +1007,14 @@ pub struct DeleteReviewComment {
     pub id: usize,
 }
 
+/// Replies to a stored review comment.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyToReviewComment {
+    pub id: usize,
+}
+
 /// Confirms an inline edit of a review comment.
 #[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
 #[action(namespace = editor)]

@@ -228,6 +228,17 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_stack_review_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.is_stack_review = enabled;
+        if enabled {
+            self.enable_lsp_data = false;
+            self.needs_initial_data_update = false;
+            self.enable_runnables = false;
+            self.enable_code_lens = false;
+        }
+        cx.notify();
+    }
+
     fn set_show_scrollbars(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_scrollbars = ScrollbarAxes {
             horizontal: show,

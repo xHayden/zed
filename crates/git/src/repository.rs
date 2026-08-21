@@ -552,6 +552,27 @@ pub struct CommitFile {
     pub is_binary: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevisionContent {
+    Text(String),
+    Binary,
+    NonBlob(String),
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct StackReviewContentRequest {
+    pub path: RepoPath,
+    pub old_oid: Option<Oid>,
+    pub include_new: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct StackReviewFileContent {
+    pub old: Option<RevisionContent>,
+    pub new: Option<RevisionContent>,
+}
+
 impl CommitFile {
     pub fn status(&self) -> CommitFileStatus {
         match (&self.old_text, &self.new_text) {
@@ -768,6 +789,57 @@ pub trait GitRepository: Send + Sync {
     }
     fn load_blob_content(&self, oid: Oid) -> BoxFuture<'_, Result<String>>;
 
+    fn stack_review_load_oid_content(&self, oid: Oid) -> BoxFuture<'_, RevisionContent> {
+        async move {
+            match self.load_blob_content(oid).await {
+                Ok(text) => RevisionContent::Text(text),
+                Err(error) => RevisionContent::Unavailable(error.to_string()),
+            }
+        }
+        .boxed()
+    }
+
+    fn stack_review_load_path_content(
+        &self,
+        _head_ref: String,
+        _path: RepoPath,
+    ) -> BoxFuture<'_, RevisionContent> {
+        async move {
+            RevisionContent::Unavailable(
+                "path content is unavailable for this Git backend".to_owned(),
+            )
+        }
+        .boxed()
+    }
+
+    fn stack_review_load_contents(
+        &self,
+        head_ref: String,
+        requests: Vec<StackReviewContentRequest>,
+    ) -> BoxFuture<'_, Result<Vec<StackReviewFileContent>>> {
+        async move {
+            let mut contents = Vec::with_capacity(requests.len());
+            for request in requests {
+                let old = if let Some(oid) = request.old_oid {
+                    Some(self.stack_review_load_oid_content(oid).await)
+                } else {
+                    None
+                };
+                let new = if request.include_new {
+                    Some(
+                        self.stack_review_load_path_content(head_ref.clone(), request.path.clone())
+                            .await,
+                    )
+                } else {
+                    None
+                };
+                contents.push(StackReviewFileContent { old, new });
+            }
+            Ok(contents)
+        }
+        .boxed()
+    }
+
     fn set_index_text(
         &self,
         path: RepoPath,
@@ -807,6 +879,42 @@ pub trait GitRepository: Send + Sync {
 
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>>;
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>>;
+
+    fn stack_review_diff_tree(
+        &self,
+        base_ref: String,
+        head_ref: String,
+    ) -> BoxFuture<'_, Result<TreeDiff>> {
+        self.diff_tree(DiffTreeType::MergeBase {
+            base: base_ref.into(),
+            head: head_ref.into(),
+        })
+    }
+
+    fn stack_review_resolve_revision(&self, revision: String) -> BoxFuture<'_, Result<String>> {
+        let result = self.revparse_batch(vec![revision.clone()]);
+        async move {
+            result
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .with_context(|| format!("missing Git revision {revision:?}"))
+        }
+        .boxed()
+    }
+
+    fn first_parent_commits(
+        &self,
+        _base_ref: String,
+        _head_ref: String,
+    ) -> BoxFuture<'_, Result<Vec<crate::stack_review::FirstParentCommit>>> {
+        async move { bail!("first-parent history is unavailable for this repository") }.boxed()
+    }
+
+    fn is_ancestor(&self, _base_ref: String, _head_ref: String) -> BoxFuture<'_, Result<bool>> {
+        async move { bail!("ancestry checks are unavailable for this repository") }.boxed()
+    }
 
     fn stash_entries(&self) -> BoxFuture<'static, Result<GitStash>>;
 
@@ -1341,6 +1449,140 @@ impl GitRepository for RealGitRepository {
         self.common_dir.clone()
     }
 
+    fn stack_review_diff_tree(
+        &self,
+        base_ref: String,
+        head_ref: String,
+    ) -> BoxFuture<'_, Result<TreeDiff>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .build_command(&[
+                        "diff-tree",
+                        "-r",
+                        "-z",
+                        "--abbrev=64",
+                        "--no-renames",
+                        "--merge-base",
+                        &base_ref,
+                        &head_ref,
+                    ])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git diff-tree failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8_lossy(&output.stdout).parse()
+            })
+            .boxed()
+    }
+
+    fn stack_review_resolve_revision(&self, revision: String) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .build_command(&["rev-parse", "--verify", &revision])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "missing Git revision {revision:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            })
+            .boxed()
+    }
+
+    fn first_parent_commits(
+        &self,
+        base_ref: String,
+        head_ref: String,
+    ) -> BoxFuture<'_, Result<Vec<crate::stack_review::FirstParentCommit>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let range = format!("{base_ref}..{head_ref}");
+                let output = git
+                    .build_command(&[
+                        "log",
+                        "--first-parent",
+                        "--reverse",
+                        "--diff-merges=first-parent",
+                        "--no-renames",
+                        "--name-only",
+                        "-z",
+                        "--format=%x1e%H%x00%at%x00%P%x00",
+                        &range,
+                    ])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git log failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let output = String::from_utf8(output.stdout)?;
+                output
+                    .split('\x1e')
+                    .map(|record| record.trim_start_matches('\n'))
+                    .filter(|record| !record.is_empty())
+                    .map(|record| {
+                        let mut fields = record.split('\0');
+                        let oid = fields.next().with_context(|| {
+                            format!("missing oid in first-parent row {record:?}")
+                        })?;
+                        let timestamp = fields.next().with_context(|| {
+                            format!("missing timestamp in first-parent row {record:?}")
+                        })?;
+                        let parents = fields.next().with_context(|| {
+                            format!("missing parents in first-parent row {record:?}")
+                        })?;
+                        let paths = fields
+                            .map(|path| path.trim_matches('\n'))
+                            .filter(|path| !path.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                        Ok(crate::stack_review::FirstParentCommit {
+                            oid: oid.to_owned(),
+                            author_timestamp: timestamp.parse()?,
+                            is_merge: parents.split_whitespace().count() > 1,
+                            paths,
+                        })
+                    })
+                    .collect()
+            })
+            .boxed()
+    }
+
+    fn is_ancestor(&self, base_ref: String, head_ref: String) -> BoxFuture<'_, Result<bool>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .build_command(&["merge-base", "--is-ancestor", &base_ref, &head_ref])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .output()
+                    .await?;
+                match output.status.code() {
+                    Some(0) => Ok(true),
+                    Some(1) => Ok(false),
+                    _ => anyhow::bail!(
+                        "git merge-base failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                }
+            })
+            .boxed()
+    }
+
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
         let git = self.git_binary();
         self.executor
@@ -1546,6 +1788,168 @@ impl GitRepository for RealGitRepository {
         let oid_str = oid.to_string();
         self.executor
             .spawn(async move { git_binary.run_raw(&["cat-file", "blob", &oid_str]).await })
+            .boxed()
+    }
+
+    fn stack_review_load_oid_content(&self, oid: Oid) -> BoxFuture<'_, RevisionContent> {
+        let git = self.git_binary();
+        let oid = oid.to_string();
+        self.executor
+            .spawn(async move {
+                load_stack_review_object(git, oid, None)
+                    .await
+                    .unwrap_or_else(|error| RevisionContent::Unavailable(error.to_string()))
+            })
+            .boxed()
+    }
+
+    fn stack_review_load_path_content(
+        &self,
+        head_ref: String,
+        path: RepoPath,
+    ) -> BoxFuture<'_, RevisionContent> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let result: Result<RevisionContent> = async {
+                    let args = [
+                        OsString::from("ls-tree"),
+                        OsString::from("-z"),
+                        OsString::from(&head_ref),
+                        OsString::from("--"),
+                        OsString::from(path.as_unix_str()),
+                    ];
+                    let output = git
+                        .build_command(&args)
+                        .env("GIT_NO_LAZY_FETCH", "1")
+                        .env("GIT_LITERAL_PATHSPECS", "1")
+                        .output()
+                        .await?;
+                    if !output.status.success() || output.stdout.is_empty() {
+                        return Ok(RevisionContent::Unavailable(format!(
+                            "content is unavailable locally at {head_ref:?}"
+                        )));
+                    }
+                    let record = output
+                        .stdout
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .unwrap_or_default();
+                    let tab = record
+                        .iter()
+                        .position(|byte| *byte == b'\t')
+                        .context("invalid git ls-tree record")?;
+                    let header = std::str::from_utf8(&record[..tab])?;
+                    let mut fields = header.split_whitespace();
+                    let _mode = fields.next().context("missing ls-tree mode")?;
+                    let object_type = fields.next().context("missing ls-tree object type")?;
+                    let oid = fields.next().context("missing ls-tree object id")?;
+                    load_stack_review_object(git, oid.to_owned(), Some(object_type.to_owned()))
+                        .await
+                }
+                .await;
+                result.unwrap_or_else(|error| RevisionContent::Unavailable(error.to_string()))
+            })
+            .boxed()
+    }
+
+    fn stack_review_load_contents(
+        &self,
+        head_ref: String,
+        requests: Vec<StackReviewContentRequest>,
+    ) -> BoxFuture<'_, Result<Vec<StackReviewFileContent>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let mut path_oids = HashMap::<String, Oid>::default();
+                const MAX_PATHSPEC_BYTES: usize = 128 * 1024;
+                let mut path_chunks = vec![Vec::<OsString>::new()];
+                let mut current_chunk_bytes = 0usize;
+                for request in requests.iter().filter(|request| request.include_new) {
+                    let path = OsString::from(request.path.as_unix_str());
+                    let path_bytes = request.path.as_unix_str().len().saturating_add(1);
+                    if current_chunk_bytes > 0
+                        && current_chunk_bytes.saturating_add(path_bytes) > MAX_PATHSPEC_BYTES
+                    {
+                        path_chunks.push(Vec::new());
+                        current_chunk_bytes = 0;
+                    }
+                    current_chunk_bytes = current_chunk_bytes.saturating_add(path_bytes);
+                    if let Some(chunk) = path_chunks.last_mut() {
+                        chunk.push(path);
+                    }
+                }
+                for paths in path_chunks.into_iter().filter(|paths| !paths.is_empty()) {
+                    let mut args = vec![
+                        OsString::from("ls-tree"),
+                        OsString::from("-r"),
+                        OsString::from("-z"),
+                        OsString::from(&head_ref),
+                        OsString::from("--"),
+                    ];
+                    args.extend(paths);
+                    let output = git
+                        .build_command(&args)
+                        .env("GIT_NO_LAZY_FETCH", "1")
+                        .env("GIT_LITERAL_PATHSPECS", "1")
+                        .output()
+                        .await?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "git ls-tree failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    for record in output.stdout.split(|byte| *byte == 0) {
+                        if record.is_empty() {
+                            continue;
+                        }
+                        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                            continue;
+                        };
+                        let header = std::str::from_utf8(&record[..tab])?;
+                        let path = std::str::from_utf8(&record[tab + 1..])?;
+                        let Some(oid) = header.split_whitespace().nth(2) else {
+                            continue;
+                        };
+                        path_oids.insert(path.to_owned(), oid.parse()?);
+                    }
+                }
+
+                let mut object_oids = HashSet::new();
+                for request in &requests {
+                    if let Some(oid) = request.old_oid {
+                        object_oids.insert(oid);
+                    }
+                    if request.include_new
+                        && let Some(oid) = path_oids.get(request.path.as_unix_str())
+                    {
+                        object_oids.insert(*oid);
+                    }
+                }
+                let mut object_oids = object_oids.into_iter().collect::<Vec<_>>();
+                object_oids.sort_by_cached_key(ToString::to_string);
+                let object_contents = load_stack_review_objects(git, object_oids).await?;
+                Ok(requests
+                    .into_iter()
+                    .map(|request| {
+                        let old = request
+                            .old_oid
+                            .and_then(|oid| object_contents.get(&oid).cloned());
+                        let new = request.include_new.then(|| {
+                            path_oids
+                                .get(request.path.as_unix_str())
+                                .and_then(|oid| object_contents.get(oid))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    RevisionContent::Unavailable(format!(
+                                        "content is unavailable locally at {head_ref:?}"
+                                    ))
+                                })
+                        });
+                        StackReviewFileContent { old, new }
+                    })
+                    .collect())
+            })
             .boxed()
     }
 
@@ -3843,6 +4247,191 @@ impl GitBinary {
     }
 }
 
+const STACK_REVIEW_BINARY_SAMPLE_BYTES: usize = 8_000;
+const STACK_REVIEW_MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const STACK_REVIEW_MAX_TOTAL_TEXT_BYTES: usize = 64 * 1024 * 1024;
+
+async fn discard_stack_review_bytes<R: smol::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    mut remaining: usize,
+) -> Result<()> {
+    let mut buffer = vec![0; 64 * 1024];
+    while remaining > 0 {
+        let read_length = remaining.min(buffer.len());
+        reader.read_exact(&mut buffer[..read_length]).await?;
+        remaining -= read_length;
+    }
+    Ok(())
+}
+
+async fn load_stack_review_objects(
+    git: GitBinary,
+    oids: Vec<Oid>,
+) -> Result<HashMap<Oid, RevisionContent>> {
+    if oids.is_empty() {
+        return Ok(HashMap::default());
+    }
+    let mut process = git
+        .build_command(&["cat-file", "--batch"])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = BufWriter::new(process.stdin.take().context("no git cat-file stdin")?);
+    for oid in &oids {
+        stdin.write_all(oid.to_string().as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+    }
+    stdin.flush().await?;
+    drop(stdin);
+
+    let mut stdout = BufReader::new(process.stdout.take().context("no git cat-file stdout")?);
+    let mut contents = HashMap::default();
+    let mut loaded_text_bytes = 0usize;
+    let mut header = String::new();
+    let mut newline = [0; 1];
+    for oid in oids {
+        header.clear();
+        stdout.read_line(&mut header).await?;
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        if fields.last() == Some(&"missing") {
+            contents.insert(
+                oid,
+                RevisionContent::Unavailable("Git object is unavailable locally".to_owned()),
+            );
+            continue;
+        }
+        let [_, object_type, size] = fields.as_slice() else {
+            bail!("invalid git cat-file header {header:?}");
+        };
+        let size = size.parse::<usize>().context("invalid Git object size")?;
+        let content = if *object_type != "blob" {
+            discard_stack_review_bytes(&mut stdout, size).await?;
+            RevisionContent::NonBlob((*object_type).to_owned())
+        } else {
+            let sample_length = size.min(STACK_REVIEW_BINARY_SAMPLE_BYTES);
+            let mut sample = vec![0; sample_length];
+            stdout.read_exact(&mut sample).await?;
+            let remaining = size.saturating_sub(sample_length);
+            if is_binary_content(&sample) {
+                discard_stack_review_bytes(&mut stdout, remaining).await?;
+                RevisionContent::Binary
+            } else if size > STACK_REVIEW_MAX_TEXT_BYTES {
+                discard_stack_review_bytes(&mut stdout, remaining).await?;
+                RevisionContent::Unavailable(format!(
+                    "Text content exceeds the {} MiB review limit",
+                    STACK_REVIEW_MAX_TEXT_BYTES / (1024 * 1024)
+                ))
+            } else if loaded_text_bytes.saturating_add(size) > STACK_REVIEW_MAX_TOTAL_TEXT_BYTES {
+                discard_stack_review_bytes(&mut stdout, remaining).await?;
+                RevisionContent::Unavailable(format!(
+                    "Stack text content exceeds the {} MiB aggregate review limit",
+                    STACK_REVIEW_MAX_TOTAL_TEXT_BYTES / (1024 * 1024)
+                ))
+            } else {
+                loaded_text_bytes = loaded_text_bytes.saturating_add(size);
+                let mut bytes = Vec::with_capacity(size);
+                bytes.extend_from_slice(&sample);
+                let mut remainder = vec![0; remaining];
+                stdout.read_exact(&mut remainder).await?;
+                bytes.extend_from_slice(&remainder);
+                RevisionContent::Text(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        stdout.read_exact(&mut newline).await?;
+        contents.insert(oid, content);
+    }
+    let output = process.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git cat-file failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(contents)
+}
+
+async fn load_stack_review_object(
+    git: GitBinary,
+    oid: String,
+    known_type: Option<String>,
+) -> Result<RevisionContent> {
+    let object_type = if let Some(object_type) = known_type {
+        object_type
+    } else {
+        let output = git
+            .build_command(&["cat-file", "-t", &oid])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Ok(RevisionContent::Unavailable(
+                "Git object is unavailable locally".to_owned(),
+            ));
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    if object_type != "blob" {
+        return Ok(RevisionContent::NonBlob(object_type));
+    }
+
+    let size_output = git
+        .build_command(&["cat-file", "-s", &oid])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .output()
+        .await?;
+    if !size_output.status.success() {
+        return Ok(RevisionContent::Unavailable(
+            "Git object is unavailable locally".to_owned(),
+        ));
+    }
+    let size = String::from_utf8_lossy(&size_output.stdout)
+        .trim()
+        .parse::<usize>()
+        .context("invalid Git object size")?;
+
+    let mut process = git
+        .build_command(&["cat-file", "blob", &oid])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = process.stdout.take().context("no git cat-file stdout")?;
+    let sample_length = size.min(STACK_REVIEW_BINARY_SAMPLE_BYTES);
+    let mut sample = vec![0; sample_length];
+    stdout.read_exact(&mut sample).await?;
+    if is_binary_content(&sample) {
+        process.kill()?;
+        process.status().await?;
+        return Ok(RevisionContent::Binary);
+    }
+    if size > STACK_REVIEW_MAX_TEXT_BYTES {
+        process.kill()?;
+        process.status().await?;
+        return Ok(RevisionContent::Unavailable(format!(
+            "Text content exceeds the {} MiB review limit",
+            STACK_REVIEW_MAX_TEXT_BYTES / (1024 * 1024)
+        )));
+    }
+
+    let mut content = Vec::with_capacity(size);
+    content.extend_from_slice(&sample);
+    let mut remainder = vec![0; size.saturating_sub(sample_length)];
+    stdout.read_exact(&mut remainder).await?;
+    content.extend_from_slice(&remainder);
+    let output = process.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git cat-file failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(RevisionContent::Text(
+        String::from_utf8_lossy(&content).into_owned(),
+    ))
+}
+
 #[derive(Error, Debug)]
 #[error("Git command failed:\n{stdout}{stderr}\n")]
 struct GitBinaryCommandError {
@@ -4114,6 +4703,17 @@ mod tests {
 
     use super::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn stack_review_discard_future_does_not_fill_a_worker_stack() {
+        let mut reader = smol::io::Cursor::new(Vec::<u8>::new());
+        let future = discard_stack_review_bytes(&mut reader, 0);
+        let future_size = std::mem::size_of_val(&future);
+        assert!(
+            future_size < 4096,
+            "discard future uses {future_size} bytes"
+        );
+    }
 
     fn disable_git_global_config() {
         unsafe {

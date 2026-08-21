@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use editor::{
     Editor, EditorEvent, MultiBuffer, RestoreOnlyUnstagedDiffHunkDelegate,
@@ -29,6 +29,15 @@ use workspace::{
 pub struct MultiDiffView {
     editor: Entity<Editor>,
     file_count: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct ContentDiffEntry {
+    pub path: PathBuf,
+    pub source_path: Option<PathBuf>,
+    pub was_deleted: bool,
+    pub old_text: String,
+    pub new_text: String,
 }
 
 struct Entry {
@@ -72,20 +81,82 @@ async fn load_entries(
     Ok((entries, common_root))
 }
 
+async fn load_content_entries(
+    content_entries: Vec<ContentDiffEntry>,
+    project: &Entity<Project>,
+    cx: &mut AsyncApp,
+) -> Result<(Vec<Entry>, Option<PathBuf>)> {
+    let mut entries = Vec::with_capacity(content_entries.len());
+    let mut all_paths = Vec::with_capacity(content_entries.len());
+
+    for (index, entry) in content_entries.into_iter().enumerate() {
+        let path = entry.path;
+        let file = if let Some(source_path) = &entry.source_path {
+            Some(
+                project
+                    .read_with(cx, |project, cx| {
+                        project.historic_file_for_absolute_path(source_path, entry.was_deleted, cx)
+                    })
+                    .with_context(|| {
+                        format!("missing project file identity for {source_path:?}")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let (old_buffer, new_buffer) = cx.update(|cx| {
+            let old_buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(entry.old_text, cx);
+                if let Some(file) = file.clone() {
+                    buffer.file_updated(file, cx);
+                }
+                buffer.set_capability(Capability::ReadOnly, cx);
+                buffer
+            });
+            let new_buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(entry.new_text, cx);
+                if let Some(file) = file {
+                    buffer.file_updated(file, cx);
+                }
+                buffer.set_capability(Capability::ReadOnly, cx);
+                buffer
+            });
+            (old_buffer, new_buffer)
+        });
+        let diff = build_buffer_diff(&old_buffer, &new_buffer, cx).await?;
+
+        all_paths.push(path.clone());
+        entries.push(Entry {
+            index,
+            new_path: path,
+            new_buffer,
+            diff,
+        });
+    }
+
+    let common_root = common_prefix(&all_paths);
+    Ok((entries, common_root))
+}
+
 fn register_entry(
     multibuffer: &Entity<MultiBuffer>,
     entry: Entry,
     common_root: &Option<PathBuf>,
     context_lines: u32,
-    cx: &mut Context<Workspace>,
+    full_file: bool,
+    cx: &mut App,
 ) {
     let snapshot = entry.new_buffer.read(cx).snapshot();
     let diff_snapshot = entry.diff.read(cx).snapshot(cx);
 
-    let ranges: Vec<std::ops::Range<language::Point>> = diff_snapshot
-        .hunks(&snapshot)
-        .map(|hunk| hunk.buffer_range.to_point(&snapshot))
-        .collect();
+    let ranges: Vec<std::ops::Range<language::Point>> = if full_file {
+        vec![language::Point::zero()..snapshot.max_point()]
+    } else {
+        diff_snapshot
+            .hunks(&snapshot)
+            .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+            .collect()
+    };
 
     let display_rel = common_root
         .as_ref()
@@ -145,6 +216,51 @@ fn common_prefix(paths: &[PathBuf]) -> Option<PathBuf> {
 }
 
 impl MultiDiffView {
+    pub(crate) fn build_from_content(
+        content_entries: Vec<ContentDiffEntry>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let context_lines = multibuffer_context_lines(cx);
+        window.spawn(cx, async move |cx| {
+            let (entries, common_root) =
+                load_content_entries(content_entries, &project, cx).await?;
+            cx.update(|window, cx| {
+                let multibuffer = cx.new(|cx| {
+                    let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
+                    multibuffer.set_all_diff_hunks_expanded(cx);
+                    multibuffer
+                });
+                let file_count = entries.len();
+                for entry in entries {
+                    register_entry(&multibuffer, entry, &common_root, context_lines, true, cx);
+                }
+                let view = cx.new(|cx| Self::new(multibuffer, project, file_count, window, cx));
+                view.update(cx, |view, cx| {
+                    view.editor.update(cx, |editor, cx| {
+                        editor.set_show_diff_review_button(true, cx);
+                        editor.set_stack_review_mode(true, cx);
+                        editor.set_allow_git_diff_scrollbar_markers(true, cx);
+                        editor.set_minimap_visibility(
+                            editor::MinimapVisibility::Enabled {
+                                setting_configuration: true,
+                                toggle_override: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                });
+                view
+            })
+        })
+    }
+
+    pub(crate) fn editor(&self) -> Entity<Editor> {
+        self.editor.clone()
+    }
+
     pub fn open(
         diff_pairs: Vec<[String; 2]>,
         workspace: &Workspace,
@@ -167,7 +283,7 @@ impl MultiDiffView {
 
                 let file_count = entries.len();
                 for entry in entries {
-                    register_entry(&multibuffer, entry, &common_root, context_lines, cx);
+                    register_entry(&multibuffer, entry, &common_root, context_lines, false, cx);
                 }
 
                 let diff_view = cx.new(|cx| {
@@ -346,5 +462,203 @@ impl Item for MultiDiffView {
 impl Render for MultiDiffView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         self.editor.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use editor::ToPoint as _;
+    use fs::Fs as _;
+    use gpui::{TestAppContext, VisualTestContext};
+    use language::language_settings::AllLanguageSettings;
+    use project::{FakeFs, Project, WorktreeSettings, project_settings::ProjectSettings};
+    use serde_json::json;
+    use settings::{Settings as _, SettingsStore};
+    use std::path::Path;
+    use theme::LoadThemes;
+    use workspace::WorkspaceSettings;
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(LoadThemes::JustBase, cx);
+            AllLanguageSettings::register(cx);
+            editor::init(cx);
+            ProjectSettings::register(cx);
+            WorktreeSettings::register(cx);
+            WorkspaceSettings::register(cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn content_diff_buffers_keep_file_identity(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let workspace =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let mut visual_context = VisualTestContext::from_window(*workspace, cx);
+
+        let task = workspace
+            .update(&mut visual_context, |_workspace, window, cx| {
+                MultiDiffView::build_from_content(
+                    vec![ContentDiffEntry {
+                        path: PathBuf::from("src/main.rs"),
+                        source_path: Some(PathBuf::from("/project/src/main.rs")),
+                        was_deleted: false,
+                        old_text: "fn old() {}".into(),
+                        new_text: "fn main() {}".into(),
+                    }],
+                    project,
+                    window,
+                    cx,
+                )
+            })
+            .expect("update workspace");
+        let view = task.await.expect("build content diff");
+        let file_path = view.read_with(&visual_context, |view, cx| {
+            let editor = view.editor();
+            let editor = editor.read(cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let point = snapshot
+                .diff_hunks_in_range(language::Point::zero()..snapshot.max_point())
+                .next()
+                .map(|hunk| hunk.multi_buffer_range.start.to_point(&snapshot))?;
+            editor
+                .review_file_path_at(point, cx)
+                .map(|path| path.as_unix_str().to_owned())
+        });
+
+        assert_eq!(file_path.as_deref(), Some("src/main.rs"));
+
+        let persisted_comment = git::stack_review::StackReviewComment {
+            id: 11,
+            path: "src/main.rs".into(),
+            start_row: 0,
+            start_column: 0,
+            end_row: 0,
+            end_column: 4,
+            body: "Preserve this review note".into(),
+            author: git::stack_review::StackReviewCommentAuthor {
+                name: "Reviewer".into(),
+                login: Some("reviewer".into()),
+            },
+            source: git::stack_review::StackReviewCommentSource::LocalHuman,
+            reply_to: None,
+        };
+        let persisted_reply = git::stack_review::StackReviewComment {
+            id: 12,
+            path: "src/main.rs".into(),
+            start_row: 0,
+            start_column: 0,
+            end_row: 0,
+            end_column: 4,
+            body: "Agent reply".into(),
+            author: git::stack_review::StackReviewCommentAuthor {
+                name: "Claude Code".into(),
+                login: None,
+            },
+            source: git::stack_review::StackReviewCommentSource::LocalAgent,
+            reply_to: Some(11),
+        };
+        let editor = view.read_with(&visual_context, |view, _| view.editor());
+        editor.update_in(&mut visual_context, |editor, window, cx| {
+            editor.restore_stack_review_comments(
+                &[persisted_comment.clone(), persisted_reply.clone()],
+                cx,
+            );
+            editor.reveal_restored_stack_review_comments(window, cx);
+        });
+        let (restored, visible_count, has_visible_overlay) =
+            editor.read_with(&visual_context, |editor, cx| {
+                (
+                    editor.stack_review_comments(cx),
+                    editor.visible_stack_review_comment_count(cx),
+                    editor.diff_review_prompt_editor().is_some(),
+                )
+            });
+
+        assert_eq!(restored, vec![persisted_comment, persisted_reply]);
+        assert_eq!(visible_count, 2);
+        assert!(has_visible_overlay);
+    }
+
+    #[gpui::test]
+    async fn content_diff_accepts_a_binary_source_with_placeholder_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {}
+            }),
+        )
+        .await;
+        fs.write(Path::new("/project/image.webp"), &[0, 1, 2, 3])
+            .await
+            .expect("write binary fixture");
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let workspace =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let mut visual_context = VisualTestContext::from_window(*workspace, cx);
+
+        let task = workspace
+            .update(&mut visual_context, |_workspace, window, cx| {
+                MultiDiffView::build_from_content(
+                    vec![ContentDiffEntry {
+                        path: PathBuf::from("image.webp"),
+                        source_path: None,
+                        was_deleted: false,
+                        old_text: String::new(),
+                        new_text: "Binary file added; content not shown\n".into(),
+                    }],
+                    project,
+                    window,
+                    cx,
+                )
+            })
+            .expect("update workspace");
+
+        assert!(task.await.is_ok());
+    }
+
+    #[gpui::test]
+    async fn content_diff_accepts_a_deleted_historical_source(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/project", json!({ ".git": {} })).await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let workspace =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let mut visual_context = VisualTestContext::from_window(*workspace, cx);
+        let task = workspace
+            .update(&mut visual_context, |_workspace, window, cx| {
+                MultiDiffView::build_from_content(
+                    vec![ContentDiffEntry {
+                        path: PathBuf::from("deleted.rs"),
+                        source_path: Some(PathBuf::from("/project/deleted.rs")),
+                        was_deleted: true,
+                        old_text: "fn deleted() {}".into(),
+                        new_text: String::new(),
+                    }],
+                    project,
+                    window,
+                    cx,
+                )
+            })
+            .expect("update workspace");
+
+        assert!(task.await.is_ok());
     }
 }

@@ -52,6 +52,7 @@ pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
 pub mod solo_diff_view;
+pub mod stack_review;
 pub mod staged_diff;
 pub mod stash_picker;
 pub mod text_diff_view;
@@ -109,6 +110,7 @@ pub fn init(cx: &mut App) {
         staged_diff::StagedDiff::register(workspace, cx);
         unstaged_diff::UnstagedDiff::register(workspace, cx);
         branch_diff::BranchDiff::register(workspace, cx);
+        stack_review::StackReview::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
         repository_selector::register(workspace);
