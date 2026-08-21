@@ -3,6 +3,7 @@ use crate::{
     status::TreeDiffStatus,
 };
 use anyhow::{Context as _, Result, bail};
+use imara_diff::{Algorithm, Diff, InternedInput, sources::lines};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -545,6 +546,19 @@ pub struct StackReviewFileDiff {
     pub new_content: Option<RevisionContent>,
     pub provenance: StackReviewFileProvenance,
     pub content_kind: StackReviewContentKind,
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
+}
+
+fn stack_review_line_counts(old_text: &str, new_text: &str) -> (u32, u32) {
+    let input = InternedInput::new(lines(old_text), lines(new_text));
+    let mut additions = 0;
+    let mut deletions = 0;
+    for hunk in Diff::compute(Algorithm::Histogram, &input).hunks() {
+        additions += hunk.after.len() as u32;
+        deletions += hunk.before.len() as u32;
+    }
+    (additions, deletions)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -674,6 +688,24 @@ pub async fn load_stack_diff(
             Some((true, true)) => StackReviewFileProvenance::Mixed,
             _ => StackReviewFileProvenance::Unknown,
         };
+        let line_counts = match (old_content.as_ref(), new_content.as_ref()) {
+            (None, None) => None,
+            (old_content, new_content) => {
+                let old_text = match old_content {
+                    Some(RevisionContent::Text(text)) => Some(text.as_str()),
+                    None => Some(""),
+                    _ => None,
+                };
+                let new_text = match new_content {
+                    Some(RevisionContent::Text(text)) => Some(text.as_str()),
+                    None => Some(""),
+                    _ => None,
+                };
+                old_text
+                    .zip(new_text)
+                    .map(|(old_text, new_text)| stack_review_line_counts(old_text, new_text))
+            }
+        };
         files.push(StackReviewFileDiff {
             path: path_text,
             status: file_status,
@@ -681,6 +713,8 @@ pub async fn load_stack_diff(
             new_content,
             provenance,
             content_kind,
+            additions: line_counts.map(|counts| counts.0),
+            deletions: line_counts.map(|counts| counts.1),
         });
     }
 
@@ -1467,6 +1501,14 @@ mod tests {
         assert!(!restored.is_file_reviewed("src/b.rs", "fingerprint-b"));
         assert!(restored.matches_snapshot("base-a", "head-a"));
         assert!(!restored.matches_snapshot("base-a", "head-b"));
+    }
+
+    #[test]
+    fn stack_review_line_counts_match_native_line_diff_semantics() {
+        assert_eq!(
+            stack_review_line_counts("one\ntwo\n", "one\nchanged\nthree\n"),
+            (2, 1)
+        );
     }
 
     #[test]

@@ -636,6 +636,17 @@ impl SplittableEditor {
         self.lhs.is_some()
     }
 
+    pub fn split_left_ratio(&self, cx: &App) -> f32 {
+        self.split_state.read(cx).left_ratio()
+    }
+
+    pub fn set_split_left_ratio(&self, ratio: f32, cx: &mut Context<Self>) {
+        self.split_state.update(cx, |state, cx| {
+            state.set_left_ratio(ratio);
+            cx.notify();
+        });
+    }
+
     pub fn set_diff_hunk_delegate(
         &self,
         delegate: Option<Arc<dyn DiffHunkDelegate>>,

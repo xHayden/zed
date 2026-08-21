@@ -38,8 +38,8 @@ pub(crate) struct ContentDiffEntry {
     pub path: PathBuf,
     pub source_path: Option<PathBuf>,
     pub was_deleted: bool,
-    pub old_text: String,
-    pub new_text: String,
+    pub old_text: Arc<str>,
+    pub new_text: Arc<str>,
 }
 
 struct Entry {
@@ -113,7 +113,7 @@ async fn load_content_entries(
         };
         let (old_buffer, new_buffer) = cx.update(|cx| {
             let old_buffer = cx.new(|cx| {
-                let mut buffer = Buffer::local(entry.old_text, cx);
+                let mut buffer = Buffer::local(entry.old_text.as_ref().to_owned(), cx);
                 buffer.set_language_registry(language_registry.clone());
                 buffer.set_language(language.clone(), cx);
                 if let Some(file) = file.clone() {
@@ -123,7 +123,7 @@ async fn load_content_entries(
                 buffer
             });
             let new_buffer = cx.new(|cx| {
-                let mut buffer = Buffer::local(entry.new_text, cx);
+                let mut buffer = Buffer::local(entry.new_text.as_ref().to_owned(), cx);
                 buffer.set_language_registry(language_registry.clone());
                 buffer.set_language(language, cx);
                 if let Some(file) = file {
@@ -286,6 +286,21 @@ impl MultiDiffView {
 
     pub(crate) fn editor(&self) -> Entity<Editor> {
         self.editor.clone()
+    }
+
+    pub(crate) fn split_left_ratio(&self, cx: &App) -> f32 {
+        self.split_editor
+            .as_ref()
+            .map(|split_editor| split_editor.read(cx).split_left_ratio(cx))
+            .unwrap_or(0.5)
+    }
+
+    pub(crate) fn set_split_left_ratio(&self, ratio: f32, cx: &mut Context<Self>) {
+        if let Some(split_editor) = &self.split_editor {
+            split_editor.update(cx, |split_editor, cx| {
+                split_editor.set_split_left_ratio(ratio, cx);
+            });
+        }
     }
 
     pub(crate) fn searchable_handle(&self) -> Box<dyn SearchableItemHandle> {
@@ -688,6 +703,20 @@ mod tests {
         assert!(has_visible_overlay);
     }
 
+    #[test]
+    fn content_diff_entry_clones_share_revision_text() {
+        let entry = ContentDiffEntry {
+            path: PathBuf::from("large.rs"),
+            source_path: None,
+            was_deleted: false,
+            old_text: Arc::from("old"),
+            new_text: Arc::from("new"),
+        };
+        let cloned = entry.clone();
+        assert!(Arc::ptr_eq(&entry.old_text, &cloned.old_text));
+        assert!(Arc::ptr_eq(&entry.new_text, &cloned.new_text));
+    }
+
     #[gpui::test]
     async fn content_diff_accepts_a_binary_source_with_placeholder_text(cx: &mut TestAppContext) {
         init_test(cx);
@@ -714,7 +743,7 @@ mod tests {
                         path: PathBuf::from("image.webp"),
                         source_path: None,
                         was_deleted: false,
-                        old_text: String::new(),
+                        old_text: Arc::from(""),
                         new_text: "Binary file added; content not shown\n".into(),
                     }],
                     project,
@@ -745,7 +774,7 @@ mod tests {
                         source_path: Some(PathBuf::from("/project/deleted.rs")),
                         was_deleted: true,
                         old_text: "fn deleted() {}".into(),
-                        new_text: String::new(),
+                        new_text: Arc::from(""),
                     }],
                     project,
                     cx.entity(),

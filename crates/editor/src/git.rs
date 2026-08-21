@@ -10,6 +10,32 @@ use ::git::{
 };
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 
+pub(crate) fn format_stack_review_comment_timestamp_at_offset(
+    timestamp: &str,
+    reference: ::time::OffsetDateTime,
+    offset: ::time::UtcOffset,
+) -> String {
+    let Ok(timestamp) =
+        ::time::OffsetDateTime::parse(timestamp, &::time::format_description::well_known::Rfc3339)
+    else {
+        return String::new();
+    };
+    time_format::format_localized_timestamp(
+        timestamp,
+        reference,
+        offset,
+        time_format::TimestampFormat::EnhancedAbsolute,
+    )
+}
+
+pub fn format_stack_review_comment_timestamp(timestamp: &str) -> String {
+    format_stack_review_comment_timestamp_at_offset(
+        timestamp,
+        ::time::OffsetDateTime::now_utc(),
+        ::time::UtcOffset::current_local_offset().unwrap_or(::time::UtcOffset::UTC),
+    )
+}
+
 #[derive(Clone)]
 pub struct ResolvedDiffHunk {
     pub buffer_range: Range<text::Anchor>,
@@ -333,6 +359,7 @@ pub(super) struct StoredReviewComment {
     pub(super) source: StackReviewCommentSource,
     pub(super) reply_to: Option<usize>,
     pub(super) created_at: String,
+    pub(super) created_at_display: SharedString,
     pub(super) resolved: bool,
 }
 
@@ -383,6 +410,10 @@ impl StoredReviewComment {
         source: StackReviewCommentSource,
         reply_to: Option<usize>,
     ) -> Self {
+        let created_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let created_at_display = format_stack_review_comment_timestamp(&created_at).into();
         Self {
             id,
             comment,
@@ -391,9 +422,8 @@ impl StoredReviewComment {
             author,
             source,
             reply_to,
-            created_at: time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
+            created_at,
+            created_at_display,
             resolved: false,
         }
     }
@@ -913,6 +943,8 @@ impl Editor {
                 source: comment.source,
                 reply_to: comment.reply_to,
                 created_at: comment.created_at.clone(),
+                created_at_display: format_stack_review_comment_timestamp(&comment.created_at)
+                    .into(),
                 resolved: comment.resolved,
             };
             if let Some((_, existing_comments)) = restored.iter_mut().find(|(existing, _)| {
@@ -3295,6 +3327,7 @@ impl Editor {
         editor_handle: WeakEntity<Editor>,
     ) -> impl IntoElement {
         let comment_count = comments.len();
+        let expanded = expanded || is_stack_review;
         let thread_items = stack_review_thread_items(
             comments,
             composer_visible.then_some(pending_reply_to).flatten(),
@@ -3314,29 +3347,34 @@ impl Editor {
                     .gap_1()
                     .px_2()
                     .py_1()
-                    .cursor_pointer()
                     .rounded_md()
-                    .hover(|style| style.bg(colors.ghost_element_hover))
-                    .on_click(move |_, window: &mut Window, cx| {
-                        if let Some(editor) = editor_handle_for_toggle.upgrade() {
-                            editor.update(cx, |editor, cx| {
-                                editor.toggle_review_comments_for_hunk(
-                                    &hunk_key_for_toggle,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }
+                    .when(!is_stack_review, move |header| {
+                        header
+                            .cursor_pointer()
+                            .hover(|style| style.bg(colors.ghost_element_hover))
+                            .on_click(move |_, window: &mut Window, cx| {
+                                if let Some(editor) = editor_handle_for_toggle.upgrade() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.toggle_review_comments_for_hunk(
+                                            &hunk_key_for_toggle,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            })
                     })
-                    .child(
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(IconSize::Small)
-                        .color(ui::Color::Muted),
-                    )
+                    .when(!is_stack_review, |header| {
+                        header.child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::Small)
+                            .color(ui::Color::Muted),
+                        )
+                    })
                     .child(
                         Label::new(format!(
                             "{} Comment{}",
@@ -3367,7 +3405,7 @@ impl Editor {
                             .into_any_element()
                         }
                         StackReviewThreadItem::Composer { depth } => div()
-                            .ml(px((depth.min(8) * 16) as f32))
+                            .pl(px((depth.min(4) * 12) as f32))
                             .child(Self::render_reply_composer(
                                 prompt_editor.clone(),
                                 action_icon_size,
@@ -3397,7 +3435,7 @@ impl Editor {
             .border_color(colors.border)
             .px_2()
             .py_1()
-            .child(div().flex_1().child(prompt_editor))
+            .child(div().min_w_0().flex_1().child(prompt_editor))
             .child(
                 IconButton::new("diff-review-close-reply", IconName::Close)
                     .icon_color(ui::Color::Muted)
@@ -3453,9 +3491,9 @@ impl Editor {
             StackReviewCommentSource::LocalAgent => format!("{} · Agent", comment.author.name),
             StackReviewCommentSource::Github => format!("{} · GitHub", comment.author.name),
         };
-        if let Some(date) = comment.created_at.get(..10).filter(|date| !date.is_empty()) {
+        if !comment.created_at_display.is_empty() {
             author_label.push_str(" · ");
-            author_label.push_str(date);
+            author_label.push_str(&comment.created_at_display);
         }
         let comment_content = if let Some(editor) = inline_editor {
             div()
@@ -3485,8 +3523,8 @@ impl Editor {
             .py_1p5()
             .rounded_md()
             .bg(colors.surface_background)
-            .ml(px(if is_stack_review {
-                (depth.min(8) * 16) as f32
+            .pl(px(if is_stack_review {
+                (depth.min(4) * 12) as f32
             } else {
                 0.
             }))
@@ -3516,12 +3554,14 @@ impl Editor {
             )
             .child(if is_stack_review {
                 v_flex()
+                    .min_w_0()
                     .flex_1()
                     .gap_0p5()
                     .child(
                         Label::new(author_label)
                             .size(LabelSize::Small)
-                            .color(Color::Muted),
+                            .color(Color::Muted)
+                            .truncate(),
                     )
                     .child(comment_content)
                     .into_any_element()
@@ -3531,6 +3571,7 @@ impl Editor {
             .child(if is_editing {
                 // Editing mode: show close and confirm buttons
                 h_flex()
+                    .flex_none()
                     .gap_1()
                     .child(
                         IconButton::new(
@@ -3567,6 +3608,7 @@ impl Editor {
                     .into_any_element()
             } else if is_stack_review {
                 h_flex()
+                    .flex_none()
                     .gap_1()
                     .child(
                         IconButton::new(

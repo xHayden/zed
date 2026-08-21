@@ -53,6 +53,12 @@ impl SplitEditorState {
         1.0 - self.visible_left_ratio
     }
 
+    pub fn set_left_ratio(&mut self, ratio: f32) {
+        let ratio = ratio.clamp(0.1, 0.9);
+        self.left_ratio = ratio;
+        self.visible_left_ratio = ratio;
+    }
+
     fn on_drag_move(
         &mut self,
         drag_event: &DragMoveEvent<DraggedSplitHandle>,

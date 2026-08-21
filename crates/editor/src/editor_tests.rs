@@ -40375,6 +40375,26 @@ fn test_stack_review_cancel_keeps_overlays_with_saved_comments(cx: &mut TestAppC
         .unwrap();
 }
 
+#[test]
+fn test_stack_review_comment_timestamp_is_readable_text() {
+    let formatted = crate::git::format_stack_review_comment_timestamp_at_offset(
+        "2026-08-21T20:15:00Z",
+        time::macros::datetime!(2026-08-25 0:00 UTC),
+        time::UtcOffset::from_hms(-4, 0, 0).expect("offset"),
+    );
+    assert_ne!(formatted, "2026-08-21T20:15:00Z");
+    assert!(!formatted.is_empty());
+    assert!(formatted.contains("15"));
+    assert_eq!(
+        crate::git::format_stack_review_comment_timestamp_at_offset(
+            "invalid",
+            time::macros::datetime!(2026-08-25 0:00 UTC),
+            time::UtcOffset::UTC,
+        ),
+        ""
+    );
+}
+
 #[gpui::test]
 fn test_stack_review_submit_keeps_comment_inline_and_hides_composer(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
