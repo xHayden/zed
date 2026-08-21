@@ -874,6 +874,23 @@ fn display_texts_for_file(
     )
 }
 
+fn content_entry_for_stack_file(
+    file: git::stack_review::StackReviewFileDiff,
+    work_directory: &Path,
+) -> ContentDiffEntry {
+    let path = PathBuf::from(file.path);
+    let has_text_content = matches!(file.old_content.as_ref(), Some(RevisionContent::Text(_)))
+        || matches!(file.new_content.as_ref(), Some(RevisionContent::Text(_)));
+    let (old_text, new_text) = display_texts_for_file(file.old_content, file.new_content);
+    ContentDiffEntry {
+        source_path: has_text_content.then(|| work_directory.join(&path)),
+        was_deleted: file.status == StackReviewFileStatus::Deleted,
+        path,
+        old_text: old_text.into(),
+        new_text: new_text.into(),
+    }
+}
+
 async fn build_active_diff_view(
     entry: Option<ContentDiffEntry>,
     comments: Vec<git::stack_review::StackReviewComment>,
@@ -1428,6 +1445,7 @@ pub struct StackReview {
     state_write_generations: HashMap<PathBuf, Arc<AtomicU64>>,
     editor_subscription: Option<Subscription>,
     comment_watch_task: Task<()>,
+    checkpoint_diff_task: Task<()>,
 }
 
 impl StackReview {
@@ -1656,6 +1674,7 @@ impl StackReview {
             state_write_generations: HashMap::new(),
             editor_subscription: None,
             comment_watch_task: Task::ready(()),
+            checkpoint_diff_task: Task::ready(()),
         }
     }
 
@@ -1902,24 +1921,7 @@ impl StackReview {
                 let content_entries: Vec<ContentDiffEntry> = diff
                     .files
                     .into_iter()
-                    .map(|file| {
-                        let path = PathBuf::from(file.path);
-                        let has_text_content =
-                            matches!(file.old_content.as_ref(), Some(RevisionContent::Text(_)))
-                                || matches!(
-                                    file.new_content.as_ref(),
-                                    Some(RevisionContent::Text(_))
-                                );
-                        let (old_text, new_text) =
-                            display_texts_for_file(file.old_content, file.new_content);
-                        ContentDiffEntry {
-                            source_path: has_text_content.then(|| work_directory.join(&path)),
-                            was_deleted: file.status == StackReviewFileStatus::Deleted,
-                            path,
-                            old_text: old_text.into(),
-                            new_text: new_text.into(),
-                        }
-                    })
+                    .map(|file| content_entry_for_stack_file(file, &work_directory))
                     .collect();
                 let selected_file_index = files.iter().position(|file| {
                     is_visible_review_path(&file.path, hide_tests, hide_migrations)
@@ -2484,6 +2486,94 @@ impl StackReview {
         self.selected_commenter = Some(cutoff.identity);
         self.time_filter = StackReviewTimeFilter::AfterComment(cutoff.timestamp);
         self.load_scope(self.selected_scope, window, cx);
+    }
+
+    fn cutoff_comparison_title(&self) -> SharedString {
+        match self.time_filter {
+            StackReviewTimeFilter::All => "Cutoff Diff".into(),
+            StackReviewTimeFilter::Days(1) => "Diff: last 24h checkpoint → To".into(),
+            StackReviewTimeFilter::Days(days) => {
+                format!("Diff: last {days}d checkpoint → To").into()
+            }
+            StackReviewTimeFilter::AfterComment(_) => self
+                .selected_commenter
+                .as_ref()
+                .and_then(|selected| {
+                    self.commenter_cutoffs
+                        .iter()
+                        .find(|cutoff| &cutoff.identity == selected)
+                })
+                .map(|cutoff| format!("Diff: after {}'s comment → To", cutoff.display_name).into())
+                .unwrap_or_else(|| "Diff: comment checkpoint → To".into()),
+        }
+    }
+
+    fn open_time_checkpoint_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cutoff) = self.time_filter.cutoff() else {
+            return;
+        };
+        let Some((base_ref, head_ref)) = self.selected_scope.refs(&self.snapshot) else {
+            self.state_error = Some("Selected stack range no longer exists".into());
+            cx.notify();
+            return;
+        };
+        let receiver = self.repository.update(cx, |repository, _| {
+            repository.stack_review_diff_from_time_checkpoint(
+                base_ref.to_owned(),
+                head_ref.to_owned(),
+                cutoff,
+            )
+        });
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        let work_directory = self.work_directory.clone();
+        let title = self.cutoff_comparison_title();
+        let split_left_ratio = self.split_left_ratio;
+        self.state_error = None;
+        cx.notify();
+
+        self.checkpoint_diff_task = cx.spawn_in(window, async move |this, cx| {
+            let result: Result<()> = async {
+                let diff = receiver.await??;
+                let entries = diff
+                    .files
+                    .into_iter()
+                    .map(|file| content_entry_for_stack_file(file, &work_directory))
+                    .collect();
+                let workspace_entity = workspace
+                    .upgrade()
+                    .context("Stack Review workspace no longer exists")?;
+                let build_task = cx.update(|window, cx| {
+                    MultiDiffView::build_from_content(
+                        entries,
+                        project,
+                        workspace_entity,
+                        window,
+                        cx,
+                    )
+                })?;
+                let diff_view = build_task.await?;
+                workspace.update_in(cx, |workspace, window, cx| {
+                    diff_view.update(cx, |diff_view, cx| {
+                        diff_view.set_title(title);
+                        diff_view.set_split_left_ratio(split_left_ratio, cx);
+                        diff_view.editor().update(cx, |editor, cx| {
+                            editor.set_show_diff_review_button(false, cx);
+                            editor.set_stack_review_mode(false, cx);
+                        });
+                    });
+                    workspace.add_item_to_active_pane(Box::new(diff_view), None, true, window, cx);
+                })?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.state_error = result.err().map(|error| error.to_string().into());
+                cx.notify();
+            }) {
+                log::error!("failed to report cutoff diff result: {error:#}");
+            }
+        });
     }
 
     fn apply_custom_days(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3093,6 +3183,17 @@ impl StackReview {
                 div()
                     .debug_selector(|| "STACK_REVIEW_COMMENTER_TIME".to_owned())
                     .child(commenter_filter),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "STACK_REVIEW_OPEN_CUTOFF_DIFF".to_owned())
+                    .child(
+                        Button::new("stack-review-open-cutoff-diff", "Open Cutoff Diff")
+                            .disabled(self.time_filter.cutoff().is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_time_checkpoint_diff(window, cx);
+                            })),
+                    ),
             );
 
         let scope_controls = h_flex()
@@ -4054,6 +4155,7 @@ mod tests {
                     state_write_generations: HashMap::new(),
                     editor_subscription: None,
                     comment_watch_task: Task::ready(()),
+                    checkpoint_diff_task: Task::ready(()),
                 });
                 workspace.add_item_to_active_pane(Box::new(review.clone()), None, true, window, cx);
                 review
@@ -4155,6 +4257,12 @@ mod tests {
                 .debug_bounds("STACK_REVIEW_COMMENTER_TIME")
                 .is_some(),
             "commenter time-filter dropdown must render"
+        );
+        assert!(
+            visual_context
+                .debug_bounds("STACK_REVIEW_OPEN_CUTOFF_DIFF")
+                .is_some(),
+            "cutoff comparison button must render"
         );
         let bounds = visual_context
             .debug_bounds("STACK_REVIEW_FILE-1")

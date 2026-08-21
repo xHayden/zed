@@ -8857,6 +8857,34 @@ impl Repository {
         )
     }
 
+    pub fn stack_review_diff_from_time_checkpoint(
+        &mut self,
+        base_ref: String,
+        head_ref: String,
+        author_timestamp: i64,
+    ) -> oneshot::Receiver<Result<git::stack_review::StackReviewDiff>> {
+        self.send_job(
+            "stack_review_diff_from_time_checkpoint",
+            None,
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        git::stack_review::load_stack_diff_from_time_checkpoint(
+                            backend.as_ref(),
+                            &base_ref,
+                            &head_ref,
+                            author_timestamp,
+                        )
+                        .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        bail!("stack review is only available for local repositories")
+                    }
+                }
+            },
+        )
+    }
+
     pub fn diff_tree(
         &mut self,
         diff_type: DiffTreeType,

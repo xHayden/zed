@@ -9,6 +9,7 @@ use ::git::{
     status::FileStatus,
 };
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
+use ui::CopyButton;
 
 pub(crate) fn format_stack_review_comment_timestamp_at_offset(
     timestamp: &str,
@@ -3484,6 +3485,7 @@ impl Editor {
         let delete_editor = editor_handle.clone();
         let resolution_editor = editor_handle;
         let resolved = comment.resolved;
+        let comment_text = comment.comment.clone();
 
         let source = comment.source;
         let mut author_label = match source {
@@ -3610,6 +3612,11 @@ impl Editor {
                 h_flex()
                     .flex_none()
                     .gap_1()
+                    .child(
+                        CopyButton::new(format!("diff-review-copy-{comment_id}"), comment_text)
+                            .icon_size(action_icon_size)
+                            .tooltip_label("Copy comment"),
+                    )
                     .child(
                         IconButton::new(
                             format!("diff-review-resolution-{comment_id}"),

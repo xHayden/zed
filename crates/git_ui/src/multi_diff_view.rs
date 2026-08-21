@@ -31,6 +31,7 @@ pub struct MultiDiffView {
     editor: Entity<Editor>,
     split_editor: Option<Entity<SplittableEditor>>,
     file_count: usize,
+    title_override: Option<SharedString>,
 }
 
 #[derive(Clone)]
@@ -263,6 +264,7 @@ impl MultiDiffView {
                     editor,
                     split_editor: Some(split_editor),
                     file_count,
+                    title_override: None,
                 });
                 view.update(cx, |view, cx| {
                     view.editor.update(cx, |editor, cx| {
@@ -301,6 +303,10 @@ impl MultiDiffView {
                 split_editor.set_split_left_ratio(ratio, cx);
             });
         }
+    }
+
+    pub(crate) fn set_title(&mut self, title: impl Into<SharedString>) {
+        self.title_override = Some(title.into());
     }
 
     pub(crate) fn searchable_handle(&self) -> Box<dyn SearchableItemHandle> {
@@ -382,10 +388,14 @@ impl MultiDiffView {
             editor,
             split_editor: None,
             file_count,
+            title_override: None,
         }
     }
 
     fn title(&self) -> SharedString {
+        if let Some(title) = &self.title_override {
+            return title.clone();
+        }
         let suffix = if self.file_count == 1 {
             "1 file".to_string()
         } else {

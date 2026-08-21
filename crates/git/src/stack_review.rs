@@ -745,6 +745,35 @@ pub async fn load_stack_diff_since(
     Ok(diff)
 }
 
+fn time_checkpoint_base(
+    base_ref: &str,
+    head_ref: &str,
+    commits: &[FirstParentCommit],
+    author_timestamp: i64,
+) -> String {
+    match commits
+        .iter()
+        .position(|commit| commit.author_timestamp >= author_timestamp)
+    {
+        Some(0) => base_ref.to_owned(),
+        Some(index) => commits[index - 1].oid.clone(),
+        None => head_ref.to_owned(),
+    }
+}
+
+pub async fn load_stack_diff_from_time_checkpoint(
+    repository: &dyn GitRepository,
+    base_ref: &str,
+    head_ref: &str,
+    author_timestamp: i64,
+) -> Result<StackReviewDiff> {
+    let commits = repository
+        .first_parent_commits(base_ref.to_owned(), head_ref.to_owned())
+        .await?;
+    let checkpoint = time_checkpoint_base(base_ref, head_ref, &commits, author_timestamp);
+    load_stack_diff(repository, &checkpoint, head_ref).await
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StackLayerAncestry {
     pub base_branch: String,
@@ -1501,6 +1530,33 @@ mod tests {
         assert!(!restored.is_file_reviewed("src/b.rs", "fingerprint-b"));
         assert!(restored.matches_snapshot("base-a", "head-a"));
         assert!(!restored.matches_snapshot("base-a", "head-b"));
+    }
+
+    #[test]
+    fn time_checkpoint_uses_parent_of_first_qualifying_graph_commit() {
+        let commits = vec![
+            FirstParentCommit {
+                oid: "one".into(),
+                author_timestamp: 100,
+                is_merge: false,
+                paths: vec![],
+            },
+            FirstParentCommit {
+                oid: "two".into(),
+                author_timestamp: 300,
+                is_merge: false,
+                paths: vec![],
+            },
+            FirstParentCommit {
+                oid: "three".into(),
+                author_timestamp: 200,
+                is_merge: false,
+                paths: vec![],
+            },
+        ];
+        assert_eq!(time_checkpoint_base("base", "head", &commits, 250), "one");
+        assert_eq!(time_checkpoint_base("base", "head", &commits, 50), "base");
+        assert_eq!(time_checkpoint_base("base", "head", &commits, 400), "head");
     }
 
     #[test]
