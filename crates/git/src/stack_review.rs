@@ -761,17 +761,45 @@ fn time_checkpoint_base(
     }
 }
 
-pub async fn load_stack_diff_from_time_checkpoint(
+pub async fn resolve_stack_review_commit_boundary(
+    repository: &dyn GitRepository,
+    base_ref: &str,
+    head_ref: &str,
+    candidate: &str,
+) -> Result<String> {
+    let candidate_oid = repository
+        .stack_review_resolve_revision(candidate.to_owned())
+        .await?;
+    anyhow::ensure!(
+        repository
+            .is_ancestor(base_ref.to_owned(), candidate_oid.clone())
+            .await?,
+        "commit boundary {candidate_oid} is not within the selected range"
+    );
+    anyhow::ensure!(
+        repository
+            .is_ancestor(candidate_oid.clone(), head_ref.to_owned())
+            .await?,
+        "commit boundary {candidate_oid} is not an ancestor of the selected To boundary"
+    );
+    Ok(candidate_oid)
+}
+
+pub async fn resolve_stack_review_time_checkpoint(
     repository: &dyn GitRepository,
     base_ref: &str,
     head_ref: &str,
     author_timestamp: i64,
-) -> Result<StackReviewDiff> {
+) -> Result<String> {
     let commits = repository
         .first_parent_commits(base_ref.to_owned(), head_ref.to_owned())
         .await?;
-    let checkpoint = time_checkpoint_base(base_ref, head_ref, &commits, author_timestamp);
-    load_stack_diff(repository, &checkpoint, head_ref).await
+    Ok(time_checkpoint_base(
+        base_ref,
+        head_ref,
+        &commits,
+        author_timestamp,
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1119,6 +1147,23 @@ mod tests {
             cx.executor(),
         )
         .expect("open repository");
+
+        let feature_oid = repository
+            .stack_review_resolve_revision("feature".into())
+            .await
+            .expect("resolve feature");
+        assert_eq!(
+            resolve_stack_review_commit_boundary(&repository, "staging", "feature", &feature_oid)
+                .await
+                .expect("validate feature boundary"),
+            feature_oid
+        );
+        assert!(
+            resolve_stack_review_commit_boundary(&repository, "feature", "staging", "feature")
+                .await
+                .is_err(),
+            "a boundary outside the selected ancestry must be rejected"
+        );
 
         let diff = load_stack_diff(&repository, "staging", "feature")
             .await

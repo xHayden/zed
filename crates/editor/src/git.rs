@@ -3483,6 +3483,7 @@ impl Editor {
         let reply_editor = editor_handle.clone();
         let edit_editor = editor_handle.clone();
         let delete_editor = editor_handle.clone();
+        let checkpoint_editor = editor_handle.clone();
         let resolution_editor = editor_handle;
         let resolved = comment.resolved;
         let comment_text = comment.comment.clone();
@@ -3617,6 +3618,28 @@ impl Editor {
                             .icon_size(action_icon_size)
                             .tooltip_label("Copy comment"),
                     )
+                    .when(source == StackReviewCommentSource::Github, |actions| {
+                        actions.child(
+                            IconButton::new(
+                                format!("diff-review-use-comment-checkpoint-{comment_id}"),
+                                IconName::Diff,
+                            )
+                            .icon_color(ui::Color::Muted)
+                            .icon_size(action_icon_size)
+                            .tooltip(Tooltip::text(
+                                "Use the last commit before this comment as From",
+                            ))
+                            .on_click(move |_, _, cx| {
+                                if let Some(editor) = checkpoint_editor.upgrade() {
+                                    editor.update(cx, |_, cx| {
+                                        cx.emit(EditorEvent::ReviewCommentCheckpointRequested {
+                                            id: comment_id,
+                                        });
+                                    });
+                                }
+                            }),
+                        )
+                    })
                     .child(
                         IconButton::new(
                             format!("diff-review-resolution-{comment_id}"),

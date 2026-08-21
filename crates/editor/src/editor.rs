@@ -11861,6 +11861,9 @@ pub enum EditorEvent {
         ids: Vec<usize>,
         resolved: bool,
     },
+    ReviewCommentCheckpointRequested {
+        id: usize,
+    },
     InputIgnored {
         text: Arc<str>,
     },

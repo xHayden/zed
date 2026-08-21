@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result, anyhow};
 use editor::{Editor, EditorEvent};
 use feature_flags::{FeatureFlagAppExt as _, StackReviewFeatureFlag};
 use fs::{Fs, RemoveOptions};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, channel::oneshot};
 use git::{
     repository::RevisionContent,
     stack_review::{
@@ -759,6 +759,14 @@ impl StackReviewTimeFilter {
             Self::AfterComment(timestamp) => Some(timestamp.saturating_add(1)),
         }
     }
+
+    fn checkpoint_timestamp(self) -> Option<i64> {
+        match self {
+            Self::All => None,
+            Self::Days(_) => self.cutoff(),
+            Self::AfterComment(timestamp) => Some(timestamp),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -951,6 +959,42 @@ struct CommenterCutoff {
     timestamp: i64,
     timestamp_nanos: i128,
     record_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CustomFromBoundary {
+    oid: String,
+    label: SharedString,
+}
+
+#[derive(Default)]
+struct CheckpointBoundaryRequestTracker {
+    generation: u64,
+}
+
+impl CheckpointBoundaryRequestTracker {
+    fn start(&mut self) -> u64 {
+        self.invalidate();
+        self.generation
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+}
+
+fn github_comment_boundary_oid(record: &StackReviewCommentRecord) -> Option<&str> {
+    if record.source != StackReviewCommentSource::Github {
+        return None;
+    }
+    record
+        .github
+        .as_ref()
+        .and_then(|identity| identity.commit_oid.as_deref())
 }
 
 fn comment_timestamp_nanos(record: &StackReviewCommentRecord) -> i128 {
@@ -1400,8 +1444,10 @@ pub struct StackReview {
     snapshot: StackSnapshot,
     current_layer: usize,
     selected_scope: StackReviewScope,
+    custom_from_boundary: Option<CustomFromBoundary>,
     time_filter: StackReviewTimeFilter,
     custom_days_editor: Entity<Editor>,
+    commit_boundary_editor: Entity<Editor>,
     has_worktree_changes: bool,
     diverged_layer_count: usize,
     repository: Entity<Repository>,
@@ -1445,7 +1491,8 @@ pub struct StackReview {
     state_write_generations: HashMap<PathBuf, Arc<AtomicU64>>,
     editor_subscription: Option<Subscription>,
     comment_watch_task: Task<()>,
-    checkpoint_diff_task: Task<()>,
+    checkpoint_boundary_task: Task<()>,
+    checkpoint_boundary_requests: CheckpointBoundaryRequestTracker,
 }
 
 impl StackReview {
@@ -1559,6 +1606,7 @@ impl StackReview {
                     });
                     if let Some(existing) = existing {
                         existing.update(cx, |review, cx| {
+                            review.custom_from_boundary = None;
                             review.load_scope(
                                 StackReviewScope::AggregateThrough(current_layer),
                                 window,
@@ -1625,12 +1673,19 @@ impl StackReview {
             editor.set_placeholder_text("Days", window, cx);
             editor
         });
+        let commit_boundary_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Commit", window, cx);
+            editor
+        });
         Self {
             snapshot,
             current_layer,
             selected_scope: StackReviewScope::AggregateThrough(current_layer),
+            custom_from_boundary: None,
             time_filter: StackReviewTimeFilter::All,
             custom_days_editor,
+            commit_boundary_editor,
             has_worktree_changes,
             diverged_layer_count,
             repository,
@@ -1674,23 +1729,34 @@ impl StackReview {
             state_write_generations: HashMap::new(),
             editor_subscription: None,
             comment_watch_task: Task::ready(()),
-            checkpoint_diff_task: Task::ready(()),
+            checkpoint_boundary_task: Task::ready(()),
+            checkpoint_boundary_requests: CheckpointBoundaryRequestTracker::default(),
         }
     }
 
     fn load_scope(&mut self, scope: StackReviewScope, window: &mut Window, cx: &mut Context<Self>) {
         self.remember_active_split_ratio(cx);
-        if scope.boundaries() != self.selected_scope.boundaries()
-            && matches!(self.time_filter, StackReviewTimeFilter::AfterComment(_))
-        {
-            self.time_filter = StackReviewTimeFilter::All;
-            self.selected_commenter = None;
+        self.checkpoint_boundary_requests.invalidate();
+        let scope_changed = scope.boundaries() != self.selected_scope.boundaries();
+        if scope_changed {
+            self.custom_from_boundary = None;
+            if matches!(self.time_filter, StackReviewTimeFilter::AfterComment(_)) {
+                self.time_filter = StackReviewTimeFilter::All;
+                self.selected_commenter = None;
+            }
         }
-        let Some((base_ref, head_ref)) = scope.refs(&self.snapshot) else {
+        let Some((stack_base_ref, head_ref)) = scope.refs(&self.snapshot) else {
             self.error = Some("Selected stack layer no longer exists".into());
             cx.notify();
             return;
         };
+        let base_ref = self
+            .custom_from_boundary
+            .as_ref()
+            .map(|boundary| boundary.oid.as_str())
+            .unwrap_or(stack_base_ref)
+            .to_owned();
+        let head_ref = head_ref.to_owned();
         log::info!(
             "[STACK_REVIEW_DEBUG] load scope: scope={scope:?}, base={base_ref}, head={head_ref}, time_filter={:?}",
             self.time_filter
@@ -1718,8 +1784,6 @@ impl StackReview {
         self.error = None;
         cx.notify();
 
-        let base_ref = base_ref.to_owned();
-        let head_ref = head_ref.to_owned();
         let github_snapshot_key = stack_review_storage_key(&base_ref, &head_ref);
         let should_refresh_github = !self
             .refreshed_github_snapshots
@@ -2028,6 +2092,9 @@ impl StackReview {
                                     } => {
                                         this.persist_comment_resolution(ids, *resolved, window, cx);
                                     }
+                                    EditorEvent::ReviewCommentCheckpointRequested { id } => {
+                                        this.use_comment_as_from(*id, window, cx);
+                                    }
                                     _ => {}
                                 }
                             },
@@ -2123,6 +2190,9 @@ impl StackReview {
                                 }
                                 EditorEvent::ReviewCommentResolutionChanged { ids, resolved } => {
                                     this.persist_comment_resolution(ids, *resolved, window, cx);
+                                }
+                                EditorEvent::ReviewCommentCheckpointRequested { id } => {
+                                    this.use_comment_as_from(*id, window, cx);
                                 }
                                 _ => {}
                             }
@@ -2488,13 +2558,11 @@ impl StackReview {
         self.load_scope(self.selected_scope, window, cx);
     }
 
-    fn cutoff_comparison_title(&self) -> SharedString {
+    fn time_filter_checkpoint_label(&self) -> Option<SharedString> {
         match self.time_filter {
-            StackReviewTimeFilter::All => "Cutoff Diff".into(),
-            StackReviewTimeFilter::Days(1) => "Diff: last 24h checkpoint → To".into(),
-            StackReviewTimeFilter::Days(days) => {
-                format!("Diff: last {days}d checkpoint → To").into()
-            }
+            StackReviewTimeFilter::All => None,
+            StackReviewTimeFilter::Days(1) => Some("Before last 24h".into()),
+            StackReviewTimeFilter::Days(days) => Some(format!("Before last {days}d").into()),
             StackReviewTimeFilter::AfterComment(_) => self
                 .selected_commenter
                 .as_ref()
@@ -2503,77 +2571,170 @@ impl StackReview {
                         .iter()
                         .find(|cutoff| &cutoff.identity == selected)
                 })
-                .map(|cutoff| format!("Diff: after {}'s comment → To", cutoff.display_name).into())
-                .unwrap_or_else(|| "Diff: comment checkpoint → To".into()),
+                .map(|cutoff| format!("Before {}'s latest comment", cutoff.display_name).into())
+                .or_else(|| Some("Before latest reviewer comment".into())),
         }
     }
 
-    fn open_time_checkpoint_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cutoff) = self.time_filter.cutoff() else {
+    fn use_time_filter_as_from(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(timestamp) = self.time_filter.checkpoint_timestamp() else {
             return;
         };
+        let Some(label) = self.time_filter_checkpoint_label() else {
+            return;
+        };
+        let commit_oid = matches!(self.time_filter, StackReviewTimeFilter::AfterComment(_))
+            .then(|| {
+                self.selected_commenter
+                    .as_ref()
+                    .and_then(|selected| {
+                        self.commenter_cutoffs
+                            .iter()
+                            .find(|cutoff| &cutoff.identity == selected)
+                    })
+                    .and_then(|cutoff| self.comment_records.get(&cutoff.record_id))
+                    .and_then(|loaded| github_comment_boundary_oid(&loaded.record))
+                    .map(str::to_owned)
+            })
+            .flatten();
+        if let Some(commit_oid) = commit_oid {
+            self.resolve_custom_from_commit_boundary(commit_oid, label, window, cx);
+        } else {
+            self.resolve_custom_from_time_boundary(timestamp, label, window, cx);
+        }
+    }
+
+    fn use_comment_as_from(
+        &mut self,
+        editor_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record_id) = self.record_id_by_editor_id.get(&editor_id) else {
+            return;
+        };
+        let Some(record) = self
+            .comment_records
+            .get(record_id)
+            .map(|loaded| &loaded.record)
+        else {
+            return;
+        };
+        if record.source != StackReviewCommentSource::Github {
+            return;
+        }
+        let commit_oid = github_comment_boundary_oid(record).map(str::to_owned);
+        let created_at = record.created_at.clone();
+        let label: SharedString = format!("Before {}'s comment", record.author.name).into();
+        if let Some(commit_oid) = commit_oid {
+            self.resolve_custom_from_commit_boundary(commit_oid, label, window, cx);
+            return;
+        }
+        let Ok(created_at) =
+            OffsetDateTime::parse(&created_at, &time::format_description::well_known::Rfc3339)
+        else {
+            self.state_error = Some("GitHub comment has no valid creation timestamp".into());
+            cx.notify();
+            return;
+        };
+        self.resolve_custom_from_time_boundary(created_at.unix_timestamp(), label, window, cx);
+    }
+
+    fn resolve_custom_from_commit_boundary(
+        &mut self,
+        candidate: String,
+        label: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((base_ref, head_ref)) = self.selected_scope.refs(&self.snapshot) else {
             self.state_error = Some("Selected stack range no longer exists".into());
             cx.notify();
             return;
         };
         let receiver = self.repository.update(cx, |repository, _| {
-            repository.stack_review_diff_from_time_checkpoint(
+            repository.resolve_stack_review_commit_boundary(
                 base_ref.to_owned(),
                 head_ref.to_owned(),
-                cutoff,
+                candidate,
             )
         });
-        let project = self.project.clone();
-        let workspace = self.workspace.clone();
-        let work_directory = self.work_directory.clone();
-        let title = self.cutoff_comparison_title();
-        let split_left_ratio = self.split_left_ratio;
+        self.apply_custom_from_boundary(receiver, label, window, cx);
+    }
+
+    fn resolve_custom_from_time_boundary(
+        &mut self,
+        timestamp: i64,
+        label: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((base_ref, head_ref)) = self.selected_scope.refs(&self.snapshot) else {
+            self.state_error = Some("Selected stack range no longer exists".into());
+            cx.notify();
+            return;
+        };
+        let receiver = self.repository.update(cx, |repository, _| {
+            repository.resolve_stack_review_time_checkpoint(
+                base_ref.to_owned(),
+                head_ref.to_owned(),
+                timestamp,
+            )
+        });
+        self.apply_custom_from_boundary(receiver, label, window, cx);
+    }
+
+    fn apply_custom_from_boundary(
+        &mut self,
+        receiver: oneshot::Receiver<Result<String>>,
+        label: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request_generation = self.checkpoint_boundary_requests.start();
         self.state_error = None;
         cx.notify();
-
-        self.checkpoint_diff_task = cx.spawn_in(window, async move |this, cx| {
-            let result: Result<()> = async {
-                let diff = receiver.await??;
-                let entries = diff
-                    .files
-                    .into_iter()
-                    .map(|file| content_entry_for_stack_file(file, &work_directory))
-                    .collect();
-                let workspace_entity = workspace
-                    .upgrade()
-                    .context("Stack Review workspace no longer exists")?;
-                let build_task = cx.update(|window, cx| {
-                    MultiDiffView::build_from_content(
-                        entries,
-                        project,
-                        workspace_entity,
-                        window,
-                        cx,
-                    )
-                })?;
-                let diff_view = build_task.await?;
-                workspace.update_in(cx, |workspace, window, cx| {
-                    diff_view.update(cx, |diff_view, cx| {
-                        diff_view.set_title(title);
-                        diff_view.set_split_left_ratio(split_left_ratio, cx);
-                        diff_view.editor().update(cx, |editor, cx| {
-                            editor.set_show_diff_review_button(false, cx);
-                            editor.set_stack_review_mode(false, cx);
-                        });
-                    });
-                    workspace.add_item_to_active_pane(Box::new(diff_view), None, true, window, cx);
-                })?;
-                Ok(())
-            }
-            .await;
-            if let Err(error) = this.update(cx, |this, cx| {
-                this.state_error = result.err().map(|error| error.to_string().into());
-                cx.notify();
+        self.checkpoint_boundary_task = cx.spawn_in(window, async move |this, cx| {
+            let result = match receiver.await {
+                Ok(result) => result,
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                if !this
+                    .checkpoint_boundary_requests
+                    .is_current(request_generation)
+                {
+                    return;
+                }
+                match result {
+                    Ok(oid) => {
+                        this.custom_from_boundary = Some(CustomFromBoundary { oid, label });
+                        this.time_filter = StackReviewTimeFilter::All;
+                        this.selected_commenter = None;
+                        this.state_error = None;
+                        this.load_scope(this.selected_scope, window, cx);
+                    }
+                    Err(error) => {
+                        this.state_error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                }
             }) {
-                log::error!("failed to report cutoff diff result: {error:#}");
+                log::error!("failed to apply custom From boundary: {error:#}");
             }
         });
+    }
+
+    fn apply_commit_boundary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let candidate = self.commit_boundary_editor.read(cx).text(cx);
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            self.state_error = Some("Enter a commit revision for From".into());
+            cx.notify();
+            return;
+        }
+        let label: SharedString = format!("Commit {candidate}").into();
+        self.resolve_custom_from_commit_boundary(candidate.to_owned(), label, window, cx);
     }
 
     fn apply_custom_days(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2926,6 +3087,14 @@ impl StackReview {
             .unwrap_or_else(|| "Missing boundary".into())
     }
 
+    fn selected_boundary_label(&self, select_from: bool, index: usize) -> SharedString {
+        if select_from && let Some(boundary) = &self.custom_from_boundary {
+            let short_oid = boundary.oid.get(..8).unwrap_or(&boundary.oid);
+            return format!("{} · {short_oid}", boundary.label).into();
+        }
+        self.boundary_label(index)
+    }
+
     fn set_boundary_range(
         &mut self,
         from: usize,
@@ -2939,6 +3108,7 @@ impl StackReview {
             return;
         }
         self.state_error = None;
+        self.custom_from_boundary = None;
         self.load_scope(StackReviewScope::Range { from, to }, window, cx);
     }
 
@@ -2959,7 +3129,11 @@ impl StackReview {
                 .map(|index| (index, self.boundary_label(index)))
                 .collect::<Vec<_>>()
         };
-        let selected_position = choices.iter().position(|(index, _)| *index == selected);
+        let selected_position = if select_from && self.custom_from_boundary.is_some() {
+            None
+        } else {
+            choices.iter().position(|(index, _)| *index == selected)
+        };
         let weak = cx.weak_entity();
         DropdownMenu::new(
             if select_from {
@@ -2967,7 +3141,7 @@ impl StackReview {
             } else {
                 "stack-review-to"
             },
-            self.boundary_label(selected),
+            self.selected_boundary_label(select_from, selected),
             ContextMenu::build(window, cx, move |mut menu, window, cx| {
                 for (index, label) in &choices {
                     let index = *index;
@@ -3186,12 +3360,12 @@ impl StackReview {
             )
             .child(
                 div()
-                    .debug_selector(|| "STACK_REVIEW_OPEN_CUTOFF_DIFF".to_owned())
+                    .debug_selector(|| "STACK_REVIEW_USE_CUTOFF_FROM".to_owned())
                     .child(
-                        Button::new("stack-review-open-cutoff-diff", "Open Cutoff Diff")
-                            .disabled(self.time_filter.cutoff().is_none())
+                        Button::new("stack-review-use-cutoff-from", "Use Cutoff as From")
+                            .disabled(self.time_filter.checkpoint_timestamp().is_none())
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_time_checkpoint_diff(window, cx);
+                                this.use_time_filter_as_from(window, cx);
                             })),
                     ),
             );
@@ -3207,6 +3381,24 @@ impl StackReview {
                     .debug_selector(|| "STACK_REVIEW_FROM_BOUNDARY".to_owned())
                     .child(from_dropdown),
             )
+            .child(Label::new("Commit From").color(Color::Muted))
+            .child(
+                div()
+                    .debug_selector(|| "STACK_REVIEW_COMMIT_FROM".to_owned())
+                    .w(px(120.))
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_md()
+                    .px_1()
+                    .child(self.commit_boundary_editor.clone()),
+            )
+            .child(
+                Button::new("stack-review-apply-commit-from", "Use").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.apply_commit_boundary(window, cx);
+                    },
+                )),
+            )
             .child(Label::new("To").color(Color::Muted))
             .child(
                 div()
@@ -3216,15 +3408,23 @@ impl StackReview {
             .child(shortcuts)
             .child(
                 Button::new("stack-review-aggregate", "Whole Stack")
-                    .toggle_state(self.selected_scope.boundaries() == aggregate_scope.boundaries())
+                    .toggle_state(
+                        self.custom_from_boundary.is_none()
+                            && self.selected_scope.boundaries() == aggregate_scope.boundaries(),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        this.custom_from_boundary = None;
                         this.load_scope(aggregate_scope, window, cx);
                     })),
             )
             .child(
                 Button::new("stack-review-current", "Current PR")
-                    .toggle_state(self.selected_scope.boundaries() == current_scope.boundaries())
+                    .toggle_state(
+                        self.custom_from_boundary.is_none()
+                            && self.selected_scope.boundaries() == current_scope.boundaries(),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        this.custom_from_boundary = None;
                         this.load_scope(current_scope, window, cx);
                     })),
             );
@@ -3512,6 +3712,9 @@ mod tests {
 
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(github_comment_boundary_oid(&records[0]), Some("abc"));
+        assert_eq!(github_comment_boundary_oid(&records[1]), Some("abc"));
+        assert_eq!(github_comment_boundary_oid(&records[2]), None);
         assert_eq!(records[0].start_row, Some(4));
         assert!(!records[0].is_writable());
         assert!(records[0].resolved);
@@ -3658,6 +3861,16 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_boundary_requests_are_invalidated_by_scope_changes() {
+        let mut requests = CheckpointBoundaryRequestTracker::default();
+        let pending_request = requests.start();
+        assert!(requests.is_current(pending_request));
+
+        requests.invalidate();
+        assert!(!requests.is_current(pending_request));
+    }
+
+    #[test]
     fn commenter_cutoff_uses_the_latest_comment_from_each_person() {
         let records = HashMap::from([
             (
@@ -3717,6 +3930,10 @@ mod tests {
         assert_eq!(
             StackReviewTimeFilter::AfterComment(adam.timestamp).cutoff(),
             Some(1_787_326_201)
+        );
+        assert_eq!(
+            StackReviewTimeFilter::AfterComment(adam.timestamp).checkpoint_timestamp(),
+            Some(1_787_326_200)
         );
     }
 
@@ -4063,8 +4280,10 @@ mod tests {
                     snapshot,
                     current_layer: 0,
                     selected_scope: StackReviewScope::AggregateThrough(0),
+                    custom_from_boundary: None,
                     time_filter: StackReviewTimeFilter::All,
                     custom_days_editor: cx.new(|cx| Editor::single_line(window, cx)),
+                    commit_boundary_editor: cx.new(|cx| Editor::single_line(window, cx)),
                     has_worktree_changes: false,
                     diverged_layer_count: 0,
                     repository,
@@ -4155,13 +4374,18 @@ mod tests {
                     state_write_generations: HashMap::new(),
                     editor_subscription: None,
                     comment_watch_task: Task::ready(()),
-                    checkpoint_diff_task: Task::ready(()),
+                    checkpoint_boundary_task: Task::ready(()),
+                    checkpoint_boundary_requests: CheckpointBoundaryRequestTracker::default(),
                 });
                 workspace.add_item_to_active_pane(Box::new(review.clone()), None, true, window, cx);
                 review
             })
             .expect("update workspace");
         review.update(&mut visual_context, |review, cx| {
+            review.custom_from_boundary = Some(CustomFromBoundary {
+                oid: "checkpoint-oid".into(),
+                label: "Before Adam's comment".into(),
+            });
             review.file_comment_statuses = HashMap::from([
                 (
                     "first.rs".into(),
@@ -4181,6 +4405,12 @@ mod tests {
             cx.notify();
         });
         visual_context.run_until_parked();
+        assert_eq!(
+            review.read_with(&visual_context, |review, _| {
+                review.selected_boundary_label(true, 0)
+            }),
+            "Before Adam's comment · checkpoi"
+        );
         assert!(
             visual_context
                 .debug_bounds("STACK_REVIEW_FILE_COMMENT-0-comments")
@@ -4248,6 +4478,12 @@ mod tests {
         );
         assert!(
             visual_context
+                .debug_bounds("STACK_REVIEW_COMMIT_FROM")
+                .is_some(),
+            "manual commit From boundary must render"
+        );
+        assert!(
+            visual_context
                 .debug_bounds("STACK_REVIEW_TO_BOUNDARY")
                 .is_some(),
             "To boundary dropdown must render"
@@ -4260,7 +4496,7 @@ mod tests {
         );
         assert!(
             visual_context
-                .debug_bounds("STACK_REVIEW_OPEN_CUTOFF_DIFF")
+                .debug_bounds("STACK_REVIEW_USE_CUTOFF_FROM")
                 .is_some(),
             "cutoff comparison button must render"
         );

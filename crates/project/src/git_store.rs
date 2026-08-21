@@ -8857,19 +8857,47 @@ impl Repository {
         )
     }
 
-    pub fn stack_review_diff_from_time_checkpoint(
+    pub fn resolve_stack_review_commit_boundary(
         &mut self,
         base_ref: String,
         head_ref: String,
-        author_timestamp: i64,
-    ) -> oneshot::Receiver<Result<git::stack_review::StackReviewDiff>> {
+        candidate: String,
+    ) -> oneshot::Receiver<Result<String>> {
         self.send_job(
-            "stack_review_diff_from_time_checkpoint",
+            "resolve_stack_review_commit_boundary",
             None,
             move |repo, _cx| async move {
                 match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                        git::stack_review::load_stack_diff_from_time_checkpoint(
+                        git::stack_review::resolve_stack_review_commit_boundary(
+                            backend.as_ref(),
+                            &base_ref,
+                            &head_ref,
+                            &candidate,
+                        )
+                        .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        bail!("stack review is only available for local repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn resolve_stack_review_time_checkpoint(
+        &mut self,
+        base_ref: String,
+        head_ref: String,
+        author_timestamp: i64,
+    ) -> oneshot::Receiver<Result<String>> {
+        self.send_job(
+            "resolve_stack_review_time_checkpoint",
+            None,
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        git::stack_review::resolve_stack_review_time_checkpoint(
                             backend.as_ref(),
                             &base_ref,
                             &head_ref,
