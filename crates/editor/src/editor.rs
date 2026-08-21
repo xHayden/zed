@@ -11857,6 +11857,10 @@ pub enum EditorEvent {
         /// The new total count of review comments.
         total_count: usize,
     },
+    ReviewCommentResolutionChanged {
+        ids: Vec<usize>,
+        resolved: bool,
+    },
     InputIgnored {
         text: Arc<str>,
     },

@@ -15,9 +15,10 @@ use git::{
     },
 };
 use gpui::{
-    AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, IntoElement, PromptLevel, Render, SharedString,
-    Subscription, Task, Window, actions, prelude::*, px, uniform_list,
+    AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DragMoveEvent,
+    Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Pixels, PromptLevel,
+    Render, SharedString, Subscription, Task, Window, actions, deferred, prelude::*, px,
+    uniform_list,
 };
 use project::{Project, git_store::Repository};
 use std::{
@@ -49,8 +50,29 @@ actions!(
     [
         /// Reviews the current branch as part of its local GitHub stack.
         ReviewStack,
+        /// Selects the next visible Stack Review file.
+        StackReviewNextFile,
+        /// Selects the previous visible Stack Review file.
+        StackReviewPreviousFile,
+        /// Shows or hides test files in Stack Review.
+        StackReviewToggleTests,
+        /// Shows or hides migration files in Stack Review.
+        StackReviewToggleMigrations,
     ]
 );
+
+#[derive(Clone)]
+struct DraggedStackReviewSidebar;
+
+const STACK_REVIEW_SIDEBAR_DEFAULT_WIDTH: Pixels = px(280.);
+const STACK_REVIEW_SIDEBAR_MIN_WIDTH: Pixels = px(200.);
+const STACK_REVIEW_SIDEBAR_MAX_WIDTH: Pixels = px(720.);
+
+impl Render for DraggedStackReviewSidebar {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,6 +257,128 @@ async fn github_api_values(
     Ok(pages.into_iter().flatten().collect())
 }
 
+async fn github_api_value(work_directory: &Path, endpoint: &str) -> Result<serde_json::Value> {
+    let output = util::command::new_command("gh")
+        .args(["api", endpoint])
+        .env("GH_PROMPT_DISABLED", "1")
+        .current_dir(work_directory)
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "GitHub API request failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+async fn github_review_thread_states(
+    work_directory: &Path,
+    repository: &str,
+    pull_request_number: u32,
+) -> Result<HashMap<u64, (bool, bool)>> {
+    let (owner, name) = repository
+        .split_once('/')
+        .context("GitHub repository name is missing its owner")?;
+    let query = r#"
+        query($owner: String!, $name: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  isResolved
+                  isOutdated
+                  comments(first: 100) { nodes { databaseId } }
+                }
+              }
+            }
+          }
+        }
+    "#;
+    let mut states = HashMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut arguments = vec![
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={query}"),
+            "-F".to_owned(),
+            format!("owner={owner}"),
+            "-F".to_owned(),
+            format!("name={name}"),
+            "-F".to_owned(),
+            format!("number={pull_request_number}"),
+        ];
+        if let Some(cursor) = &cursor {
+            arguments.extend(["-F".to_owned(), format!("after={cursor}")]);
+        }
+        let output = util::command::new_command("gh")
+            .args(arguments)
+            .env("GH_PROMPT_DISABLED", "1")
+            .current_dir(work_directory)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "GitHub review-thread lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let threads = response
+            .pointer("/data/repository/pullRequest/reviewThreads")
+            .context("GitHub review-thread lookup returned no threads")?;
+        for thread in threads
+            .get("nodes")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let resolved = thread
+                .get("isResolved")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let outdated = thread
+                .get("isOutdated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            for comment in thread
+                .pointer("/comments/nodes")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(database_id) = comment
+                    .get("databaseId")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    states.insert(database_id, (resolved, outdated));
+                }
+            }
+        }
+        let page_info = threads
+            .get("pageInfo")
+            .context("GitHub review-thread lookup returned no page info")?;
+        if !page_info
+            .get("hasNextPage")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        cursor = page_info
+            .get("endCursor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        anyhow::ensure!(
+            cursor.is_some(),
+            "GitHub review-thread pagination has no cursor"
+        );
+    }
+    Ok(states)
+}
+
 fn github_author(value: &serde_json::Value) -> StackReviewCommentAuthor {
     let login = value
         .pointer("/user/login")
@@ -254,6 +398,8 @@ fn github_comment_records(
     inline_comments: Vec<serde_json::Value>,
     reviews: Vec<serde_json::Value>,
     conversation_comments: Vec<serde_json::Value>,
+    thread_states: &HashMap<u64, (bool, bool)>,
+    force_outdated: bool,
 ) -> Result<Vec<StackReviewCommentRecord>> {
     let mut records = Vec::new();
     for value in inline_comments {
@@ -282,7 +428,9 @@ fn github_comment_records(
             _ => StackReviewCommentSide::Right,
         };
         let id = format!("github-pr-{pull_request_number}-inline-{github_id}");
-        records.push(StackReviewCommentRecord::new_github_inline(
+        let (resolved, thread_outdated) =
+            thread_states.get(&github_id).copied().unwrap_or_default();
+        let mut record = StackReviewCommentRecord::new_github_inline(
             id,
             base_oid.to_owned(),
             head_oid.to_owned(),
@@ -300,8 +448,8 @@ fn github_comment_records(
                 .and_then(serde_json::Value::as_u64)
                 .map(|id| format!("github-pr-{pull_request_number}-inline-{id}")),
             value
-                .get("updated_at")
-                .or_else(|| value.get("created_at"))
+                .get("created_at")
+                .or_else(|| value.get("updated_at"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
@@ -319,8 +467,15 @@ fn github_comment_records(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
             },
-            current_line.is_none(),
-        ));
+            current_line.is_none() || thread_outdated || force_outdated,
+        );
+        record.updated_at = value
+            .get("updated_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(record.created_at.as_str())
+            .to_owned();
+        record.resolved = resolved;
+        records.push(record);
     }
     for (kind, values) in [
         (StackReviewGitHubCommentKind::Review, reviews),
@@ -386,9 +541,9 @@ async fn refresh_github_comment_projection(
     github_directory: &Path,
     base_oid: &str,
     head_oid: &str,
-    pull_request_numbers: &[u32],
+    pull_requests: &[(u32, String)],
 ) -> Result<()> {
-    if pull_request_numbers.is_empty() {
+    if pull_requests.is_empty() {
         return Ok(());
     }
     let output = util::command::new_command("gh")
@@ -408,7 +563,19 @@ async fn refresh_github_comment_projection(
         .and_then(serde_json::Value::as_str)
         .context("GitHub repository lookup returned no nameWithOwner")?;
     let mut records = Vec::new();
-    for pull_request_number in pull_request_numbers {
+    for (pull_request_number, expected_head_oid) in pull_requests {
+        let pull_request = github_api_value(
+            work_directory,
+            &format!("repos/{repository}/pulls/{pull_request_number}"),
+        )
+        .await?;
+        let remote_head_oid = pull_request
+            .pointer("/head/sha")
+            .and_then(serde_json::Value::as_str)
+            .context("GitHub pull request returned no head SHA")?;
+        let force_outdated = remote_head_oid != expected_head_oid;
+        let thread_states =
+            github_review_thread_states(work_directory, repository, *pull_request_number).await?;
         let inline = github_api_values(
             work_directory,
             &format!("repos/{repository}/pulls/{pull_request_number}/comments"),
@@ -431,11 +598,25 @@ async fn refresh_github_comment_projection(
             inline,
             reviews,
             conversation,
+            &thread_states,
+            force_outdated,
         )?);
     }
     let mut expected_paths = HashSet::new();
-    for record in records {
+    for mut record in records {
         let path = github_directory.join(comment_file_name(&record));
+        if fs.is_file(&path).await {
+            match fs.load(&path).await.and_then(|serialized| {
+                StackReviewCommentRecord::from_json(&serialized, base_oid, head_oid)
+            }) {
+                Ok(existing) => record.local_resolution = existing.local_resolution,
+                Err(error) => {
+                    log::warn!(
+                        "unable to preserve local comment resolution at {path:?}: {error:#}"
+                    );
+                }
+            }
+        }
         expected_paths.insert(path.clone());
         fs.atomic_write(path, record.to_json()?).await?;
     }
@@ -558,6 +739,55 @@ struct StackReviewFileItem {
     content_kind: StackReviewContentKind,
 }
 
+fn is_test_path(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    if path
+        .split('/')
+        .any(|component| matches!(component, "test" | "tests" | "__tests__" | "test-data"))
+    {
+        return true;
+    }
+    let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+    if file_name.contains(".test.") || file_name.contains(".it-test.") {
+        return true;
+    }
+    file_name
+        .rsplit_once(".spec.")
+        .is_some_and(|(_, extension)| {
+            matches!(
+                extension,
+                "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" | "py" | "rs" | "go"
+            )
+        })
+}
+
+fn is_migration_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let components = path.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|component| *component == "migrations")
+    {
+        return true;
+    }
+    let Some((stem, extension)) = components
+        .last()
+        .and_then(|file_name| file_name.rsplit_once('.'))
+    else {
+        return false;
+    };
+    matches!(extension, "sql" | "ts" | "js")
+        && (stem == "migration"
+            || stem.ends_with(".migration")
+            || stem.ends_with("_migration")
+            || stem.ends_with("-migration"))
+}
+
+fn is_visible_review_path(path: &str, hide_tests: bool, hide_migrations: bool) -> bool {
+    !(hide_tests && is_test_path(path) || hide_migrations && is_migration_path(path))
+}
+
 fn stack_review_file_fingerprint(file: &git::stack_review::StackReviewFileDiff) -> SharedString {
     let identity = format!(
         "{}\0{:?}\0{:?}\0{:?}",
@@ -623,8 +853,12 @@ async fn build_active_diff_view(
     Vec<git::stack_review::StackReviewComment>,
 )> {
     let entries = entry.into_iter().collect();
-    let build_task =
-        cx.update(|window, cx| MultiDiffView::build_from_content(entries, project, window, cx))?;
+    let workspace_entity = workspace
+        .upgrade()
+        .context("Stack Review workspace no longer exists")?;
+    let build_task = cx.update(|window, cx| {
+        MultiDiffView::build_from_content(entries, project, workspace_entity, window, cx)
+    })?;
     let diff_view = build_task.await?;
     let restored_comments = cx.update(|window, cx| {
         diff_view.read(cx).editor().update(cx, |editor, cx| {
@@ -783,11 +1017,16 @@ async fn load_all_comment_records(
     Ok(records)
 }
 
-fn project_comment_records(records: &HashMap<String, LoadedCommentRecord>) -> CommentProjection {
+fn project_comment_records(
+    records: &HashMap<String, LoadedCommentRecord>,
+    include_resolved: bool,
+) -> CommentProjection {
     let mut inline_records = records
         .values()
         .filter(|loaded| {
-            loaded.record.side == StackReviewCommentSide::Right && !loaded.record.outdated
+            loaded.record.side == StackReviewCommentSide::Right
+                && !loaded.record.outdated
+                && (include_resolved || !loaded.record.is_resolved())
         })
         .collect::<Vec<_>>();
     inline_records.sort_by(|left, right| {
@@ -815,6 +1054,8 @@ fn project_comment_records(records: &HashMap<String, LoadedCommentRecord>) -> Co
                 end_row: loaded.record.end_row.unwrap_or_default(),
                 end_column: loaded.record.end_column.unwrap_or_default(),
                 body: loaded.record.body.clone(),
+                created_at: loaded.record.created_at.clone(),
+                resolved: loaded.record.is_resolved(),
                 author: loaded.record.author.clone(),
                 source: loaded.record.source,
                 reply_to: loaded
@@ -901,6 +1142,7 @@ struct LoadedStackReview {
     state_error: Option<SharedString>,
     files: Vec<StackReviewFileItem>,
     content_entries: Vec<ContentDiffEntry>,
+    selected_file_index: Option<usize>,
     rendered_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
     record_id_by_editor_id: HashMap<usize, String>,
@@ -927,6 +1169,10 @@ pub struct StackReview {
     files: Vec<StackReviewFileItem>,
     content_entries: Vec<ContentDiffEntry>,
     selected_file_index: Option<usize>,
+    hide_tests: bool,
+    hide_migrations: bool,
+    show_resolved_comments: bool,
+    sidebar_width: Pixels,
     review_comment_count: usize,
     rendered_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
@@ -1144,6 +1390,10 @@ impl StackReview {
             files: Vec::new(),
             content_entries: Vec::new(),
             selected_file_index: None,
+            hide_tests: false,
+            hide_migrations: false,
+            show_resolved_comments: false,
+            sidebar_width: STACK_REVIEW_SIDEBAR_DEFAULT_WIDTH,
             review_comment_count: 0,
             rendered_comment_ids: HashSet::new(),
             comment_records: HashMap::new(),
@@ -1212,12 +1462,20 @@ impl StackReview {
         let fs = self.fs.clone();
         let state_root = self.state_root.clone();
         let work_directory = self.work_directory.clone();
-        let layer_pull_requests: Vec<u32> = match scope {
+        let show_resolved_comments = self.show_resolved_comments;
+        let hide_tests = self.hide_tests;
+        let hide_migrations = self.hide_migrations;
+        let layer_pull_requests: Vec<(u32, String)> = match scope {
             StackReviewScope::Layer(index) => self
                 .snapshot
                 .layers
                 .get(index)
-                .and_then(|layer| layer.head.pull_request_number)
+                .and_then(|layer| {
+                    layer
+                        .head
+                        .pull_request_number
+                        .map(|number| (number, layer.head.oid.clone()))
+                })
                 .into_iter()
                 .collect(),
             StackReviewScope::AggregateThrough(index) => self
@@ -1225,7 +1483,12 @@ impl StackReview {
                 .layers
                 .iter()
                 .take(index.saturating_add(1))
-                .filter_map(|layer| layer.head.pull_request_number)
+                .filter_map(|layer| {
+                    layer
+                        .head
+                        .pull_request_number
+                        .map(|number| (number, layer.head.oid.clone()))
+                })
                 .collect(),
             StackReviewScope::Range { from, to } => self
                 .snapshot
@@ -1233,7 +1496,12 @@ impl StackReview {
                 .iter()
                 .skip(from)
                 .take(to.saturating_sub(from))
-                .filter_map(|layer| layer.head.pull_request_number)
+                .filter_map(|layer| {
+                    layer
+                        .head
+                        .pull_request_number
+                        .map(|number| (number, layer.head.oid.clone()))
+                })
                 .collect(),
         };
         self.load_task = cx.spawn_in(window, async move |this, cx| {
@@ -1295,28 +1563,19 @@ impl StackReview {
                         Some(review_state_path.clone()),
                     )
                 };
-                let github_projection_marker = github_comments_directory.join(".complete");
-                if !fs.is_file(&github_projection_marker).await {
-                    match refresh_github_comment_projection(
-                        &fs,
-                        &work_directory,
-                        &github_comments_directory,
-                        &diff.base_ref,
-                        &diff.head_ref,
-                        &layer_pull_requests,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            fs.atomic_write(github_projection_marker, "complete\n".into())
-                                .await?;
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "unable to load GitHub comments; using local projection: {error:#}"
-                            );
-                        }
-                    }
+                if let Err(error) = refresh_github_comment_projection(
+                    &fs,
+                    &work_directory,
+                    &github_comments_directory,
+                    &diff.base_ref,
+                    &diff.head_ref,
+                    &layer_pull_requests,
+                )
+                .await
+                {
+                    log::warn!(
+                        "unable to refresh GitHub comments; using local projection: {error:#}"
+                    );
                 }
                 let mut comment_records = load_all_comment_records(
                     &fs,
@@ -1347,12 +1606,16 @@ impl StackReview {
                     format!("reviews/{storage_key}.json"),
                     format!("comments/{storage_key}"),
                     format!("github/{storage_key}"),
-                    layer_pull_requests,
+                    layer_pull_requests
+                        .iter()
+                        .map(|(number, _)| *number)
+                        .collect(),
                 );
                 fs.atomic_write(state_root.join("current.json"), manifest.to_json()?)
                     .await?;
-                let comment_projection = project_comment_records(&comment_records);
-                let files = diff
+                let comment_projection =
+                    project_comment_records(&comment_records, show_resolved_comments);
+                let files: Vec<StackReviewFileItem> = diff
                     .files
                     .iter()
                     .map(|file| StackReviewFileItem {
@@ -1384,7 +1647,12 @@ impl StackReview {
                         }
                     })
                     .collect();
-                let active_entry = content_entries.first().cloned();
+                let selected_file_index = files.iter().position(|file| {
+                    is_visible_review_path(&file.path, hide_tests, hide_migrations)
+                });
+                let active_entry = selected_file_index
+                    .and_then(|index| content_entries.get(index))
+                    .cloned();
                 let (diff_view, restored_comments) = build_active_diff_view(
                     active_entry,
                     comment_projection.comments,
@@ -1403,6 +1671,7 @@ impl StackReview {
                     state_error,
                     files,
                     content_entries,
+                    selected_file_index,
                     rendered_comment_ids,
                     comment_records,
                     record_id_by_editor_id: comment_projection.record_id_by_editor_id,
@@ -1415,9 +1684,10 @@ impl StackReview {
             if let Err(error) = this.update_in(cx, |this, window, cx| match result {
                 Ok(loaded) => {
                     let editor = loaded.diff_view.read(cx).editor();
+                    let selected_file_index = loaded.selected_file_index;
                     let active_path = loaded
-                        .content_entries
-                        .first()
+                        .selected_file_index
+                        .and_then(|index| loaded.content_entries.get(index))
                         .map(|entry| entry.path.to_string_lossy().into_owned());
                     let review_comment_count = loaded.comment_records.len();
                     if let Some(nav_history) = this.nav_history.clone() {
@@ -1425,13 +1695,13 @@ impl StackReview {
                             editor.set_nav_history(Some(nav_history));
                         });
                     }
-                    this.diff_view = Some(loaded.diff_view);
+                    this.diff_view = selected_file_index.map(|_| loaded.diff_view);
                     this.provenance_summary = Some(loaded.provenance_summary);
                     this.review_state = Some(loaded.review_state);
                     this.review_state_path = loaded.review_state_path;
                     this.files = loaded.files;
                     this.content_entries = loaded.content_entries;
-                    this.selected_file_index = (!this.files.is_empty()).then_some(0);
+                    this.selected_file_index = selected_file_index;
                     this.review_comment_count = review_comment_count;
                     this.rendered_comment_ids = loaded.rendered_comment_ids;
                     this.comment_records = loaded.comment_records;
@@ -1445,13 +1715,26 @@ impl StackReview {
                         this.selected_file_index
                     );
                     this.editor_subscription = active_path.map(|active_path| {
-                        cx.subscribe(&editor, move |this, editor, event: &EditorEvent, cx| {
-                            cx.emit(event.clone());
-                            if let EditorEvent::ReviewCommentsChanged { .. } = event {
-                                let comments = editor.read(cx).stack_review_comments(cx);
-                                this.reconcile_editor_comments(&active_path, comments, cx);
-                            }
-                        })
+                        cx.subscribe_in(
+                            &editor,
+                            window,
+                            move |this, editor, event: &EditorEvent, window, cx| {
+                                cx.emit(event.clone());
+                                match event {
+                                    EditorEvent::ReviewCommentsChanged { .. } => {
+                                        let comments = editor.read(cx).stack_review_comments(cx);
+                                        this.reconcile_editor_comments(&active_path, comments, cx);
+                                    }
+                                    EditorEvent::ReviewCommentResolutionChanged {
+                                        ids,
+                                        resolved,
+                                    } => {
+                                        this.persist_comment_resolution(ids, *resolved, window, cx);
+                                    }
+                                    _ => {}
+                                }
+                            },
+                        )
                     });
                     this.state_error = loaded.state_error;
                     this.error = None;
@@ -1481,7 +1764,8 @@ impl StackReview {
             return;
         };
         let active_path = entry.path.to_string_lossy().into_owned();
-        let comment_projection = project_comment_records(&self.comment_records);
+        let comment_projection =
+            project_comment_records(&self.comment_records, self.show_resolved_comments);
         let comments = comment_projection.comments;
         self.record_id_by_editor_id = comment_projection.record_id_by_editor_id;
         self.selected_file_index = Some(index);
@@ -1507,13 +1791,20 @@ impl StackReview {
                     this.rendered_comment_ids =
                         restored_comments.iter().map(|comment| comment.id).collect();
                     this.diff_view = Some(diff_view);
-                    this.editor_subscription = Some(cx.subscribe(
+                    this.editor_subscription = Some(cx.subscribe_in(
                         &editor,
-                        move |this, editor, event: &EditorEvent, cx| {
+                        window,
+                        move |this, editor, event: &EditorEvent, window, cx| {
                             cx.emit(event.clone());
-                            if let EditorEvent::ReviewCommentsChanged { .. } = event {
-                                let comments = editor.read(cx).stack_review_comments(cx);
-                                this.reconcile_editor_comments(&active_path, comments, cx);
+                            match event {
+                                EditorEvent::ReviewCommentsChanged { .. } => {
+                                    let comments = editor.read(cx).stack_review_comments(cx);
+                                    this.reconcile_editor_comments(&active_path, comments, cx);
+                                }
+                                EditorEvent::ReviewCommentResolutionChanged { ids, resolved } => {
+                                    this.persist_comment_resolution(ids, *resolved, window, cx);
+                                }
+                                _ => {}
                             }
                         },
                     ));
@@ -1571,8 +1862,11 @@ impl StackReview {
                         );
                         this.comment_records = records;
                         this.review_comment_count = this.comment_records.len();
-                        this.record_id_by_editor_id =
-                            project_comment_records(&this.comment_records).record_id_by_editor_id;
+                        this.record_id_by_editor_id = project_comment_records(
+                            &this.comment_records,
+                            this.show_resolved_comments,
+                        )
+                        .record_id_by_editor_id;
                         this.state_error = Some(
                             "Comments changed on disk; switch files to refresh the active diff"
                                 .into(),
@@ -1590,6 +1884,62 @@ impl StackReview {
                 }
             }
         });
+    }
+
+    fn persist_comment_resolution(
+        &mut self,
+        editor_ids: &[usize],
+        resolved: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut writes = Vec::new();
+        for editor_id in editor_ids {
+            let Some(record_id) = self.record_id_by_editor_id.get(editor_id).cloned() else {
+                continue;
+            };
+            let Some(loaded) = self.comment_records.get_mut(&record_id) else {
+                continue;
+            };
+            let expected = loaded.serialized.clone();
+            let mut record = loaded.record.clone();
+            if record.source == StackReviewCommentSource::Github {
+                record.local_resolution = Some(resolved);
+            } else {
+                record.resolved = resolved;
+            }
+            record.updated_at = stack_review_timestamp();
+            let Ok(serialized) = record.to_json() else {
+                self.state_error = Some("Unable to serialize comment resolution".into());
+                cx.notify();
+                return;
+            };
+            writes.push(CommentWrite::Upsert {
+                path: loaded.path.clone(),
+                expected: Some(expected),
+                serialized: serialized.clone(),
+            });
+            loaded.record = record;
+            loaded.serialized = serialized;
+        }
+        if writes.is_empty() {
+            return;
+        }
+        let fs = self.fs.clone();
+        let write_lock = self.comment_write_lock.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = apply_comment_writes(fs, write_lock, writes).await;
+            if let Err(update_error) = this.update(cx, |this, cx| {
+                this.state_error = result.err().map(|error| error.to_string().into());
+                cx.notify();
+            }) {
+                log::error!("failed to report comment resolution write: {update_error:#}");
+            }
+        })
+        .detach();
+        if let Some(index) = self.selected_file_index {
+            self.select_file(index, window, cx);
+        }
     }
 
     fn reconcile_editor_comments(
@@ -1670,6 +2020,7 @@ impl StackReview {
                 record.updated_at = existing.record.updated_at.clone();
                 record.outdated = existing.record.outdated;
                 record.resolved = existing.record.resolved;
+                record.local_resolution = existing.record.local_resolution;
                 if record == existing.record {
                     continue;
                 }
@@ -1830,6 +2181,93 @@ impl StackReview {
         }
     }
 
+    fn visible_file_indexes(&self) -> Vec<usize> {
+        self.files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                is_visible_review_path(&file.path, self.hide_tests, self.hide_migrations)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    fn select_adjacent_file(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let visible_indexes = self.visible_file_indexes();
+        let Some(current_position) = self
+            .selected_file_index
+            .and_then(|selected| visible_indexes.iter().position(|index| *index == selected))
+        else {
+            if let Some(index) = visible_indexes.first().copied() {
+                self.select_file(index, window, cx);
+            }
+            return;
+        };
+        let next_position = if forward {
+            current_position
+                .saturating_add(1)
+                .min(visible_indexes.len().saturating_sub(1))
+        } else {
+            current_position.saturating_sub(1)
+        };
+        if let Some(index) = visible_indexes.get(next_position).copied() {
+            self.select_file(index, window, cx);
+        }
+    }
+
+    fn next_file(&mut self, _: &StackReviewNextFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_adjacent_file(true, window, cx);
+    }
+
+    fn previous_file(
+        &mut self,
+        _: &StackReviewPreviousFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_adjacent_file(false, window, cx);
+    }
+
+    fn reconcile_filtered_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible_indexes = self.visible_file_indexes();
+        if self
+            .selected_file_index
+            .is_some_and(|selected| visible_indexes.contains(&selected))
+        {
+            cx.notify();
+            return;
+        }
+        if let Some(index) = visible_indexes.first().copied() {
+            self.select_file(index, window, cx);
+        } else {
+            self.file_load_task = Task::ready(());
+            self.selected_file_index = None;
+            self.diff_view = None;
+            self.editor_subscription = None;
+            self.rendered_comment_ids.clear();
+            cx.notify();
+        }
+    }
+
+    fn toggle_test_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_tests = !self.hide_tests;
+        self.reconcile_filtered_selection(window, cx);
+    }
+
+    fn toggle_migration_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_migrations = !self.hide_migrations;
+        self.reconcile_filtered_selection(window, cx);
+    }
+
+    fn toggle_resolved_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_resolved_comments = !self.show_resolved_comments;
+        if let Some(index) = self.selected_file_index {
+            self.select_file(index, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     fn render_file_item(&self, index: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let file = self.files.get(index)?.clone();
         let path = file.path.clone();
@@ -1877,41 +2315,119 @@ impl StackReview {
     }
 
     fn render_file_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let visible_indexes = Arc::new(self.visible_file_indexes());
         let reviewed_count = self
             .review_state
             .as_ref()
             .map(StackReviewState::reviewed_file_count)
             .unwrap_or_default();
-        let file_count = self.files.len();
+        let total_file_count = self.files.len();
+        let visible_file_count = visible_indexes.len();
+        let test_count = self
+            .files
+            .iter()
+            .filter(|file| is_test_path(&file.path))
+            .count();
+        let migration_count = self
+            .files
+            .iter()
+            .filter(|file| is_migration_path(&file.path))
+            .count();
         v_flex()
             .id("stack-review-files")
-            .w(px(280.))
+            .debug_selector(|| "STACK_REVIEW_FILE_SIDEBAR".to_owned())
+            .relative()
+            .w(self.sidebar_width)
             .h_full()
             .flex_none()
             .border_r_1()
             .border_color(cx.theme().colors().border)
             .child(
-                h_flex()
+                v_flex()
                     .w_full()
+                    .gap_1()
                     .p_2()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .child(Label::new(format!(
-                        "{reviewed_count}/{file_count} reviewed"
-                    ))),
+                        "{reviewed_count}/{total_file_count} reviewed · {visible_file_count} shown"
+                    )))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .gap_1()
+                            .child(
+                                Button::new(
+                                    "stack-review-filter-tests",
+                                    if self.hide_tests {
+                                        format!("Show Tests ({test_count})")
+                                    } else {
+                                        format!("Hide Tests ({test_count})")
+                                    },
+                                )
+                                .toggle_state(self.hide_tests)
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.toggle_test_filter(window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new(
+                                    "stack-review-filter-migrations",
+                                    if self.hide_migrations {
+                                        format!("Show Migrations ({migration_count})")
+                                    } else {
+                                        format!("Hide Migrations ({migration_count})")
+                                    },
+                                )
+                                .toggle_state(self.hide_migrations)
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.toggle_migration_filter(window, cx);
+                                    },
+                                )),
+                            ),
+                    ),
             )
             .child(
                 uniform_list(
                     "stack-review-file-list",
-                    file_count,
-                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                        range
-                            .filter_map(|index| this.render_file_item(index, cx))
-                            .collect()
+                    visible_file_count,
+                    cx.processor({
+                        move |this, range: std::ops::Range<usize>, _window, cx| {
+                            range
+                                .filter_map(|visible_index| {
+                                    visible_indexes
+                                        .get(visible_index)
+                                        .and_then(|index| this.render_file_item(*index, cx))
+                                })
+                                .collect()
+                        }
                     }),
                 )
                 .flex_1(),
             )
+            .child(deferred(
+                div()
+                    .id("stack-review-sidebar-resize")
+                    .debug_selector(|| "STACK_REVIEW_SIDEBAR_RESIZE".to_owned())
+                    .absolute()
+                    .right(px(-2.))
+                    .top_0()
+                    .h_full()
+                    .w(px(5.))
+                    .cursor_col_resize()
+                    .on_drag(DraggedStackReviewSidebar, |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| gpui::Empty)
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .occlude(),
+            ))
     }
 
     fn render_preserved_comments(&self) -> Option<AnyElement> {
@@ -1935,7 +2451,15 @@ impl StackReview {
             .boundary(index)
             .map(|boundary| {
                 let short_oid = boundary.oid.get(..8).unwrap_or(&boundary.oid);
-                format!("{} · {short_oid}", boundary.branch).into()
+                if let Some(pull_request_number) = boundary.pull_request_number {
+                    format!(
+                        "PR #{pull_request_number} · {} · {short_oid}",
+                        boundary.branch
+                    )
+                    .into()
+                } else {
+                    format!("Trunk · {} · {short_oid}", boundary.branch).into()
+                }
             })
             .unwrap_or_else(|| "Missing boundary".into())
     }
@@ -2020,6 +2544,40 @@ impl StackReview {
         let current_scope = StackReviewScope::Layer(self.current_layer);
         let from_dropdown = self.render_boundary_dropdown(true, window, cx);
         let to_dropdown = self.render_boundary_dropdown(false, window, cx);
+        let shortcut_focus = self.focus_handle(cx);
+        let shortcuts = DropdownMenu::new(
+            "stack-review-shortcuts",
+            "Shortcuts",
+            ContextMenu::build(window, cx, move |menu, _, _| {
+                menu.context(shortcut_focus)
+                    .action("Previous file", Box::new(StackReviewPreviousFile))
+                    .action("Next file", Box::new(StackReviewNextFile))
+                    .separator()
+                    .action(
+                        "Previous changed hunk",
+                        Box::new(editor::actions::GoToPreviousChange),
+                    )
+                    .action(
+                        "Next changed hunk",
+                        Box::new(editor::actions::GoToNextChange),
+                    )
+                    .action(
+                        "Resolve or reopen thread at cursor",
+                        Box::new(editor::actions::ToggleActiveReviewCommentResolved),
+                    )
+                    .separator()
+                    .action("Show or hide tests", Box::new(StackReviewToggleTests))
+                    .action(
+                        "Show or hide migrations",
+                        Box::new(StackReviewToggleMigrations),
+                    )
+            }),
+        );
+        let resolved_comment_count = self
+            .comment_records
+            .values()
+            .filter(|loaded| loaded.record.is_resolved())
+            .count();
         let status = h_flex()
             .w_full()
             .flex_wrap()
@@ -2050,6 +2608,22 @@ impl StackReview {
             .child(
                 Label::new(format!("{} comments", self.review_comment_count)).color(Color::Muted),
             )
+            .when(resolved_comment_count > 0, |status| {
+                status.child(
+                    Button::new(
+                        "stack-review-show-resolved",
+                        if self.show_resolved_comments {
+                            format!("Hide Resolved ({resolved_comment_count})")
+                        } else {
+                            format!("Show Resolved ({resolved_comment_count})")
+                        },
+                    )
+                    .toggle_state(self.show_resolved_comments)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_resolved_comments(window, cx);
+                    })),
+                )
+            })
             .when(self.time_filter != StackReviewTimeFilter::All, |status| {
                 status.child(Label::new("File filter · full file diffs shown").color(Color::Muted))
             })
@@ -2121,6 +2695,7 @@ impl StackReview {
                     .debug_selector(|| "STACK_REVIEW_TO_BOUNDARY".to_owned())
                     .child(to_dropdown),
             )
+            .child(shortcuts)
             .child(
                 Button::new("stack-review-aggregate", "Whole Stack")
                     .toggle_state(self.selected_scope.boundaries() == aggregate_scope.boundaries())
@@ -2207,7 +2782,7 @@ impl Item for StackReview {
     ) -> Option<Box<dyn SearchableItemHandle>> {
         self.diff_view
             .as_ref()
-            .map(|view| Box::new(view.read(cx).editor()) as Box<dyn SearchableItemHandle>)
+            .map(|view| view.read(cx).searchable_handle())
     }
 
     fn set_nav_history(
@@ -2247,9 +2822,30 @@ impl Render for StackReview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(window, cx);
         let file_list = self.render_file_list(cx);
+        let all_files_hidden = !self.files.is_empty() && self.visible_file_indexes().is_empty();
         v_flex()
             .size_full()
+            .key_context("StackReview")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::next_file))
+            .on_action(cx.listener(Self::previous_file))
+            .on_action(cx.listener(|this, _: &StackReviewToggleTests, window, cx| {
+                this.toggle_test_filter(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &StackReviewToggleMigrations, window, cx| {
+                    this.toggle_migration_filter(window, cx);
+                }),
+            )
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedStackReviewSidebar>, _window, cx| {
+                    this.sidebar_width = (event.event.position.x - event.bounds.left()).clamp(
+                        STACK_REVIEW_SIDEBAR_MIN_WIDTH,
+                        STACK_REVIEW_SIDEBAR_MAX_WIDTH,
+                    );
+                    cx.notify();
+                },
+            ))
             .child(header)
             .child(
                 h_flex()
@@ -2272,7 +2868,9 @@ impl Render for StackReview {
                                 )
                             })
                             .when(
-                                self.error.is_none() && self.diff_view.is_none(),
+                                self.error.is_none()
+                                    && self.diff_view.is_none()
+                                    && !all_files_hidden,
                                 |element| {
                                     element.child(
                                         v_flex().size_full().items_center().justify_center().child(
@@ -2281,6 +2879,16 @@ impl Render for StackReview {
                                     )
                                 },
                             )
+                            .when(all_files_hidden, |element| {
+                                element.child(
+                                    v_flex().size_full().items_center().justify_center().child(
+                                        Label::new(
+                                            "All changed files are hidden by the current filters.",
+                                        )
+                                        .color(Color::Muted),
+                                    ),
+                                )
+                            })
                             .when_some(self.diff_view.clone(), |element, diff_view| {
                                 element.child(div().size_full().child(diff_view))
                             }),
@@ -2292,7 +2900,10 @@ impl Render for StackReview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{
+        Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent, TestAppContext, VisualTestContext,
+        point,
+    };
     use language::language_settings::AllLanguageSettings;
     use project::{FakeFs, WorktreeSettings, project_settings::ProjectSettings};
     use serde_json::json;
@@ -2311,6 +2922,35 @@ mod tests {
             ProjectSettings::register(cx);
             WorktreeSettings::register(cx);
             WorkspaceSettings::register(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn stack_review_default_keybindings_load(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            for path in [
+                "keymaps/default-macos.json",
+                "keymaps/default-linux.json",
+                "keymaps/default-windows.json",
+            ] {
+                let bindings = settings::KeymapFile::load_asset_allow_partial_failure(path, cx)
+                    .unwrap_or_else(|error| panic!("failed to load {path}: {error:#}"));
+                for action_name in [
+                    "git::StackReviewPreviousFile",
+                    "git::StackReviewNextFile",
+                    "editor::ToggleActiveReviewCommentResolved",
+                    "git::StackReviewToggleTests",
+                    "git::StackReviewToggleMigrations",
+                ] {
+                    assert!(
+                        bindings
+                            .iter()
+                            .any(|binding| binding.action().name() == action_name),
+                        "{path} did not load {action_name}"
+                    );
+                }
+            }
         });
     }
 
@@ -2346,6 +2986,8 @@ mod tests {
                 "html_url": "https://github.test/conversation",
                 "created_at": "2026-08-21T12:02:00Z"
             })],
+            &HashMap::from([(10, (true, false))]),
+            false,
         )
         .expect("map GitHub comments");
 
@@ -2353,6 +2995,7 @@ mod tests {
         assert_eq!(records[0].path.as_deref(), Some("src/lib.rs"));
         assert_eq!(records[0].start_row, Some(4));
         assert!(!records[0].is_writable());
+        assert!(records[0].resolved);
         assert_eq!(records[1].side, StackReviewCommentSide::TopLevel);
         assert_eq!(records[2].side, StackReviewCommentSide::TopLevel);
     }
@@ -2378,6 +3021,8 @@ mod tests {
                 end_row: 4,
                 end_column: 2,
                 body: "Migrated".into(),
+                created_at: String::new(),
+                resolved: false,
                 author: git::stack_review::StackReviewCommentAuthor::default(),
                 source: StackReviewCommentSource::LocalHuman,
                 reply_to: None,
@@ -2387,9 +3032,29 @@ mod tests {
         .await
         .expect("migrate legacy comment");
         assert_eq!(records.len(), 1);
-        let projection = project_comment_records(&records);
+        let projection = project_comment_records(&records, false);
         assert_eq!(projection.comments.len(), 1);
         assert_eq!(projection.comments[0].body, "Migrated");
+        assert!(!projection.comments[0].created_at.is_empty());
+        assert!(!projection.comments[0].resolved);
+        let mut resolved_records = records.clone();
+        resolved_records
+            .values_mut()
+            .next()
+            .expect("resolved record")
+            .record
+            .local_resolution = Some(true);
+        assert!(
+            project_comment_records(&resolved_records, false)
+                .comments
+                .is_empty()
+        );
+        assert_eq!(
+            project_comment_records(&resolved_records, true)
+                .comments
+                .len(),
+            1
+        );
         let loaded = records.values().next().expect("migrated record").clone();
 
         let agent_record = StackReviewCommentRecord::new_inline(
@@ -2464,6 +3129,33 @@ mod tests {
         );
         assert_eq!(old_text, "was text\n");
         assert!(new_text.contains("missing object"));
+    }
+
+    #[test]
+    fn classifies_review_noise_without_hiding_behavior_specs() {
+        assert!(is_test_path(
+            "apps/api/src/routes/file-parsing/file-parsing.service.test.ts"
+        ));
+        assert!(is_test_path(
+            "apps/frontend/tests/e2e/upload/upload-measurements.spec.ts"
+        ));
+        assert!(is_test_path("test-data/pdf/fixtures/report.pdf"));
+        assert!(!is_test_path(
+            "apps/api/src/routes/file-parsing/file-parsing.service.spec.md"
+        ));
+        assert!(is_migration_path(
+            "apps/api/supabase/migrations/20260820210139_change.sql"
+        ));
+        assert!(is_migration_path(
+            "apps/api/supabase/migrations/meta/_journal.json"
+        ));
+        assert!(is_migration_path("db/user.migration.ts"));
+        assert!(!is_migration_path(
+            "apps/api/src/services/migration-helper.ts"
+        ));
+        assert!(!is_migration_path("drizzle/schema.ts"));
+        assert!(!is_visible_review_path("src/service.test.ts", true, false));
+        assert!(is_visible_review_path("src/service.test.ts", false, false));
     }
 
     #[test]
@@ -2547,6 +3239,7 @@ mod tests {
                         new_text: "fn first() {}".into(),
                     }],
                     project.clone(),
+                    cx.entity(),
                     window,
                     cx,
                 )
@@ -2640,6 +3333,10 @@ mod tests {
                         },
                     ],
                     selected_file_index: Some(0),
+                    hide_tests: false,
+                    hide_migrations: false,
+                    show_resolved_comments: false,
+                    sidebar_width: STACK_REVIEW_SIDEBAR_DEFAULT_WIDTH,
                     review_comment_count: 0,
                     rendered_comment_ids: HashSet::new(),
                     comment_records: HashMap::new(),
@@ -2665,6 +3362,47 @@ mod tests {
             })
             .expect("update workspace");
         visual_context.run_until_parked();
+        let initial_sidebar_bounds = visual_context
+            .debug_bounds("STACK_REVIEW_FILE_SIDEBAR")
+            .expect("file sidebar bounds");
+        let resize_bounds = visual_context
+            .debug_bounds("STACK_REVIEW_SIDEBAR_RESIZE")
+            .expect("sidebar resize handle bounds");
+        let resized_position = point(
+            initial_sidebar_bounds.left() + px(420.),
+            resize_bounds.center().y,
+        );
+        visual_context.simulate_event(MouseDownEvent {
+            position: resize_bounds.center(),
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        visual_context.run_until_parked();
+        visual_context.simulate_event(MouseMoveEvent {
+            position: point(resize_bounds.center().x + px(10.), resize_bounds.center().y),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::none(),
+        });
+        visual_context.run_until_parked();
+        visual_context.simulate_event(MouseMoveEvent {
+            position: resized_position,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::none(),
+        });
+        visual_context.run_until_parked();
+        visual_context.simulate_event(MouseUpEvent {
+            position: resized_position,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        visual_context.run_until_parked();
+        let expanded_sidebar_bounds = visual_context
+            .debug_bounds("STACK_REVIEW_FILE_SIDEBAR")
+            .expect("expanded file sidebar bounds");
+        assert!(expanded_sidebar_bounds.size.width > initial_sidebar_bounds.size.width);
         assert!(
             visual_context
                 .debug_bounds("STACK_REVIEW_FROM_BOUNDARY")

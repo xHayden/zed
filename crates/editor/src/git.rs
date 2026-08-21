@@ -332,6 +332,8 @@ pub(super) struct StoredReviewComment {
     pub(super) author: StackReviewCommentAuthor,
     pub(super) source: StackReviewCommentSource,
     pub(super) reply_to: Option<usize>,
+    pub(super) created_at: String,
+    pub(super) resolved: bool,
 }
 
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
@@ -389,6 +391,10 @@ impl StoredReviewComment {
             author,
             source,
             reply_to,
+            created_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            resolved: false,
         }
     }
 }
@@ -844,6 +850,8 @@ impl Editor {
                         end_row: end.row,
                         end_column: end.column,
                         body: comment.comment.clone(),
+                        created_at: comment.created_at.clone(),
+                        resolved: comment.resolved,
                         author: comment.author.clone(),
                         source: comment.source,
                         reply_to: comment.reply_to,
@@ -904,6 +912,8 @@ impl Editor {
                 author: comment.author.clone(),
                 source: comment.source,
                 reply_to: comment.reply_to,
+                created_at: comment.created_at.clone(),
+                resolved: comment.resolved,
             };
             if let Some((_, existing_comments)) = restored.iter_mut().find(|(existing, _)| {
                 existing.file_path == hunk_key.file_path
@@ -1728,6 +1738,93 @@ impl Editor {
             }
         }
         false
+    }
+
+    pub fn set_review_comment_resolved(
+        &mut self,
+        id: usize,
+        resolved: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut root_id = id;
+        let mut seen = HashSet::default();
+        loop {
+            if !seen.insert(root_id) {
+                return false;
+            }
+            let parent = self
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .find(|comment| comment.id == root_id)
+                .and_then(|comment| comment.reply_to);
+            let Some(parent) = parent else {
+                break;
+            };
+            root_id = parent;
+        }
+        let mut ids = vec![root_id];
+        loop {
+            let mut changed = false;
+            for comment in self
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+            {
+                if comment.reply_to.is_some_and(|parent| ids.contains(&parent))
+                    && !ids.contains(&comment.id)
+                {
+                    ids.push(comment.id);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut found = false;
+        for (_, comments) in &mut self.stored_review_comments {
+            for comment in comments {
+                if ids.contains(&comment.id) {
+                    comment.resolved = resolved;
+                    found = true;
+                }
+            }
+        }
+        if found {
+            cx.emit(EditorEvent::ReviewCommentResolutionChanged { ids, resolved });
+            cx.notify();
+        }
+        found
+    }
+
+    pub(super) fn toggle_active_review_comment_resolved(
+        &mut self,
+        _: &crate::actions::ToggleActiveReviewCommentResolved,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_stack_review {
+            cx.propagate();
+            return;
+        }
+        let display_snapshot = self.display_snapshot(cx);
+        let cursor = self.selections.newest::<Point>(&display_snapshot).head();
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let candidate = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| {
+                let start = comment.range.start.to_point(&snapshot);
+                let end = comment.range.end.to_point(&snapshot);
+                start.row <= cursor.row && cursor.row <= end.row
+            })
+            .min_by_key(|comment| comment.resolved)
+            .map(|comment| (comment.id, comment.resolved));
+        if let Some((id, resolved)) = candidate {
+            self.set_review_comment_resolved(id, !resolved, cx);
+        }
     }
 
     /// Sets a comment's editing state.
@@ -3346,14 +3443,20 @@ impl Editor {
         let confirm_editor = editor_handle.clone();
         let reply_editor = editor_handle.clone();
         let edit_editor = editor_handle.clone();
-        let delete_editor = editor_handle;
+        let delete_editor = editor_handle.clone();
+        let resolution_editor = editor_handle;
+        let resolved = comment.resolved;
 
         let source = comment.source;
-        let author_label = match source {
+        let mut author_label = match source {
             StackReviewCommentSource::LocalHuman => comment.author.name.clone(),
             StackReviewCommentSource::LocalAgent => format!("{} · Agent", comment.author.name),
             StackReviewCommentSource::Github => format!("{} · GitHub", comment.author.name),
         };
+        if let Some(date) = comment.created_at.get(..10).filter(|date| !date.is_empty()) {
+            author_label.push_str(" · ");
+            author_label.push_str(date);
+        }
         let comment_content = if let Some(editor) = inline_editor {
             div()
                 .w_full()
@@ -3465,6 +3568,30 @@ impl Editor {
             } else if is_stack_review {
                 h_flex()
                     .gap_1()
+                    .child(
+                        IconButton::new(
+                            format!("diff-review-resolution-{comment_id}"),
+                            if resolved {
+                                IconName::Undo
+                            } else {
+                                IconName::Check
+                            },
+                        )
+                        .icon_color(ui::Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text(if resolved {
+                            "Reopen thread"
+                        } else {
+                            "Resolve thread"
+                        }))
+                        .on_click(move |_, _, cx| {
+                            if let Some(editor) = resolution_editor.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.set_review_comment_resolved(comment_id, !resolved, cx);
+                                });
+                            }
+                        }),
+                    )
                     .child(
                         IconButton::new(
                             format!("diff-review-reply-{comment_id}"),

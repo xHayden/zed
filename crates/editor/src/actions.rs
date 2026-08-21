@@ -907,6 +907,8 @@ actions!(
         ToggleSelectedDiffHunks,
         /// Stores the diff review comment locally (for later batch submission).
         SubmitDiffReviewComment,
+        /// Resolves or reopens the Stack Review thread at the cursor.
+        ToggleActiveReviewCommentResolved,
         /// Toggles the expanded state of the comments section in the overlay.
         ToggleReviewCommentsExpanded,
         /// Sends all stored review comments to the Agent panel.

@@ -536,6 +536,18 @@
     },
   },
   {
+    "context": "StackReview",
+    "bindings": {
+      "ctrl-alt-up": "git::StackReviewPreviousFile",
+      "ctrl-alt-down": "git::StackReviewNextFile",
+      "ctrl-alt-k": "editor::GoToPreviousChange",
+      "ctrl-alt-j": "editor::GoToNextChange",
+      "ctrl-alt-r": "editor::ToggleActiveReviewCommentResolved",
+      "ctrl-alt-t": "git::StackReviewToggleTests",
+      "ctrl-alt-m": "git::StackReviewToggleMigrations",
+    },
+  },
+  {
     "context": "Pane",
     "use_key_equivalents": true,
     "bindings": {

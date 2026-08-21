@@ -1,17 +1,18 @@
 use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use editor::{
-    Editor, EditorEvent, MultiBuffer, RestoreOnlyUnstagedDiffHunkDelegate,
+    Editor, EditorEvent, MultiBuffer, RestoreOnlyUnstagedDiffHunkDelegate, SplittableEditor,
     multibuffer_context_lines,
 };
 use git_ui_core::file_diff_view::build_buffer_diff;
 use gpui::{
     AnyElement, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Font, IntoElement, Render, SharedString, Task, Window,
+    Focusable, Font, IntoElement, ParentElement, Render, SharedString, Styled, Task, Window,
 };
 use language::{Buffer, Capability, HighlightedText, OffsetRangeExt};
 use multi_buffer::PathKey;
 use project::{Project, ProjectPath};
+use settings::DiffViewStyle;
 use std::{
     any::{Any, TypeId},
     path::{Path, PathBuf},
@@ -28,6 +29,7 @@ use workspace::{
 
 pub struct MultiDiffView {
     editor: Entity<Editor>,
+    split_editor: Option<Entity<SplittableEditor>>,
     file_count: usize,
 }
 
@@ -88,9 +90,14 @@ async fn load_content_entries(
 ) -> Result<(Vec<Entry>, Option<PathBuf>)> {
     let mut entries = Vec::with_capacity(content_entries.len());
     let mut all_paths = Vec::with_capacity(content_entries.len());
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
 
     for (index, entry) in content_entries.into_iter().enumerate() {
         let path = entry.path;
+        let language = language_registry
+            .load_language_for_file_path(&path)
+            .await
+            .ok();
         let file = if let Some(source_path) = &entry.source_path {
             Some(
                 project
@@ -107,6 +114,8 @@ async fn load_content_entries(
         let (old_buffer, new_buffer) = cx.update(|cx| {
             let old_buffer = cx.new(|cx| {
                 let mut buffer = Buffer::local(entry.old_text, cx);
+                buffer.set_language_registry(language_registry.clone());
+                buffer.set_language(language.clone(), cx);
                 if let Some(file) = file.clone() {
                     buffer.file_updated(file, cx);
                 }
@@ -115,6 +124,8 @@ async fn load_content_entries(
             });
             let new_buffer = cx.new(|cx| {
                 let mut buffer = Buffer::local(entry.new_text, cx);
+                buffer.set_language_registry(language_registry.clone());
+                buffer.set_language(language, cx);
                 if let Some(file) = file {
                     buffer.file_updated(file, cx);
                 }
@@ -219,6 +230,7 @@ impl MultiDiffView {
     pub(crate) fn build_from_content(
         content_entries: Vec<ContentDiffEntry>,
         project: Entity<Project>,
+        workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
@@ -236,7 +248,22 @@ impl MultiDiffView {
                 for entry in entries {
                     register_entry(&multibuffer, entry, &common_root, context_lines, true, cx);
                 }
-                let view = cx.new(|cx| Self::new(multibuffer, project, file_count, window, cx));
+                let split_editor = cx.new(|cx| {
+                    SplittableEditor::new(
+                        DiffViewStyle::Split,
+                        multibuffer,
+                        project,
+                        workspace,
+                        window,
+                        cx,
+                    )
+                });
+                let editor = split_editor.read(cx).rhs_editor().clone();
+                let view = cx.new(|_| Self {
+                    editor,
+                    split_editor: Some(split_editor),
+                    file_count,
+                });
                 view.update(cx, |view, cx| {
                     view.editor.update(cx, |editor, cx| {
                         editor.set_show_diff_review_button(true, cx);
@@ -259,6 +286,21 @@ impl MultiDiffView {
 
     pub(crate) fn editor(&self) -> Entity<Editor> {
         self.editor.clone()
+    }
+
+    pub(crate) fn searchable_handle(&self) -> Box<dyn SearchableItemHandle> {
+        if let Some(split_editor) = &self.split_editor {
+            Box::new(split_editor.clone())
+        } else {
+            Box::new(self.editor.clone())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_split(&self, cx: &App) -> bool {
+        self.split_editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).is_split())
     }
 
     pub fn open(
@@ -321,7 +363,11 @@ impl MultiDiffView {
             editor
         });
 
-        Self { editor, file_count }
+        Self {
+            editor,
+            split_editor: None,
+            file_count,
+        }
     }
 
     fn title(&self) -> SharedString {
@@ -338,7 +384,10 @@ impl EventEmitter<EditorEvent> for MultiDiffView {}
 
 impl Focusable for MultiDiffView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.editor.focus_handle(cx)
+        self.split_editor
+            .as_ref()
+            .map(|editor| editor.focus_handle(cx))
+            .unwrap_or_else(|| self.editor.focus_handle(cx))
     }
 }
 
@@ -376,8 +425,12 @@ impl Item for MultiDiffView {
     }
 
     fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor
-            .update(cx, |editor, cx| editor.deactivated(window, cx));
+        if let Some(split_editor) = &self.split_editor {
+            split_editor.update(cx, |editor, cx| editor.deactivated(window, cx));
+        } else {
+            self.editor
+                .update(cx, |editor, cx| editor.deactivated(window, cx));
+        }
     }
 
     fn act_as_type<'a>(
@@ -388,6 +441,8 @@ impl Item for MultiDiffView {
     ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
             Some(self_handle.clone().into())
+        } else if type_id == TypeId::of::<SplittableEditor>() {
+            self.split_editor.clone().map(Into::into)
         } else if type_id == TypeId::of::<Editor>() {
             Some(self.editor.clone().into())
         } else {
@@ -396,7 +451,7 @@ impl Item for MultiDiffView {
     }
 
     fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
-        Some(Box::new(self.editor.clone()))
+        Some(self.searchable_handle())
     }
 
     fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
@@ -420,8 +475,12 @@ impl Item for MultiDiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.editor
-            .update(cx, |editor, cx| editor.navigate(data, window, cx))
+        if let Some(split_editor) = &self.split_editor {
+            split_editor.update(cx, |editor, cx| editor.navigate(data, window, cx))
+        } else {
+            self.editor
+                .update(cx, |editor, cx| editor.navigate(data, window, cx))
+        }
     }
 
     fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
@@ -438,9 +497,15 @@ impl Item for MultiDiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editor.update(cx, |editor, cx| {
-            editor.added_to_workspace(workspace, window, cx)
-        });
+        if let Some(split_editor) = &self.split_editor {
+            split_editor.update(cx, |editor, cx| {
+                editor.added_to_workspace(workspace, window, cx)
+            });
+        } else {
+            self.editor.update(cx, |editor, cx| {
+                editor.added_to_workspace(workspace, window, cx)
+            });
+        }
     }
 
     fn can_save(&self, cx: &App) -> bool {
@@ -461,7 +526,12 @@ impl Item for MultiDiffView {
 
 impl Render for MultiDiffView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.editor.clone()
+        gpui::div().size_full().child(
+            self.split_editor
+                .clone()
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| self.editor.clone().into_any_element()),
+        )
     }
 }
 
@@ -506,6 +576,9 @@ mod tests {
         )
         .await;
         let project = Project::test(fs, [Path::new("/project")], cx).await;
+        project.read_with(cx, |project, _| {
+            project.languages().add(language::rust_lang());
+        });
         let workspace =
             cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let mut visual_context = VisualTestContext::from_window(*workspace, cx);
@@ -521,26 +594,43 @@ mod tests {
                         new_text: "fn main() {}".into(),
                     }],
                     project,
+                    cx.entity(),
                     window,
                     cx,
                 )
             })
             .expect("update workspace");
         let view = task.await.expect("build content diff");
-        let file_path = view.read_with(&visual_context, |view, cx| {
+        visual_context.run_until_parked();
+        assert!(view.read_with(&visual_context, |view, cx| view.is_split(cx)));
+        let (file_path, language_name) = view.read_with(&visual_context, |view, cx| {
             let editor = view.editor();
             let editor = editor.read(cx);
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let point = snapshot
                 .diff_hunks_in_range(language::Point::zero()..snapshot.max_point())
                 .next()
-                .map(|hunk| hunk.multi_buffer_range.start.to_point(&snapshot))?;
-            editor
-                .review_file_path_at(point, cx)
-                .map(|path| path.as_unix_str().to_owned())
+                .map(|hunk| hunk.multi_buffer_range.start.to_point(&snapshot));
+            let file_path = point
+                .and_then(|point| editor.review_file_path_at(point, cx))
+                .map(|path| path.as_unix_str().to_owned());
+            let language_name =
+                editor
+                    .buffer()
+                    .read(cx)
+                    .all_buffers_iter()
+                    .next()
+                    .and_then(|buffer| {
+                        buffer
+                            .read(cx)
+                            .language()
+                            .map(|language| language.name().to_string())
+                    });
+            (file_path, language_name)
         });
 
         assert_eq!(file_path.as_deref(), Some("src/main.rs"));
+        assert_eq!(language_name.as_deref(), Some("Rust"));
 
         let persisted_comment = git::stack_review::StackReviewComment {
             id: 11,
@@ -550,6 +640,8 @@ mod tests {
             end_row: 0,
             end_column: 4,
             body: "Preserve this review note".into(),
+            created_at: "2026-08-21T12:00:00Z".into(),
+            resolved: false,
             author: git::stack_review::StackReviewCommentAuthor {
                 name: "Reviewer".into(),
                 login: Some("reviewer".into()),
@@ -565,6 +657,8 @@ mod tests {
             end_row: 0,
             end_column: 4,
             body: "Agent reply".into(),
+            created_at: "2026-08-21T12:01:00Z".into(),
+            resolved: false,
             author: git::stack_review::StackReviewCommentAuthor {
                 name: "Claude Code".into(),
                 login: None,
@@ -624,6 +718,7 @@ mod tests {
                         new_text: "Binary file added; content not shown\n".into(),
                     }],
                     project,
+                    cx.entity(),
                     window,
                     cx,
                 )
@@ -653,6 +748,7 @@ mod tests {
                         new_text: String::new(),
                     }],
                     project,
+                    cx.entity(),
                     window,
                     cx,
                 )

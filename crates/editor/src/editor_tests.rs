@@ -40404,6 +40404,12 @@ fn test_stack_review_submit_keeps_comment_inline_and_hides_composer(cx: &mut Tes
             let comments =
                 editor.comments_for_hunk(&editor.diff_review_overlays[0].hunk_key, &snapshot);
             assert_eq!(comments[0].comment, "Persist inline");
+            assert!(!comments[0].created_at.is_empty());
+            assert!(!comments[0].resolved);
+            assert!(editor.set_review_comment_resolved(0, true, cx));
+            assert!(editor.stored_review_comments[0].1[0].resolved);
+            assert!(editor.set_review_comment_resolved(0, false, cx));
+            assert!(!editor.stored_review_comments[0].1[0].resolved);
         })
         .unwrap();
 }
@@ -40447,7 +40453,7 @@ fn test_stack_review_reply_persists_parent_and_author(cx: &mut TestAppContext) {
         .unwrap();
 
     editor
-        .update(cx, |editor, _window, _cx| {
+        .update(cx, |editor, _window, cx| {
             let comments = &editor.stored_review_comments[0].1;
             assert_eq!(comments.len(), 3);
             assert_eq!(comments[0].author.name, "You");
@@ -40471,6 +40477,13 @@ fn test_stack_review_reply_persists_parent_and_author(cx: &mut TestAppContext) {
                     })
                     .collect::<Vec<_>>(),
                 ["comment:0:0", "comment:1:1", "composer:2", "comment:2:2"]
+            );
+            assert!(editor.set_review_comment_resolved(2, true, cx));
+            assert!(
+                editor.stored_review_comments[0]
+                    .1
+                    .iter()
+                    .all(|comment| comment.resolved)
             );
         })
         .unwrap();

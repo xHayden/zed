@@ -522,6 +522,11 @@ impl EditorElement {
         register_action(editor, window, Editor::edit_review_comment);
         register_action(editor, window, Editor::delete_review_comment);
         register_action(editor, window, Editor::reply_to_review_comment);
+        register_action(
+            editor,
+            window,
+            Editor::toggle_active_review_comment_resolved,
+        );
         register_action(editor, window, Editor::confirm_edit_review_comment_action);
         register_action(editor, window, Editor::cancel_edit_review_comment_action);
         register_action(editor, window, Editor::go_to_previous_change);

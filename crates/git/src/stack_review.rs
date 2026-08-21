@@ -48,6 +48,10 @@ pub struct StackReviewComment {
     pub end_column: u32,
     pub body: String,
     #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default)]
     pub author: StackReviewCommentAuthor,
     #[serde(default)]
     pub source: StackReviewCommentSource,
@@ -112,6 +116,8 @@ pub struct StackReviewCommentRecord {
     #[serde(default)]
     pub resolved: bool,
     #[serde(default)]
+    pub local_resolution: Option<bool>,
+    #[serde(default)]
     pub github: Option<StackReviewGitHubCommentIdentity>,
 }
 
@@ -151,6 +157,7 @@ impl StackReviewCommentRecord {
             updated_at: timestamp,
             outdated: false,
             resolved: false,
+            local_resolution: None,
             github: None,
         }
     }
@@ -189,6 +196,7 @@ impl StackReviewCommentRecord {
             updated_at: timestamp,
             outdated,
             resolved: false,
+            local_resolution: None,
             github: Some(github),
         }
     }
@@ -221,6 +229,7 @@ impl StackReviewCommentRecord {
             updated_at: timestamp,
             outdated: false,
             resolved: false,
+            local_resolution: None,
             github: Some(github),
         }
     }
@@ -290,6 +299,10 @@ impl StackReviewCommentRecord {
 
     pub fn is_writable(&self) -> bool {
         self.source != StackReviewCommentSource::Github
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        self.local_resolution.unwrap_or(self.resolved)
     }
 }
 
@@ -1480,6 +1493,7 @@ mod tests {
             updated_at: "2026-08-21T12:00:00Z".into(),
             outdated: false,
             resolved: false,
+            local_resolution: None,
             github: None,
         };
         let restored = StackReviewCommentRecord::from_json(
@@ -1526,6 +1540,8 @@ mod tests {
             end_row: 6,
             end_column: 8,
             body: "Check this edge case".into(),
+            created_at: "2026-08-21T12:00:00Z".into(),
+            resolved: false,
             author: StackReviewCommentAuthor {
                 name: "Claude Code".into(),
                 login: None,
@@ -1589,6 +1605,8 @@ mod tests {
                 end_row: 1,
                 end_column: 1,
                 body: "Rendered".into(),
+                created_at: String::new(),
+                resolved: false,
                 author: StackReviewCommentAuthor::default(),
                 source: StackReviewCommentSource::LocalHuman,
                 reply_to: None,
@@ -1601,6 +1619,8 @@ mod tests {
                 end_row: 200,
                 end_column: 1,
                 body: "Outdated but preserved".into(),
+                created_at: String::new(),
+                resolved: false,
                 author: StackReviewCommentAuthor::default(),
                 source: StackReviewCommentSource::LocalHuman,
                 reply_to: None,
