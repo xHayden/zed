@@ -1675,7 +1675,7 @@ impl StackReview {
         });
         let commit_boundary_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Commit", window, cx);
+            editor.set_placeholder_text("Commit or SHA", window, cx);
             editor
         });
         Self {
@@ -3269,10 +3269,7 @@ impl StackReview {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.add_comment_at_cursor(window, cx);
                     })),
-            )
-            .when_some(self.state_error.clone(), |status, error| {
-                status.child(Label::new(error).color(Color::Error))
-            });
+            );
 
         let commenter_filter_label = self
             .selected_commenter
@@ -3313,11 +3310,7 @@ impl StackReview {
             }),
         );
 
-        let mut time_controls = h_flex()
-            .w_full()
-            .flex_wrap()
-            .gap_1()
-            .child(Label::new("Files touched by author time").color(Color::Muted));
+        let mut time_presets = h_flex().flex_none().gap_1();
         for (index, (time_filter, label)) in [
             (StackReviewTimeFilter::All, "All"),
             (StackReviewTimeFilter::Days(1), "24h"),
@@ -3328,7 +3321,7 @@ impl StackReview {
         .into_iter()
         .enumerate()
         {
-            time_controls = time_controls.child(
+            time_presets = time_presets.child(
                 Button::new(("stack-review-time", index), label)
                     .toggle_state(self.time_filter == time_filter)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -3336,76 +3329,58 @@ impl StackReview {
                     })),
             );
         }
-        time_controls = time_controls
+        let time_controls = h_flex()
+            .w_full()
+            .flex_wrap()
+            .gap_2()
+            .child(Label::new("Changes").color(Color::Muted))
+            .child(time_presets)
             .child(
-                div()
-                    .w(px(72.))
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .rounded_md()
-                    .px_1()
-                    .child(self.custom_days_editor.clone()),
-            )
-            .child(
-                Button::new("stack-review-custom-days", "Apply").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.apply_custom_days(window, cx);
-                    },
-                )),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "STACK_REVIEW_COMMENTER_TIME".to_owned())
-                    .child(commenter_filter),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "STACK_REVIEW_USE_CUTOFF_FROM".to_owned())
+                h_flex()
+                    .flex_none()
+                    .gap_1()
                     .child(
-                        Button::new("stack-review-use-cutoff-from", "Use Cutoff as From")
-                            .disabled(self.time_filter.checkpoint_timestamp().is_none())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.use_time_filter_as_from(window, cx);
-                            })),
+                        div()
+                            .w(px(72.))
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .rounded_md()
+                            .px_1()
+                            .child(self.custom_days_editor.clone()),
+                    )
+                    .child(
+                        Button::new("stack-review-custom-days", "Set days").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.apply_custom_days(window, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        div()
+                            .debug_selector(|| "STACK_REVIEW_COMMENTER_TIME".to_owned())
+                            .child(commenter_filter),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "STACK_REVIEW_USE_CUTOFF_FROM".to_owned())
+                            .child(
+                                Button::new("stack-review-use-cutoff-from", "Set as From")
+                                    .disabled(self.time_filter.checkpoint_timestamp().is_none())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.use_time_filter_as_from(window, cx);
+                                    })),
+                            ),
                     ),
             );
 
-        let scope_controls = h_flex()
-            .id("stack-review-scopes")
-            .w_full()
-            .flex_wrap()
+        let scope_presets = h_flex()
+            .flex_none()
             .gap_1()
-            .child(Label::new("From").color(Color::Muted))
-            .child(
-                div()
-                    .debug_selector(|| "STACK_REVIEW_FROM_BOUNDARY".to_owned())
-                    .child(from_dropdown),
-            )
-            .child(Label::new("Commit From").color(Color::Muted))
-            .child(
-                div()
-                    .debug_selector(|| "STACK_REVIEW_COMMIT_FROM".to_owned())
-                    .w(px(120.))
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .rounded_md()
-                    .px_1()
-                    .child(self.commit_boundary_editor.clone()),
-            )
-            .child(
-                Button::new("stack-review-apply-commit-from", "Use").on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.apply_commit_boundary(window, cx);
-                    },
-                )),
-            )
-            .child(Label::new("To").color(Color::Muted))
-            .child(
-                div()
-                    .debug_selector(|| "STACK_REVIEW_TO_BOUNDARY".to_owned())
-                    .child(to_dropdown),
-            )
-            .child(shortcuts)
             .child(
                 Button::new("stack-review-aggregate", "Whole Stack")
                     .toggle_state(
@@ -3428,6 +3403,52 @@ impl StackReview {
                         this.load_scope(current_scope, window, cx);
                     })),
             );
+        let boundary_pair = h_flex()
+            .flex_none()
+            .gap_1()
+            .child(Label::new("From").color(Color::Muted))
+            .child(
+                div()
+                    .debug_selector(|| "STACK_REVIEW_FROM_BOUNDARY".to_owned())
+                    .child(from_dropdown),
+            )
+            .child(Label::new("To").color(Color::Muted))
+            .child(
+                div()
+                    .debug_selector(|| "STACK_REVIEW_TO_BOUNDARY".to_owned())
+                    .child(to_dropdown),
+            );
+        let commit_boundary = h_flex()
+            .flex_none()
+            .gap_1()
+            .child(Label::new("Commit").color(Color::Muted))
+            .child(
+                div()
+                    .debug_selector(|| "STACK_REVIEW_COMMIT_FROM".to_owned())
+                    .w(px(112.))
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_md()
+                    .px_1()
+                    .child(self.commit_boundary_editor.clone()),
+            )
+            .child(
+                Button::new("stack-review-apply-commit-from", "Set From").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.apply_commit_boundary(window, cx);
+                    },
+                )),
+            );
+        let scope_controls = h_flex()
+            .id("stack-review-scopes")
+            .w_full()
+            .flex_wrap()
+            .gap_2()
+            .child(Label::new("Range").color(Color::Muted))
+            .child(scope_presets)
+            .child(boundary_pair)
+            .child(commit_boundary)
+            .child(shortcuts);
 
         v_flex()
             .w_full()
@@ -3436,9 +3457,12 @@ impl StackReview {
             .p_2()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(status)
-            .child(time_controls)
             .child(scope_controls)
+            .child(time_controls)
+            .child(status)
+            .when_some(self.state_error.clone(), |header, error| {
+                header.child(div().w_full().child(Label::new(error).color(Color::Error)))
+            })
             .when_some(self.render_preserved_comments(), |header, comments| {
                 header.child(comments)
             })

@@ -58,6 +58,7 @@ static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
 
 /// Number of commits to load per chunk for the git graph.
 pub const GRAPH_CHUNK_SIZE: usize = 1000;
+const STACK_REVIEW_PATCH_ID_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Default value for the `git.worktree_directory` setting.
 pub const DEFAULT_WORKTREE_DIRECTORY: &str = "../worktrees";
@@ -912,6 +913,24 @@ pub trait GitRepository: Send + Sync {
         async move { bail!("first-parent history is unavailable for this repository") }.boxed()
     }
 
+    fn stack_review_merge_base(
+        &self,
+        _base_ref: String,
+        _head_ref: String,
+    ) -> BoxFuture<'_, Result<String>> {
+        async move { bail!("merge-base resolution is unavailable for this repository") }.boxed()
+    }
+
+    fn stack_review_patch_equivalent_commits(
+        &self,
+        _base_ref: String,
+        _head_ref: String,
+        _candidate_oid: String,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        async move { bail!("patch-equivalent commit lookup is unavailable for this repository") }
+            .boxed()
+    }
+
     fn is_ancestor(&self, _base_ref: String, _head_ref: String) -> BoxFuture<'_, Result<bool>> {
         async move { bail!("ancestry checks are unavailable for this repository") }.boxed()
     }
@@ -1440,6 +1459,137 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
     .await
 }
 
+async fn bounded_git_stdout(
+    git: &GitBinary,
+    args: &[&str],
+    error_context: &str,
+) -> Result<Vec<u8>> {
+    let mut command = git.build_command(args);
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().context("Git command has no stdout")?;
+    let stderr = child.stderr.take();
+    let (stderr_overflow_tx, stderr_overflow_rx) = async_channel::bounded::<()>(1);
+    let stderr_task = git.executor.spawn(async move {
+        let mut bytes = Vec::new();
+        let mut overflowed = false;
+        if let Some(mut stderr) = stderr {
+            let mut chunk = vec![0; 64 * 1024];
+            loop {
+                let read = stderr.read(&mut chunk).await?;
+                if read == 0 {
+                    break;
+                }
+                if bytes.len().saturating_add(read) > STACK_REVIEW_PATCH_ID_MAX_BYTES {
+                    if !overflowed {
+                        let _ = stderr_overflow_tx.try_send(());
+                    }
+                    overflowed = true;
+                } else if !overflowed {
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+            }
+        }
+        std::io::Result::Ok((bytes, overflowed))
+    });
+
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0; 64 * 1024];
+    let mut stderr_finished = false;
+    loop {
+        let read = if stderr_finished {
+            stdout.read(&mut chunk).await?
+        } else {
+            let read_future = stdout.read(&mut chunk).fuse();
+            let overflow_future = stderr_overflow_rx.recv().fuse();
+            futures::pin_mut!(read_future, overflow_future);
+            select_biased! {
+                overflow = overflow_future => match overflow {
+                    Ok(()) => {
+                        let kill_result = child.kill();
+                        let status_result = child.status().await;
+                        let stderr_result = stderr_task.await;
+                        kill_result.context("failed to stop Git command with oversized stderr")?;
+                        status_result.context("failed to reap Git command with oversized stderr")?;
+                        stderr_result.context("failed to drain oversized Git command stderr")?;
+                        anyhow::bail!("{error_context} stderr exceeds the 64 MiB patch-equivalence limit");
+                    }
+                    Err(_) => {
+                        stderr_finished = true;
+                        continue;
+                    }
+                },
+                read = read_future => read?,
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > STACK_REVIEW_PATCH_ID_MAX_BYTES {
+            let kill_result = child.kill();
+            let status_result = child.status().await;
+            let stderr_result = stderr_task.await;
+            kill_result.context("failed to stop oversized Git command")?;
+            status_result.context("failed to reap oversized Git command")?;
+            let (_, stderr_overflowed) =
+                stderr_result.context("failed to drain oversized Git command stderr")?;
+            anyhow::ensure!(
+                !stderr_overflowed,
+                "{error_context} exceeded both stdout and stderr limits"
+            );
+            anyhow::bail!("{error_context} exceeds the 64 MiB patch-equivalence limit");
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    let status = child.status().await?;
+    let (stderr, stderr_overflowed) = stderr_task.await?;
+    anyhow::ensure!(
+        !stderr_overflowed,
+        "{error_context} stderr exceeds the 64 MiB patch-equivalence limit"
+    );
+    anyhow::ensure!(
+        status.success(),
+        "{error_context}: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    Ok(bytes)
+}
+
+async fn stable_patch_ids(git: &GitBinary, input: Vec<u8>) -> Result<Vec<(String, String)>> {
+    let mut command = git.build_command(&["patch-id", "--stable"]);
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take().context("git patch-id has no stdin")?;
+    let output_task = git.executor.spawn(async move { child.output().await });
+    stdin.write_all(&input).await?;
+    stdin.close().await?;
+    drop(stdin);
+    let output = output_task.await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git patch-id failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)?
+        .lines()
+        .map(|line| {
+            let (patch_id, commit_id) = line
+                .split_once(' ')
+                .with_context(|| format!("invalid git patch-id row {line:?}"))?;
+            Ok((patch_id.to_owned(), commit_id.to_owned()))
+        })
+        .collect()
+}
+
 impl GitRepository for RealGitRepository {
     fn path(&self) -> PathBuf {
         self.git_dir.clone()
@@ -1558,6 +1708,87 @@ impl GitRepository for RealGitRepository {
                         })
                     })
                     .collect()
+            })
+            .boxed()
+    }
+
+    fn stack_review_merge_base(
+        &self,
+        base_ref: String,
+        head_ref: String,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .build_command(&["merge-base", &base_ref, &head_ref])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git merge-base failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+            })
+            .boxed()
+    }
+
+    fn stack_review_patch_equivalent_commits(
+        &self,
+        base_ref: String,
+        head_ref: String,
+        candidate_oid: String,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let candidate_error =
+                    format!("git show failed for commit boundary {candidate_oid}");
+                let candidate = bounded_git_stdout(
+                    &git,
+                    &[
+                        "show",
+                        "--no-ext-diff",
+                        "--binary",
+                        "--no-renames",
+                        "--diff-merges=first-parent",
+                        &candidate_oid,
+                    ],
+                    &candidate_error,
+                )
+                .await?;
+                let candidate_patch_ids = stable_patch_ids(&git, candidate).await?;
+                let candidate_patch_id = candidate_patch_ids
+                    .first()
+                    .map(|(patch_id, _)| patch_id)
+                    .context("commit boundary has no stable patch identity")?;
+
+                let range = format!("{base_ref}..{head_ref}");
+                let commits = bounded_git_stdout(
+                    &git,
+                    &[
+                        "log",
+                        "--first-parent",
+                        "--reverse",
+                        "--no-ext-diff",
+                        "--binary",
+                        "--no-renames",
+                        "--diff-merges=first-parent",
+                        "-p",
+                        &range,
+                    ],
+                    "git log failed for selected Stack Review range",
+                )
+                .await?;
+                Ok(stable_patch_ids(&git, commits)
+                    .await?
+                    .into_iter()
+                    .filter_map(|(patch_id, commit_id)| {
+                        (patch_id == *candidate_patch_id).then_some(commit_id)
+                    })
+                    .collect())
             })
             .boxed()
     }

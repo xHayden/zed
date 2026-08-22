@@ -767,22 +767,38 @@ pub async fn resolve_stack_review_commit_boundary(
     head_ref: &str,
     candidate: &str,
 ) -> Result<String> {
+    let effective_base = repository
+        .stack_review_merge_base(base_ref.to_owned(), head_ref.to_owned())
+        .await?;
     let candidate_oid = repository
         .stack_review_resolve_revision(candidate.to_owned())
         .await?;
-    anyhow::ensure!(
-        repository
-            .is_ancestor(base_ref.to_owned(), candidate_oid.clone())
-            .await?,
-        "commit boundary {candidate_oid} is not within the selected range"
-    );
-    anyhow::ensure!(
-        repository
+    let is_direct_boundary = repository
+        .is_ancestor(effective_base.clone(), candidate_oid.clone())
+        .await?
+        && repository
             .is_ancestor(candidate_oid.clone(), head_ref.to_owned())
-            .await?,
-        "commit boundary {candidate_oid} is not an ancestor of the selected To boundary"
-    );
-    Ok(candidate_oid)
+            .await?;
+    if is_direct_boundary {
+        return Ok(candidate_oid);
+    }
+
+    let equivalent_commits = repository
+        .stack_review_patch_equivalent_commits(
+            effective_base,
+            head_ref.to_owned(),
+            candidate_oid.clone(),
+        )
+        .await?;
+    match equivalent_commits.as_slice() {
+        [equivalent] => Ok(equivalent.clone()),
+        [] => anyhow::bail!(
+            "commit boundary {candidate_oid} is not within the selected range and has no patch-equivalent rewritten commit"
+        ),
+        _ => anyhow::bail!(
+            "commit boundary {candidate_oid} has multiple patch-equivalent commits in the selected range"
+        ),
+    }
 }
 
 pub async fn resolve_stack_review_time_checkpoint(
@@ -1139,6 +1155,27 @@ mod tests {
             None,
         )
         .await;
+        run_git(
+            cx.executor(),
+            repository_directory.path(),
+            &["switch", "-c", "rewritten", "staging"],
+            None,
+        )
+        .await;
+        run_git(
+            cx.executor(),
+            repository_directory.path(),
+            &["cherry-pick", "feature"],
+            None,
+        )
+        .await;
+        run_git(
+            cx.executor(),
+            repository_directory.path(),
+            &["commit", "--amend", "-m", "rewritten feature"],
+            None,
+        )
+        .await;
 
         let repository = RealGitRepository::new(
             &repository_directory.path().join(".git"),
@@ -1157,6 +1194,21 @@ mod tests {
                 .await
                 .expect("validate feature boundary"),
             feature_oid
+        );
+        let rewritten_oid = repository
+            .stack_review_resolve_revision("rewritten".into())
+            .await
+            .expect("resolve rewritten feature");
+        assert_eq!(
+            resolve_stack_review_commit_boundary(
+                &repository,
+                "staging",
+                "rewritten",
+                &feature_oid,
+            )
+            .await
+            .expect("map stale source commit to rewritten equivalent"),
+            rewritten_oid
         );
         assert!(
             resolve_stack_review_commit_boundary(&repository, "feature", "staging", "feature")
