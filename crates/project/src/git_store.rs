@@ -645,6 +645,8 @@ enum GitJobKey {
     ReloadBufferDiffBases,
     RefreshStatuses,
     ReloadGitState,
+    StackReviewLoad,
+    StackReviewBoundary,
 }
 
 impl GitStore {
@@ -8817,16 +8819,22 @@ impl Repository {
         base_ref: String,
         head_ref: String,
     ) -> oneshot::Receiver<Result<git::stack_review::StackReviewDiff>> {
-        self.send_job("stack_review_diff", None, move |repo, _cx| async move {
-            match repo {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    git::stack_review::load_stack_diff(backend.as_ref(), &base_ref, &head_ref).await
+        self.send_keyed_job(
+            "stack_review_diff",
+            Some(GitJobKey::StackReviewLoad),
+            None,
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        git::stack_review::load_stack_diff(backend.as_ref(), &base_ref, &head_ref)
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        bail!("stack review is only available for local repositories")
+                    }
                 }
-                RepositoryState::Remote(_) => {
-                    bail!("stack review is only available for local repositories")
-                }
-            }
-        })
+            },
+        )
     }
 
     pub fn stack_review_diff_since(
@@ -8835,8 +8843,9 @@ impl Repository {
         head_ref: String,
         author_timestamp: i64,
     ) -> oneshot::Receiver<Result<git::stack_review::StackReviewDiff>> {
-        self.send_job(
+        self.send_keyed_job(
             "stack_review_diff_since",
+            Some(GitJobKey::StackReviewLoad),
             None,
             move |repo, _cx| async move {
                 match repo {
@@ -8863,8 +8872,9 @@ impl Repository {
         head_ref: String,
         candidate: String,
     ) -> oneshot::Receiver<Result<String>> {
-        self.send_job(
+        self.send_keyed_job(
             "resolve_stack_review_commit_boundary",
+            Some(GitJobKey::StackReviewBoundary),
             None,
             move |repo, _cx| async move {
                 match repo {
@@ -8891,8 +8901,9 @@ impl Repository {
         head_ref: String,
         author_timestamp: i64,
     ) -> oneshot::Receiver<Result<String>> {
-        self.send_job(
+        self.send_keyed_job(
             "resolve_stack_review_time_checkpoint",
+            Some(GitJobKey::StackReviewBoundary),
             None,
             move |repo, _cx| async move {
                 match repo {
@@ -9927,6 +9938,8 @@ fn format_job_key(key: &GitJobKey) -> SharedString {
         GitJobKey::ReloadBufferDiffBases => "ReloadBufferDiffBases".into(),
         GitJobKey::RefreshStatuses => "RefreshStatuses".into(),
         GitJobKey::ReloadGitState => "ReloadGitState".into(),
+        GitJobKey::StackReviewLoad => "StackReviewLoad".into(),
+        GitJobKey::StackReviewBoundary => "StackReviewBoundary".into(),
     }
 }
 

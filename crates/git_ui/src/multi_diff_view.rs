@@ -135,6 +135,13 @@ async fn load_content_entries(
             (old_buffer, new_buffer)
         });
         let diff = build_buffer_diff(&old_buffer, &new_buffer, cx).await?;
+        let old_file = old_buffer.read_with(cx, |buffer, _| buffer.file().cloned());
+        if let Some(old_file) = old_file {
+            let base_text_buffer = diff.read_with(cx, |diff, _| diff.base_text_buffer().clone());
+            base_text_buffer.update(cx, |buffer, cx| {
+                buffer.file_updated(old_file, cx);
+            });
+        }
 
         all_paths.push(path.clone());
         entries.push(Entry {
@@ -278,6 +285,12 @@ impl MultiDiffView {
                             cx,
                         );
                     });
+                    if let Some(left_editor) = view.left_editor(cx) {
+                        left_editor.update(cx, |editor, cx| {
+                            editor.set_stack_review_mode(true, cx);
+                            editor.set_allow_git_diff_scrollbar_markers(true, cx);
+                        });
+                    }
                 });
                 view
             })
@@ -286,6 +299,12 @@ impl MultiDiffView {
 
     pub(crate) fn editor(&self) -> Entity<Editor> {
         self.editor.clone()
+    }
+
+    pub(crate) fn left_editor(&self, cx: &App) -> Option<Entity<Editor>> {
+        self.split_editor
+            .as_ref()
+            .and_then(|split_editor| split_editor.read(cx).lhs_editor().cloned())
     }
 
     pub(crate) fn split_left_ratio(&self, cx: &App) -> f32 {
@@ -698,9 +717,31 @@ mod tests {
                 )
             });
 
-        assert_eq!(restored, vec![persisted_comment, persisted_reply]);
+        assert_eq!(restored, vec![persisted_comment.clone(), persisted_reply]);
         assert_eq!(visible_count, 2);
         assert!(has_visible_overlay);
+
+        let mut previous_comment = persisted_comment;
+        previous_comment.id = 13;
+        previous_comment.body = "Comment on the previous revision".into();
+        let previous_editor = view
+            .read_with(&visual_context, |view, cx| view.left_editor(cx))
+            .expect("previous revision editor");
+        previous_editor.update_in(&mut visual_context, |editor, window, cx| {
+            editor.restore_stack_review_comments(&[previous_comment.clone()], cx);
+            editor.reveal_restored_stack_review_comments(window, cx);
+        });
+        let (previous_restored, previous_visible, previous_overlay) =
+            previous_editor.read_with(&visual_context, |editor, cx| {
+                (
+                    editor.stack_review_comments(cx),
+                    editor.visible_stack_review_comment_count(cx),
+                    editor.diff_review_prompt_editor().is_some(),
+                )
+            });
+        assert_eq!(previous_restored, vec![previous_comment]);
+        assert_eq!(previous_visible, 1);
+        assert!(previous_overlay);
     }
 
     #[test]

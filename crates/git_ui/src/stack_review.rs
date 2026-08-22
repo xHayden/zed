@@ -172,6 +172,7 @@ async fn discover_stack_with_github_cli(
 ) -> std::result::Result<StackFile, GitHubStackDiscoveryError> {
     let auth = util::command::new_command("gh")
         .args(["auth", "status", "--hostname", "github.com"])
+        .kill_on_drop(true)
         .env("GH_PROMPT_DISABLED", "1")
         .current_dir(work_directory)
         .output()
@@ -212,6 +213,7 @@ async fn discover_stack_with_github_cli(
                 "--json",
                 "number,headRefName,baseRefName",
             ])
+            .kill_on_drop(true)
             .env("GH_PROMPT_DISABLED", "1")
             .current_dir(work_directory)
             .output()
@@ -244,6 +246,7 @@ async fn github_api_values(
 ) -> Result<Vec<serde_json::Value>> {
     let output = util::command::new_command("gh")
         .args(["api", "--paginate", "--slurp", endpoint])
+        .kill_on_drop(true)
         .env("GH_PROMPT_DISABLED", "1")
         .current_dir(work_directory)
         .output()
@@ -260,6 +263,7 @@ async fn github_api_values(
 async fn github_api_value(work_directory: &Path, endpoint: &str) -> Result<serde_json::Value> {
     let output = util::command::new_command("gh")
         .args(["api", endpoint])
+        .kill_on_drop(true)
         .env("GH_PROMPT_DISABLED", "1")
         .current_dir(work_directory)
         .output()
@@ -316,6 +320,7 @@ async fn github_review_thread_states(
         }
         let output = util::command::new_command("gh")
             .args(arguments)
+            .kill_on_drop(true)
             .env("GH_PROMPT_DISABLED", "1")
             .current_dir(work_directory)
             .output()
@@ -556,6 +561,7 @@ async fn refresh_github_comment_projection(
     }
     let output = util::command::new_command("gh")
         .args(["repo", "view", "--json", "nameWithOwner"])
+        .kill_on_drop(true)
         .env("GH_PROMPT_DISABLED", "1")
         .current_dir(work_directory)
         .output()
@@ -901,14 +907,12 @@ fn content_entry_for_stack_file(
 
 async fn build_active_diff_view(
     entry: Option<ContentDiffEntry>,
-    comments: Vec<git::stack_review::StackReviewComment>,
+    comments: FileCommentProjection,
+    next_comment_id: usize,
     project: Entity<Project>,
     workspace: gpui::WeakEntity<Workspace>,
     cx: &mut AsyncWindowContext,
-) -> Result<(
-    Entity<MultiDiffView>,
-    Vec<git::stack_review::StackReviewComment>,
-)> {
+) -> Result<(Entity<MultiDiffView>, FileCommentProjection)> {
     let entries = entry.into_iter().collect();
     let workspace_entity = workspace
         .upgrade()
@@ -918,11 +922,29 @@ async fn build_active_diff_view(
     })?;
     let diff_view = build_task.await?;
     let restored_comments = cx.update(|window, cx| {
-        diff_view.read(cx).editor().update(cx, |editor, cx| {
-            editor.restore_stack_review_comments(&comments, cx);
+        let right = diff_view.read(cx).editor();
+        let right_comments = right.update(cx, |editor, cx| {
+            editor.restore_stack_review_comments(&comments.right, cx);
+            editor.ensure_next_stack_review_comment_id(next_comment_id);
             editor.reveal_restored_stack_review_comments(window, cx);
             editor.stack_review_comments(cx)
-        })
+        });
+        let left_comments = diff_view
+            .read(cx)
+            .left_editor(cx)
+            .map(|left| {
+                left.update(cx, |editor, cx| {
+                    editor.restore_stack_review_comments(&comments.left, cx);
+                    editor.ensure_next_stack_review_comment_id(next_comment_id);
+                    editor.reveal_restored_stack_review_comments(window, cx);
+                    editor.stack_review_comments(cx)
+                })
+            })
+            .unwrap_or_default();
+        FileCommentProjection {
+            left: left_comments,
+            right: right_comments,
+        }
     })?;
     workspace.update_in(cx, |workspace, window, cx| {
         diff_view.update(cx, |diff_view, cx| {
@@ -1143,9 +1165,16 @@ fn summarize_file_comments(
     statuses
 }
 
+#[derive(Clone, Default)]
+struct FileCommentProjection {
+    left: Vec<StackReviewComment>,
+    right: Vec<StackReviewComment>,
+}
+
 struct CommentProjection {
-    comments_by_path: HashMap<String, Vec<StackReviewComment>>,
+    comments_by_path: HashMap<String, FileCommentProjection>,
     record_id_by_editor_id: HashMap<usize, String>,
+    next_editor_id: usize,
 }
 
 enum CommentWrite {
@@ -1298,12 +1327,16 @@ fn merge_reloaded_local_comments(
 fn project_comment_records(
     records: &HashMap<String, LoadedCommentRecord>,
     include_resolved: bool,
+    existing_record_ids: &HashMap<usize, String>,
+    next_editor_id_floor: usize,
 ) -> CommentProjection {
     let mut inline_records = records
         .values()
         .filter(|loaded| {
-            loaded.record.side == StackReviewCommentSide::Right
-                && !loaded.record.outdated
+            matches!(
+                loaded.record.side,
+                StackReviewCommentSide::Left | StackReviewCommentSide::Right
+            ) && !loaded.record.outdated
                 && (include_resolved || !loaded.record.is_resolved())
         })
         .collect::<Vec<_>>();
@@ -1312,47 +1345,70 @@ fn project_comment_records(
             .cmp(&comment_timestamp_nanos(&right.record))
             .then_with(|| left.record.id.cmp(&right.record.id))
     });
-    let editor_id_by_record_id = inline_records
+    let mut record_id_by_editor_id = existing_record_ids
         .iter()
-        .enumerate()
-        .map(|(editor_id, loaded)| (loaded.record.id.clone(), editor_id))
+        .filter(|(_, record_id)| records.contains_key(record_id.as_str()))
+        .map(|(editor_id, record_id)| (*editor_id, record_id.clone()))
         .collect::<HashMap<_, _>>();
-    let mut record_id_by_editor_id = HashMap::new();
-    let comments: Vec<StackReviewComment> = inline_records
-        .into_iter()
-        .enumerate()
-        .map(|(editor_id, loaded)| {
+    let mut editor_id_by_record_id = record_id_by_editor_id
+        .iter()
+        .map(|(editor_id, record_id)| (record_id.clone(), *editor_id))
+        .collect::<HashMap<_, _>>();
+    let mut next_editor_id = next_editor_id_floor.max(
+        record_id_by_editor_id
+            .keys()
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or_default(),
+    );
+    for loaded in &inline_records {
+        if !editor_id_by_record_id.contains_key(&loaded.record.id) {
+            let editor_id = next_editor_id;
+            next_editor_id = next_editor_id.saturating_add(1);
+            editor_id_by_record_id.insert(loaded.record.id.clone(), editor_id);
             record_id_by_editor_id.insert(editor_id, loaded.record.id.clone());
-            StackReviewComment {
-                id: editor_id,
-                path: loaded.record.path.clone().unwrap_or_default(),
-                start_row: loaded.record.start_row.unwrap_or_default(),
-                start_column: loaded.record.start_column.unwrap_or_default(),
-                end_row: loaded.record.end_row.unwrap_or_default(),
-                end_column: loaded.record.end_column.unwrap_or_default(),
-                body: loaded.record.body.clone(),
-                created_at: loaded.record.created_at.clone(),
-                resolved: loaded.record.is_resolved(),
-                author: loaded.record.author.clone(),
-                source: loaded.record.source,
-                reply_to: loaded
-                    .record
-                    .reply_to
-                    .as_ref()
-                    .and_then(|reply_to| editor_id_by_record_id.get(reply_to).copied()),
-            }
+        }
+    }
+    let comments = inline_records
+        .into_iter()
+        .map(|loaded| {
+            let editor_id = editor_id_by_record_id[&loaded.record.id];
+            (
+                loaded.record.side,
+                StackReviewComment {
+                    id: editor_id,
+                    path: loaded.record.path.clone().unwrap_or_default(),
+                    start_row: loaded.record.start_row.unwrap_or_default(),
+                    start_column: loaded.record.start_column.unwrap_or_default(),
+                    end_row: loaded.record.end_row.unwrap_or_default(),
+                    end_column: loaded.record.end_column.unwrap_or_default(),
+                    body: loaded.record.body.clone(),
+                    created_at: loaded.record.created_at.clone(),
+                    resolved: loaded.record.is_resolved(),
+                    author: loaded.record.author.clone(),
+                    source: loaded.record.source,
+                    reply_to: loaded
+                        .record
+                        .reply_to
+                        .as_ref()
+                        .and_then(|reply_to| editor_id_by_record_id.get(reply_to).copied()),
+                },
+            )
         })
-        .collect();
-    let mut comments_by_path = HashMap::<String, Vec<StackReviewComment>>::new();
-    for comment in &comments {
-        comments_by_path
-            .entry(comment.path.clone())
-            .or_default()
-            .push(comment.clone());
+        .collect::<Vec<_>>();
+    let mut comments_by_path = HashMap::<String, FileCommentProjection>::new();
+    for (side, comment) in comments {
+        let projection = comments_by_path.entry(comment.path.clone()).or_default();
+        match side {
+            StackReviewCommentSide::Left => projection.left.push(comment),
+            StackReviewCommentSide::Right => projection.right.push(comment),
+            StackReviewCommentSide::TopLevel => {}
+        }
     }
     CommentProjection {
         comments_by_path,
         record_id_by_editor_id,
+        next_editor_id,
     }
 }
 
@@ -1427,15 +1483,18 @@ struct LoadedStackReview {
     files: Vec<StackReviewFileItem>,
     content_entries: Vec<ContentDiffEntry>,
     selected_file_index: Option<usize>,
-    rendered_comment_ids: HashSet<usize>,
+    rendered_left_comment_ids: HashSet<usize>,
+    rendered_right_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
-    comments_by_path: HashMap<String, Vec<StackReviewComment>>,
+    comments_by_path: HashMap<String, FileCommentProjection>,
     record_id_by_editor_id: HashMap<usize, String>,
+    next_comment_editor_id: usize,
     file_comment_statuses: HashMap<String, FileCommentSummary>,
     commenter_cutoffs: Vec<CommenterCutoff>,
     reviewer_login: Option<String>,
     github_snapshot_key: String,
-    github_refresh_succeeded: bool,
+    should_refresh_github: bool,
+    layer_pull_requests: Vec<(u32, String)>,
     comments_directory: PathBuf,
     github_comments_directory: PathBuf,
 }
@@ -1467,15 +1526,18 @@ pub struct StackReview {
     sidebar_width: Pixels,
     split_left_ratio: f32,
     review_comment_count: usize,
-    rendered_comment_ids: HashSet<usize>,
+    rendered_left_comment_ids: HashSet<usize>,
+    rendered_right_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
-    comments_by_path: HashMap<String, Vec<StackReviewComment>>,
+    comments_by_path: HashMap<String, FileCommentProjection>,
     record_id_by_editor_id: HashMap<usize, String>,
+    next_comment_editor_id: usize,
     file_comment_statuses: HashMap<String, FileCommentSummary>,
     commenter_cutoffs: Vec<CommenterCutoff>,
     selected_commenter: Option<String>,
     reviewer_login: Option<String>,
     refreshed_github_snapshots: HashSet<String>,
+    github_refreshing: bool,
     comments_directory: Option<PathBuf>,
     github_comments_directory: Option<PathBuf>,
     diff_view: Option<Entity<MultiDiffView>>,
@@ -1489,8 +1551,10 @@ pub struct StackReview {
     state_write_lock: Arc<futures::lock::Mutex<()>>,
     comment_write_lock: Arc<futures::lock::Mutex<()>>,
     state_write_generations: HashMap<PathBuf, Arc<AtomicU64>>,
-    editor_subscription: Option<Subscription>,
+    editor_subscriptions: Vec<Subscription>,
+    active_comment_projection_stale: bool,
     comment_watch_task: Task<()>,
+    github_refresh_task: Task<()>,
     checkpoint_boundary_task: Task<()>,
     checkpoint_boundary_requests: CheckpointBoundaryRequestTracker,
 }
@@ -1705,15 +1769,18 @@ impl StackReview {
             sidebar_width: STACK_REVIEW_SIDEBAR_DEFAULT_WIDTH,
             split_left_ratio: 0.5,
             review_comment_count: 0,
-            rendered_comment_ids: HashSet::new(),
+            rendered_left_comment_ids: HashSet::new(),
+            rendered_right_comment_ids: HashSet::new(),
             comment_records: HashMap::new(),
             comments_by_path: HashMap::new(),
             record_id_by_editor_id: HashMap::new(),
+            next_comment_editor_id: 0,
             file_comment_statuses: HashMap::new(),
             commenter_cutoffs: Vec::new(),
             selected_commenter: None,
             reviewer_login: None,
             refreshed_github_snapshots: HashSet::new(),
+            github_refreshing: false,
             comments_directory: None,
             github_comments_directory: None,
             diff_view: None,
@@ -1727,8 +1794,10 @@ impl StackReview {
             state_write_lock: Arc::new(futures::lock::Mutex::new(())),
             comment_write_lock: Arc::new(futures::lock::Mutex::new(())),
             state_write_generations: HashMap::new(),
-            editor_subscription: None,
+            editor_subscriptions: Vec::new(),
+            active_comment_projection_stale: false,
             comment_watch_task: Task::ready(()),
+            github_refresh_task: Task::ready(()),
             checkpoint_boundary_task: Task::ready(()),
             checkpoint_boundary_requests: CheckpointBoundaryRequestTracker::default(),
         }
@@ -1771,16 +1840,21 @@ impl StackReview {
         self.content_entries.clear();
         self.selected_file_index = None;
         self.review_comment_count = 0;
-        self.rendered_comment_ids.clear();
+        self.rendered_left_comment_ids.clear();
+        self.rendered_right_comment_ids.clear();
         self.comment_records.clear();
         self.comments_by_path.clear();
         self.record_id_by_editor_id.clear();
+        self.next_comment_editor_id = 0;
         self.file_comment_statuses.clear();
         self.comments_directory = None;
         self.github_comments_directory = None;
         self.comment_watch_task = Task::ready(());
+        self.github_refresh_task = Task::ready(());
+        self.github_refreshing = false;
         self.state_error = None;
-        self.editor_subscription = None;
+        self.editor_subscriptions.clear();
+        self.active_comment_projection_stale = false;
         self.error = None;
         cx.notify();
 
@@ -1904,31 +1978,7 @@ impl StackReview {
                         Some(review_state_path.clone()),
                     )
                 };
-                let (reviewer_login, github_refresh_succeeded) = if should_refresh_github {
-                    match refresh_github_comment_projection(
-                        &fs,
-                        &work_directory,
-                        &github_comments_directory,
-                        &diff.base_ref,
-                        &diff.head_ref,
-                        &layer_pull_requests,
-                    )
-                    .await
-                    {
-                        Ok(reviewer_login) => (
-                            reviewer_login.or(cached_reviewer_login),
-                            !layer_pull_requests.is_empty(),
-                        ),
-                        Err(error) => {
-                            log::warn!(
-                                "unable to refresh GitHub comments; using local projection: {error:#}"
-                            );
-                            (cached_reviewer_login, false)
-                        }
-                    }
-                } else {
-                    (cached_reviewer_login, false)
-                };
+                let reviewer_login = cached_reviewer_login;
                 let mut comment_records = load_all_comment_records(
                     &fs,
                     &comments_directory,
@@ -1965,8 +2015,13 @@ impl StackReview {
                 );
                 fs.atomic_write(state_root.join("current.json"), manifest.to_json()?)
                     .await?;
-                let comment_projection =
-                    project_comment_records(&comment_records, show_resolved_comments);
+                let comment_projection = project_comment_records(
+                    &comment_records,
+                    show_resolved_comments,
+                    &HashMap::new(),
+                    0,
+                );
+                let next_comment_id = comment_projection.next_editor_id;
                 let file_comment_statuses =
                     summarize_file_comments(&comment_records, reviewer_login.as_deref());
                 let commenter_cutoffs = latest_comment_cutoffs(&comment_records);
@@ -2002,14 +2057,28 @@ impl StackReview {
                     })
                     .cloned()
                     .unwrap_or_default();
-                let (diff_view, restored_comments) =
-                    build_active_diff_view(active_entry, active_comments, project, workspace, cx)
-                        .await?;
+                let (diff_view, restored_comments) = build_active_diff_view(
+                    active_entry,
+                    active_comments,
+                    next_comment_id,
+                    project,
+                    workspace,
+                    cx,
+                )
+                .await?;
                 diff_view.update(cx, |diff_view, cx| {
                     diff_view.set_split_left_ratio(split_left_ratio, cx);
                 });
-                let rendered_comment_ids =
-                    restored_comments.iter().map(|comment| comment.id).collect();
+                let rendered_left_comment_ids = restored_comments
+                    .left
+                    .iter()
+                    .map(|comment| comment.id)
+                    .collect();
+                let rendered_right_comment_ids = restored_comments
+                    .right
+                    .iter()
+                    .map(|comment| comment.id)
+                    .collect();
                 Ok(LoadedStackReview {
                     diff_view,
                     provenance_summary,
@@ -2019,15 +2088,18 @@ impl StackReview {
                     files,
                     content_entries,
                     selected_file_index,
-                    rendered_comment_ids,
+                    rendered_left_comment_ids,
+                    rendered_right_comment_ids,
                     comment_records,
                     comments_by_path: comment_projection.comments_by_path,
                     record_id_by_editor_id: comment_projection.record_id_by_editor_id,
+                    next_comment_editor_id: next_comment_id,
                     file_comment_statuses,
                     commenter_cutoffs,
                     reviewer_login,
                     github_snapshot_key,
-                    github_refresh_succeeded,
+                    should_refresh_github,
+                    layer_pull_requests,
                     comments_directory,
                     github_comments_directory,
                 })
@@ -2036,11 +2108,18 @@ impl StackReview {
 
             if let Err(error) = this.update_in(cx, |this, window, cx| match result {
                 Ok(loaded) => {
-                    if loaded.github_refresh_succeeded {
-                        this.refreshed_github_snapshots
-                            .insert(loaded.github_snapshot_key.clone());
-                    }
+                    let github_refresh = loaded.should_refresh_github.then(|| {
+                        (
+                            loaded.github_snapshot_key.clone(),
+                            loaded.review_state.base_oid.clone(),
+                            loaded.review_state.head_oid.clone(),
+                            loaded.comments_directory.clone(),
+                            loaded.github_comments_directory.clone(),
+                            loaded.layer_pull_requests.clone(),
+                        )
+                    });
                     let editor = loaded.diff_view.read(cx).editor();
+                    let left_editor = loaded.diff_view.read(cx).left_editor(cx);
                     let selected_file_index = loaded.selected_file_index;
                     let active_path = loaded
                         .selected_file_index
@@ -2060,10 +2139,12 @@ impl StackReview {
                     this.content_entries = loaded.content_entries;
                     this.selected_file_index = selected_file_index;
                     this.review_comment_count = review_comment_count;
-                    this.rendered_comment_ids = loaded.rendered_comment_ids;
+                    this.rendered_left_comment_ids = loaded.rendered_left_comment_ids;
+                    this.rendered_right_comment_ids = loaded.rendered_right_comment_ids;
                     this.comment_records = loaded.comment_records;
                     this.comments_by_path = loaded.comments_by_path;
                     this.record_id_by_editor_id = loaded.record_id_by_editor_id;
+                    this.next_comment_editor_id = loaded.next_comment_editor_id;
                     this.file_comment_statuses = loaded.file_comment_statuses;
                     this.commenter_cutoffs = loaded.commenter_cutoffs;
                     this.reviewer_login = loaded.reviewer_login;
@@ -2075,34 +2156,49 @@ impl StackReview {
                         this.review_comment_count,
                         this.selected_file_index
                     );
-                    this.editor_subscription = active_path.map(|active_path| {
-                        cx.subscribe_in(
+                    this.editor_subscriptions.clear();
+                    if let Some(active_path) = active_path {
+                        this.subscribe_to_comment_editor(
                             &editor,
+                            active_path.clone(),
+                            StackReviewCommentSide::Right,
                             window,
-                            move |this, editor, event: &EditorEvent, window, cx| {
-                                cx.emit(event.clone());
-                                match event {
-                                    EditorEvent::ReviewCommentsChanged { .. } => {
-                                        let comments = editor.read(cx).stack_review_comments(cx);
-                                        this.reconcile_editor_comments(&active_path, comments, cx);
-                                    }
-                                    EditorEvent::ReviewCommentResolutionChanged {
-                                        ids,
-                                        resolved,
-                                    } => {
-                                        this.persist_comment_resolution(ids, *resolved, window, cx);
-                                    }
-                                    EditorEvent::ReviewCommentCheckpointRequested { id } => {
-                                        this.use_comment_as_from(*id, window, cx);
-                                    }
-                                    _ => {}
-                                }
-                            },
-                        )
-                    });
+                            cx,
+                        );
+                        if let Some(left_editor) = &left_editor {
+                            this.subscribe_to_comment_editor(
+                                left_editor,
+                                active_path,
+                                StackReviewCommentSide::Left,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    this.active_comment_projection_stale = false;
                     this.state_error = loaded.state_error;
                     this.error = None;
                     this.start_comment_watch(window, cx);
+                    if let Some((
+                        snapshot_key,
+                        base_oid,
+                        head_oid,
+                        comments_directory,
+                        github_comments_directory,
+                        pull_requests,
+                    )) = github_refresh
+                    {
+                        this.start_github_refresh(
+                            snapshot_key,
+                            base_oid,
+                            head_oid,
+                            comments_directory,
+                            github_comments_directory,
+                            pull_requests,
+                            window,
+                            cx,
+                        );
+                    }
                     window.focus(&editor.focus_handle(cx), cx);
                     cx.notify();
                 }
@@ -2123,10 +2219,45 @@ impl StackReview {
         });
     }
 
+    fn subscribe_to_comment_editor(
+        &mut self,
+        editor: &Entity<Editor>,
+        active_path: String,
+        side: StackReviewCommentSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_subscriptions.push(cx.subscribe_in(
+            editor,
+            window,
+            move |this, editor, event: &EditorEvent, window, cx| {
+                cx.emit(event.clone());
+                match event {
+                    EditorEvent::ReviewCommentsChanged { .. } => {
+                        let comments = editor.read(cx).stack_review_comments(cx);
+                        this.reconcile_editor_comments(&active_path, side, comments, cx);
+                    }
+                    EditorEvent::ReviewCommentResolutionChanged { ids, resolved } => {
+                        this.persist_comment_resolution(ids, *resolved, window, cx);
+                    }
+                    EditorEvent::ReviewCommentCheckpointRequested { id } => {
+                        this.use_comment_as_from(*id, window, cx);
+                    }
+                    _ => {}
+                }
+            },
+        ));
+    }
+
     fn rebuild_comment_derived_state(&mut self) {
         self.review_comment_count = self.comment_records.len();
-        let projection =
-            project_comment_records(&self.comment_records, self.show_resolved_comments);
+        let projection = project_comment_records(
+            &self.comment_records,
+            self.show_resolved_comments,
+            &self.record_id_by_editor_id,
+            self.next_comment_editor_id,
+        );
+        self.next_comment_editor_id = projection.next_editor_id;
         self.comments_by_path = projection.comments_by_path;
         self.record_id_by_editor_id = projection.record_id_by_editor_id;
         self.file_comment_statuses =
@@ -2141,6 +2272,12 @@ impl StackReview {
     }
 
     fn select_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_file_index == Some(index)
+            && self.diff_view.is_some()
+            && !self.active_comment_projection_stale
+        {
+            return;
+        }
         self.remember_active_split_ratio(cx);
         let Some(entry) = self.content_entries.get(index).cloned() else {
             return;
@@ -2151,10 +2288,13 @@ impl StackReview {
             .get(&active_path)
             .cloned()
             .unwrap_or_default();
+        let next_comment_id = self.next_comment_editor_id;
         self.selected_file_index = Some(index);
         self.diff_view = None;
-        self.editor_subscription = None;
-        self.rendered_comment_ids.clear();
+        self.editor_subscriptions.clear();
+        self.rendered_left_comment_ids.clear();
+        self.rendered_right_comment_ids.clear();
+        self.active_comment_projection_stale = false;
         self.error = None;
         cx.notify();
 
@@ -2162,42 +2302,55 @@ impl StackReview {
         let workspace = self.workspace.clone();
         let split_left_ratio = self.split_left_ratio;
         self.file_load_task = cx.spawn_in(window, async move |this, cx| {
-            let result =
-                build_active_diff_view(Some(entry), comments, project, workspace, cx).await;
+            let result = build_active_diff_view(
+                Some(entry),
+                comments,
+                next_comment_id,
+                project,
+                workspace,
+                cx,
+            )
+            .await;
             if let Err(error) = this.update_in(cx, |this, window, cx| match result {
                 Ok((diff_view, restored_comments)) => {
                     diff_view.update(cx, |diff_view, cx| {
                         diff_view.set_split_left_ratio(split_left_ratio, cx);
                     });
                     let editor = diff_view.read(cx).editor();
+                    let left_editor = diff_view.read(cx).left_editor(cx);
                     if let Some(nav_history) = this.nav_history.clone() {
                         editor.update(cx, |editor, _| {
                             editor.set_nav_history(Some(nav_history));
                         });
                     }
-                    this.rendered_comment_ids =
-                        restored_comments.iter().map(|comment| comment.id).collect();
+                    this.rendered_left_comment_ids = restored_comments
+                        .left
+                        .iter()
+                        .map(|comment| comment.id)
+                        .collect();
+                    this.rendered_right_comment_ids = restored_comments
+                        .right
+                        .iter()
+                        .map(|comment| comment.id)
+                        .collect();
                     this.diff_view = Some(diff_view);
-                    this.editor_subscription = Some(cx.subscribe_in(
+                    this.editor_subscriptions.clear();
+                    this.subscribe_to_comment_editor(
                         &editor,
+                        active_path.clone(),
+                        StackReviewCommentSide::Right,
                         window,
-                        move |this, editor, event: &EditorEvent, window, cx| {
-                            cx.emit(event.clone());
-                            match event {
-                                EditorEvent::ReviewCommentsChanged { .. } => {
-                                    let comments = editor.read(cx).stack_review_comments(cx);
-                                    this.reconcile_editor_comments(&active_path, comments, cx);
-                                }
-                                EditorEvent::ReviewCommentResolutionChanged { ids, resolved } => {
-                                    this.persist_comment_resolution(ids, *resolved, window, cx);
-                                }
-                                EditorEvent::ReviewCommentCheckpointRequested { id } => {
-                                    this.use_comment_as_from(*id, window, cx);
-                                }
-                                _ => {}
-                            }
-                        },
-                    ));
+                        cx,
+                    );
+                    if let Some(left_editor) = &left_editor {
+                        this.subscribe_to_comment_editor(
+                            left_editor,
+                            active_path,
+                            StackReviewCommentSide::Left,
+                            window,
+                            cx,
+                        );
+                    }
                     this.error = None;
                     window.focus(&editor.focus_handle(cx), cx);
                     cx.notify();
@@ -2230,7 +2383,7 @@ impl StackReview {
             while events.next().await.is_some() {
                 let local_records =
                     load_comment_directory(&fs, &comments_directory, &base_oid, &head_oid).await;
-                if let Err(update_error) = this.update_in(cx, |this, _window, cx| {
+                if let Err(update_error) = this.update_in(cx, |this, window, cx| {
                     let records = local_records.and_then(|local_records| {
                         merge_reloaded_local_comments(&this.comment_records, local_records)
                     });
@@ -2243,11 +2396,14 @@ impl StackReview {
                             );
                             this.comment_records = records;
                             this.rebuild_comment_derived_state();
-                            this.state_error = Some(
-                                "Comments changed on disk; switch files to refresh the active diff"
-                                    .into(),
-                            );
-                            cx.notify();
+                            this.active_comment_projection_stale = true;
+                            this.editor_subscriptions.clear();
+                            this.state_error = None;
+                            if let Some(index) = this.selected_file_index {
+                                this.select_file(index, window, cx);
+                            } else {
+                                cx.notify();
+                            }
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -2259,6 +2415,90 @@ impl StackReview {
                     log::error!("failed to reload Stack Review comments: {update_error:#}");
                     break;
                 }
+            }
+        });
+    }
+
+    fn start_github_refresh(
+        &mut self,
+        snapshot_key: String,
+        base_oid: String,
+        head_oid: String,
+        comments_directory: PathBuf,
+        github_comments_directory: PathBuf,
+        pull_requests: Vec<(u32, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if pull_requests.is_empty() {
+            return;
+        }
+        self.github_refreshing = true;
+        cx.notify();
+        let fs = self.fs.clone();
+        let work_directory = self.work_directory.clone();
+        self.github_refresh_task = cx.spawn_in(window, async move |this, cx| {
+            let result: Result<_> = async {
+                let reviewer_login = refresh_github_comment_projection(
+                    &fs,
+                    &work_directory,
+                    &github_comments_directory,
+                    &base_oid,
+                    &head_oid,
+                    &pull_requests,
+                )
+                .await?;
+                let records = load_all_comment_records(
+                    &fs,
+                    &comments_directory,
+                    &github_comments_directory,
+                    &base_oid,
+                    &head_oid,
+                )
+                .await?;
+                Ok((reviewer_login, records))
+            }
+            .await;
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                this.github_refreshing = false;
+                let is_current_snapshot = this
+                    .review_state
+                    .as_ref()
+                    .is_some_and(|state| state.matches_snapshot(&base_oid, &head_oid));
+                if !is_current_snapshot {
+                    return;
+                }
+                match result {
+                    Ok((reviewer_login, records)) => {
+                        let records_changed = records != this.comment_records;
+                        this.refreshed_github_snapshots.insert(snapshot_key);
+                        this.reviewer_login = reviewer_login.or(this.reviewer_login.take());
+                        this.state_error = None;
+                        this.comment_records = records;
+                        this.rebuild_comment_derived_state();
+                        if records_changed
+                            && let Some(index) = this.selected_file_index
+                        {
+                            this.active_comment_projection_stale = true;
+                            this.editor_subscriptions.clear();
+                            this.select_file(index, window, cx);
+                        } else {
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "unable to refresh GitHub comments; cached projection remains active: {error:#}"
+                        );
+                        this.state_error = Some(
+                            format!("GitHub refresh failed; cached comments remain active: {error}")
+                                .into(),
+                        );
+                        cx.notify();
+                    }
+                }
+            }) {
+                log::error!("failed to apply GitHub comment refresh: {error:#}");
             }
         });
     }
@@ -2323,9 +2563,15 @@ impl StackReview {
     fn reconcile_editor_comments(
         &mut self,
         active_path: &str,
+        side: StackReviewCommentSide,
         comments: Vec<StackReviewComment>,
         cx: &mut Context<Self>,
     ) {
+        let rendered_comment_ids = match side {
+            StackReviewCommentSide::Left => &self.rendered_left_comment_ids,
+            StackReviewCommentSide::Right => &self.rendered_right_comment_ids,
+            StackReviewCommentSide::TopLevel => return,
+        };
         let Some(comments_directory) = self.comments_directory.clone() else {
             return;
         };
@@ -2342,8 +2588,7 @@ impl StackReview {
             .map(|comment| comment.id)
             .collect::<HashSet<_>>();
         let mut writes = Vec::new();
-        for editor_id in self
-            .rendered_comment_ids
+        for editor_id in rendered_comment_ids
             .difference(&current_editor_ids)
             .copied()
             .collect::<Vec<_>>()
@@ -2393,6 +2638,7 @@ impl StackReview {
                 reply_to,
                 timestamp.clone(),
             );
+            record.side = side;
             if let Some(existing) = &existing {
                 record.created_at = existing.record.created_at.clone();
                 record.updated_at = existing.record.updated_at.clone();
@@ -2432,7 +2678,15 @@ impl StackReview {
                 },
             );
         }
-        self.rendered_comment_ids = current_editor_ids;
+        match side {
+            StackReviewCommentSide::Left => {
+                self.rendered_left_comment_ids = current_editor_ids;
+            }
+            StackReviewCommentSide::Right => {
+                self.rendered_right_comment_ids = current_editor_ids;
+            }
+            StackReviewCommentSide::TopLevel => {}
+        }
         self.rebuild_comment_derived_state();
         if writes.is_empty() {
             return;
@@ -2814,8 +3068,9 @@ impl StackReview {
             self.file_load_task = Task::ready(());
             self.selected_file_index = None;
             self.diff_view = None;
-            self.editor_subscription = None;
-            self.rendered_comment_ids.clear();
+            self.editor_subscriptions.clear();
+            self.rendered_left_comment_ids.clear();
+            self.rendered_right_comment_ids.clear();
             cx.notify();
         }
     }
@@ -3244,6 +3499,9 @@ impl StackReview {
             .child(
                 Label::new(format!("{} comments", self.review_comment_count)).color(Color::Muted),
             )
+            .when(self.github_refreshing, |status| {
+                status.child(Label::new("Refreshing GitHub comments…").color(Color::Muted))
+            })
             .when(resolved_comment_count > 0, |status| {
                 status.child(
                     Button::new(
@@ -3854,7 +4112,18 @@ mod tests {
 
     #[test]
     fn comment_projection_groups_records_by_file_before_editor_restore() {
+        let mut left = test_comment_record(
+            "left",
+            "src/first.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T11:59:00Z",
+        );
+        left.record.side = StackReviewCommentSide::Left;
+        left.serialized = left.record.to_json().unwrap_or_default();
         let records = HashMap::from([
+            ("left".into(), left),
             (
                 "first".into(),
                 test_comment_record(
@@ -3879,9 +4148,47 @@ mod tests {
             ),
         ]);
 
-        let projection = project_comment_records(&records, false);
-        assert_eq!(projection.comments_by_path["src/first.rs"].len(), 1);
-        assert_eq!(projection.comments_by_path["src/second.rs"].len(), 1);
+        let projection = project_comment_records(&records, false, &HashMap::new(), 0);
+        assert_eq!(projection.comments_by_path["src/first.rs"].left.len(), 1);
+        assert_eq!(projection.comments_by_path["src/first.rs"].right.len(), 1);
+        assert_eq!(projection.comments_by_path["src/second.rs"].right.len(), 1);
+        let first_right_id = projection.comments_by_path["src/first.rs"].right[0].id;
+        let mut after_left_delete = records;
+        after_left_delete.remove("left");
+        let reprojected = project_comment_records(
+            &after_left_delete,
+            false,
+            &projection.record_id_by_editor_id,
+            projection.next_editor_id,
+        );
+        assert_eq!(
+            reprojected.comments_by_path["src/first.rs"].right[0].id, first_right_id,
+            "deleting a LEFT comment must not renumber the RIGHT editor"
+        );
+        let mut after_highest_delete = after_left_delete;
+        after_highest_delete.remove("second");
+        after_highest_delete.insert(
+            "third".into(),
+            test_comment_record(
+                "third",
+                "src/third.rs",
+                StackReviewCommentSource::LocalAgent,
+                None,
+                None,
+                "2026-08-21T12:02:00Z",
+            ),
+        );
+        let after_new_comment = project_comment_records(
+            &after_highest_delete,
+            false,
+            &reprojected.record_id_by_editor_id,
+            reprojected.next_editor_id,
+        );
+        assert!(
+            after_new_comment.comments_by_path["src/third.rs"].right[0].id
+                >= projection.next_editor_id,
+            "deleted editor IDs must never be reused"
+        );
     }
 
     #[test]
@@ -4056,8 +4363,8 @@ mod tests {
         .await
         .expect("migrate legacy comment");
         assert_eq!(records.len(), 1);
-        let projection = project_comment_records(&records, false);
-        let comments = &projection.comments_by_path["src/lib.rs"];
+        let projection = project_comment_records(&records, false, &HashMap::new(), 0);
+        let comments = &projection.comments_by_path["src/lib.rs"].right;
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].body, "Migrated");
         assert!(!comments[0].created_at.is_empty());
@@ -4070,15 +4377,15 @@ mod tests {
             .record
             .local_resolution = Some(true);
         assert!(
-            project_comment_records(&resolved_records, false)
+            project_comment_records(&resolved_records, false, &HashMap::new(), 0)
                 .comments_by_path
                 .is_empty()
         );
         assert_eq!(
-            project_comment_records(&resolved_records, true)
+            project_comment_records(&resolved_records, true, &HashMap::new(), 0)
                 .comments_by_path
                 .values()
-                .map(Vec::len)
+                .map(|projection| projection.left.len() + projection.right.len())
                 .sum::<usize>(),
             1
         );
@@ -4374,15 +4681,18 @@ mod tests {
                     sidebar_width: STACK_REVIEW_SIDEBAR_DEFAULT_WIDTH,
                     split_left_ratio: 0.5,
                     review_comment_count: 0,
-                    rendered_comment_ids: HashSet::new(),
+                    rendered_left_comment_ids: HashSet::new(),
+                    rendered_right_comment_ids: HashSet::new(),
                     comment_records: HashMap::new(),
                     comments_by_path: HashMap::new(),
                     record_id_by_editor_id: HashMap::new(),
+                    next_comment_editor_id: 0,
                     file_comment_statuses: HashMap::new(),
                     commenter_cutoffs: Vec::new(),
                     selected_commenter: None,
                     reviewer_login: Some("xHayden".into()),
                     refreshed_github_snapshots: HashSet::new(),
+                    github_refreshing: false,
                     comments_directory: None,
                     github_comments_directory: None,
                     diff_view: Some(diff_view.clone()),
@@ -4396,8 +4706,10 @@ mod tests {
                     state_write_lock: Arc::new(futures::lock::Mutex::new(())),
                     comment_write_lock: Arc::new(futures::lock::Mutex::new(())),
                     state_write_generations: HashMap::new(),
-                    editor_subscription: None,
+                    editor_subscriptions: Vec::new(),
+                    active_comment_projection_stale: false,
                     comment_watch_task: Task::ready(()),
+                    github_refresh_task: Task::ready(()),
                     checkpoint_boundary_task: Task::ready(()),
                     checkpoint_boundary_requests: CheckpointBoundaryRequestTracker::default(),
                 });

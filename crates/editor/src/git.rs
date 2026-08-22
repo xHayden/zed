@@ -967,6 +967,10 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn ensure_next_stack_review_comment_id(&mut self, next_id: usize) {
+        self.next_review_comment_id = self.next_review_comment_id.max(next_id);
+    }
+
     pub fn show_stack_review_comment_at_cursor(
         &mut self,
         window: &mut Window,

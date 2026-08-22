@@ -600,15 +600,28 @@ pub async fn load_stack_diff(
     base_ref: &str,
     head_ref: &str,
 ) -> Result<StackReviewDiff> {
+    let commits = repository
+        .first_parent_commits(base_ref.to_owned(), head_ref.to_owned())
+        .await?;
+    load_stack_diff_with_commits(repository, base_ref, head_ref, commits, None).await
+}
+
+async fn load_stack_diff_with_commits(
+    repository: &dyn GitRepository,
+    base_ref: &str,
+    head_ref: &str,
+    commits: Vec<FirstParentCommit>,
+    included_paths: Option<&HashSet<String>>,
+) -> Result<StackReviewDiff> {
     let tree_diff = repository
         .stack_review_diff_tree(base_ref.to_owned(), head_ref.to_owned())
         .await?;
     let mut entries = tree_diff.entries.into_iter().collect::<Vec<_>>();
+    if let Some(included_paths) = included_paths {
+        entries.retain(|(path, _)| included_paths.contains(path.as_unix_str()));
+    }
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    let commits = repository
-        .first_parent_commits(base_ref.to_owned(), head_ref.to_owned())
-        .await?;
     let mut provenance_by_path = HashMap::<String, (bool, bool)>::new();
     for commit in commits {
         for path in commit.paths {
@@ -735,14 +748,18 @@ pub async fn load_stack_diff_since(
         .first_parent_commits(base_ref.to_owned(), head_ref.to_owned())
         .await?;
     let included_paths = commits
-        .into_iter()
+        .iter()
         .filter(|commit| commit.author_timestamp >= author_timestamp)
-        .flat_map(|commit| commit.paths)
+        .flat_map(|commit| commit.paths.iter().cloned())
         .collect::<HashSet<_>>();
-    let mut diff = load_stack_diff(repository, base_ref, head_ref).await?;
-    diff.files
-        .retain(|file| included_paths.contains(&file.path));
-    Ok(diff)
+    load_stack_diff_with_commits(
+        repository,
+        base_ref,
+        head_ref,
+        commits,
+        Some(&included_paths),
+    )
+    .await
 }
 
 fn time_checkpoint_base(
