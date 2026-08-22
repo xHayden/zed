@@ -350,6 +350,7 @@ pub(super) struct DiffHunkKey {
 pub(super) struct StoredReviewComment {
     /// Unique identifier for this comment (for edit/delete operations).
     pub(super) id: usize,
+    pub(super) record_id: Option<String>,
     /// The comment text entered by the user.
     pub(super) comment: String,
     /// Anchors for the code range being reviewed.
@@ -359,6 +360,7 @@ pub(super) struct StoredReviewComment {
     pub(super) author: StackReviewCommentAuthor,
     pub(super) source: StackReviewCommentSource,
     pub(super) reply_to: Option<usize>,
+    pub(super) reply_to_record_id: Option<String>,
     pub(super) created_at: String,
     pub(super) created_at_display: SharedString,
     pub(super) resolved: bool,
@@ -403,13 +405,25 @@ impl DiffReviewDragState {
 }
 
 impl StoredReviewComment {
+    pub(super) fn checkpoint_requested_event(&self) -> EditorEvent {
+        if let Some(record_id) = &self.record_id {
+            EditorEvent::StackReviewCommentCheckpointRequested {
+                record_id: record_id.clone(),
+            }
+        } else {
+            EditorEvent::ReviewCommentCheckpointRequested { id: self.id }
+        }
+    }
+
     fn with_metadata(
         id: usize,
+        record_id: Option<String>,
         comment: String,
         anchor_range: Range<Anchor>,
         author: StackReviewCommentAuthor,
         source: StackReviewCommentSource,
         reply_to: Option<usize>,
+        reply_to_record_id: Option<String>,
     ) -> Self {
         let created_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -417,12 +431,14 @@ impl StoredReviewComment {
         let created_at_display = format_stack_review_comment_timestamp(&created_at).into();
         Self {
             id,
+            record_id,
             comment,
             range: anchor_range,
             is_editing: false,
             author,
             source,
             reply_to,
+            reply_to_record_id,
             created_at,
             created_at_display,
             resolved: false,
@@ -445,55 +461,97 @@ pub(super) fn stack_review_thread_items(
     comments: Vec<StoredReviewComment>,
     pending_reply_to: Option<usize>,
 ) -> Vec<StackReviewThreadItem> {
-    let mut comments_by_id = HashMap::default();
-    for comment in comments {
-        comments_by_id.entry(comment.id).or_insert(comment);
+    let mut indices_by_record_id = HashMap::<String, Vec<usize>>::default();
+    let mut indices_by_numeric_id = HashMap::<usize, Vec<usize>>::default();
+    for (index, comment) in comments.iter().enumerate() {
+        if let Some(record_id) = &comment.record_id {
+            indices_by_record_id
+                .entry(record_id.clone())
+                .or_default()
+                .push(index);
+        }
+        indices_by_numeric_id
+            .entry(comment.id)
+            .or_default()
+            .push(index);
     }
-    let known_ids = comments_by_id.keys().copied().collect::<HashSet<_>>();
+    let exact_index = |indices: Option<&Vec<usize>>| match indices.map(Vec::as_slice) {
+        Some([index]) => Some(*index),
+        _ => None,
+    };
     let mut roots = Vec::new();
     let mut children = HashMap::<usize, Vec<usize>>::default();
-    for comment in comments_by_id.values() {
-        if let Some(parent_id) = comment.reply_to
-            && parent_id != comment.id
-            && known_ids.contains(&parent_id)
-        {
-            children.entry(parent_id).or_default().push(comment.id);
+    for (index, comment) in comments.iter().enumerate() {
+        let parent_index = comment
+            .reply_to_record_id
+            .as_ref()
+            .and_then(|record_id| exact_index(indices_by_record_id.get(record_id)))
+            .or_else(|| {
+                comment.record_id.is_none().then_some(())?;
+                comment
+                    .reply_to
+                    .and_then(|parent_id| exact_index(indices_by_numeric_id.get(&parent_id)))
+            })
+            .filter(|parent_index| *parent_index != index);
+        if let Some(parent_index) = parent_index {
+            children.entry(parent_index).or_default().push(index);
         } else {
-            roots.push(comment.id);
+            roots.push(index);
         }
     }
-    roots.sort_unstable();
-    for child_ids in children.values_mut() {
-        child_ids.sort_unstable();
+    let compare_indices = |left: &usize, right: &usize| {
+        let left = &comments[*left];
+        let right = &comments[*right];
+        time::OffsetDateTime::parse(
+            &left.created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map(|timestamp| timestamp.unix_timestamp_nanos())
+        .unwrap_or(i128::MIN)
+        .cmp(
+            &time::OffsetDateTime::parse(
+                &right.created_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map(|timestamp| timestamp.unix_timestamp_nanos())
+            .unwrap_or(i128::MIN),
+        )
+        .then_with(|| left.record_id.cmp(&right.record_id))
+        .then_with(|| left.id.cmp(&right.id))
+    };
+    roots.sort_by(compare_indices);
+    for child_indices in children.values_mut() {
+        child_indices.sort_by(compare_indices);
     }
 
+    let pending_reply_index =
+        pending_reply_to.and_then(|comment_id| exact_index(indices_by_numeric_id.get(&comment_id)));
     let mut items = Vec::new();
     let mut visited = HashSet::default();
-    let mut pending_roots = roots;
-    let mut all_ids = known_ids.into_iter().collect::<Vec<_>>();
-    all_ids.sort_unstable();
-    pending_roots.extend(all_ids);
-    for root_id in pending_roots {
-        if visited.contains(&root_id) {
+    let mut all_indices = (0..comments.len()).collect::<Vec<_>>();
+    all_indices.sort_by(compare_indices);
+    roots.extend(all_indices);
+    for root_index in roots {
+        if visited.contains(&root_index) {
             continue;
         }
-        let mut pending = vec![(root_id, 0usize)];
-        while let Some((comment_id, depth)) = pending.pop() {
-            if !visited.insert(comment_id) {
+        let mut pending = vec![(root_index, 0usize)];
+        while let Some((comment_index, depth)) = pending.pop() {
+            if !visited.insert(comment_index) {
                 continue;
             }
-            let Some(comment) = comments_by_id.get(&comment_id).cloned() else {
+            let Some(comment) = comments.get(comment_index).cloned() else {
                 continue;
             };
             items.push(StackReviewThreadItem::Comment { comment, depth });
-            if pending_reply_to == Some(comment_id) {
+            if pending_reply_index == Some(comment_index) {
                 items.push(StackReviewThreadItem::Composer {
                     depth: depth.saturating_add(1),
                 });
             }
-            if let Some(child_ids) = children.get(&comment_id) {
-                for child_id in child_ids.iter().rev() {
-                    pending.push((*child_id, depth.saturating_add(1).min(32)));
+            if let Some(child_indices) = children.get(&comment_index) {
+                for child_index in child_indices.iter().rev() {
+                    pending.push((*child_index, depth.saturating_add(1).min(32)));
                 }
             }
         }
@@ -875,6 +933,7 @@ impl Editor {
                     };
                     Some(StackReviewComment {
                         id: comment.id,
+                        record_id: comment.record_id.clone(),
                         path,
                         start_row: start.row,
                         start_column: start.column,
@@ -886,6 +945,7 @@ impl Editor {
                         author: comment.author.clone(),
                         source: comment.source,
                         reply_to: comment.reply_to,
+                        reply_to_record_id: comment.reply_to_record_id.clone(),
                     })
                 })
             })
@@ -937,12 +997,14 @@ impl Editor {
             };
             let stored_comment = StoredReviewComment {
                 id: comment.id,
+                record_id: comment.record_id.clone(),
                 comment: comment.body.clone(),
                 range: start..end,
                 is_editing: false,
                 author: comment.author.clone(),
                 source: comment.source,
                 reply_to: comment.reply_to,
+                reply_to_record_id: comment.reply_to_record_id.clone(),
                 created_at: comment.created_at.clone(),
                 created_at_display: format_stack_review_comment_timestamp(&comment.created_at)
                     .into(),
@@ -1325,8 +1387,29 @@ impl Editor {
         let id = self.next_review_comment_id;
         self.next_review_comment_id += 1;
 
-        let stored_comment =
-            StoredReviewComment::with_metadata(id, comment, anchor_range, author, source, reply_to);
+        let (record_id, reply_to_record_id) = if self.is_stack_review {
+            let reply_to_record_id = reply_to.and_then(|reply_to| {
+                self.stored_review_comments
+                    .iter()
+                    .flat_map(|(_, comments)| comments)
+                    .find(|comment| comment.id == reply_to)
+                    .and_then(|comment| comment.record_id.clone())
+            });
+            (Some(uuid::Uuid::now_v7().to_string()), reply_to_record_id)
+        } else {
+            (None, None)
+        };
+
+        let stored_comment = StoredReviewComment::with_metadata(
+            id,
+            record_id,
+            comment,
+            anchor_range,
+            author,
+            source,
+            reply_to,
+            reply_to_record_id,
+        );
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let key_point = hunk_key.hunk_start_anchor.to_point(&snapshot);
@@ -1783,56 +1866,129 @@ impl Editor {
         resolved: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut root_id = id;
+        let comments = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut indices_by_record_id = HashMap::<String, Vec<usize>>::default();
+        let mut indices_by_numeric_id = HashMap::<usize, Vec<usize>>::default();
+        for (index, comment) in comments.iter().enumerate() {
+            if let Some(record_id) = &comment.record_id {
+                indices_by_record_id
+                    .entry(record_id.clone())
+                    .or_default()
+                    .push(index);
+            }
+            indices_by_numeric_id
+                .entry(comment.id)
+                .or_default()
+                .push(index);
+        }
+        let exact_index = |indices: Option<&Vec<usize>>| match indices.map(Vec::as_slice) {
+            Some([index]) => Some(*index),
+            _ => None,
+        };
+        let Some(selected_index) = exact_index(indices_by_numeric_id.get(&id)) else {
+            return false;
+        };
+        if let Some(record_id) = comments[selected_index].record_id.clone() {
+            for (_, comments) in &mut self.stored_review_comments {
+                for comment in comments {
+                    if comment.record_id.as_ref() == Some(&record_id) {
+                        comment.resolved = resolved;
+                    }
+                }
+            }
+            cx.emit(EditorEvent::StackReviewCommentResolutionChanged {
+                record_ids: vec![record_id],
+                resolved,
+            });
+            cx.notify();
+            return true;
+        }
+        let mut root_index = selected_index;
+        let parent_indices = comments
+            .iter()
+            .enumerate()
+            .map(|(index, comment)| {
+                comment
+                    .reply_to_record_id
+                    .as_ref()
+                    .and_then(|record_id| exact_index(indices_by_record_id.get(record_id)))
+                    .or_else(|| {
+                        comment.record_id.is_none().then_some(())?;
+                        comment.reply_to.and_then(|parent_id| {
+                            exact_index(indices_by_numeric_id.get(&parent_id))
+                        })
+                    })
+                    .filter(|parent_index| *parent_index != index)
+            })
+            .collect::<Vec<_>>();
         let mut seen = HashSet::default();
         loop {
-            if !seen.insert(root_id) {
+            if !seen.insert(root_index) {
                 return false;
             }
-            let parent = self
-                .stored_review_comments
-                .iter()
-                .flat_map(|(_, comments)| comments)
-                .find(|comment| comment.id == root_id)
-                .and_then(|comment| comment.reply_to);
-            let Some(parent) = parent else {
+            let Some(parent_index) = parent_indices[root_index] else {
                 break;
             };
-            root_id = parent;
+            root_index = parent_index;
         }
-        let mut ids = vec![root_id];
-        loop {
-            let mut changed = false;
-            for comment in self
-                .stored_review_comments
-                .iter()
-                .flat_map(|(_, comments)| comments)
-            {
-                if comment.reply_to.is_some_and(|parent| ids.contains(&parent))
-                    && !ids.contains(&comment.id)
+
+        let mut member_indices = vec![root_index];
+        let mut next_member_index = 0;
+        while let Some(parent_index) = member_indices.get(next_member_index).copied() {
+            for (comment_index, candidate_parent) in parent_indices.iter().enumerate() {
+                if *candidate_parent == Some(parent_index)
+                    && !member_indices.contains(&comment_index)
                 {
-                    ids.push(comment.id);
-                    changed = true;
+                    member_indices.push(comment_index);
                 }
             }
-            if !changed {
-                break;
-            }
+            next_member_index = next_member_index.saturating_add(1);
         }
-        let mut found = false;
+        let record_ids = member_indices
+            .iter()
+            .filter_map(|index| comments[*index].record_id.clone())
+            .collect::<Vec<_>>();
+        let legacy_ids = member_indices
+            .iter()
+            .filter_map(|index| {
+                comments[*index]
+                    .record_id
+                    .is_none()
+                    .then_some(comments[*index].id)
+            })
+            .collect::<Vec<_>>();
+        let record_ids_to_update = record_ids.iter().collect::<HashSet<_>>();
+        let legacy_ids_to_update = legacy_ids.iter().copied().collect::<HashSet<_>>();
         for (_, comments) in &mut self.stored_review_comments {
             for comment in comments {
-                if ids.contains(&comment.id) {
+                let is_member = comment
+                    .record_id
+                    .as_ref()
+                    .is_some_and(|record_id| record_ids_to_update.contains(record_id))
+                    || (comment.record_id.is_none() && legacy_ids_to_update.contains(&comment.id));
+                if is_member {
                     comment.resolved = resolved;
-                    found = true;
                 }
             }
         }
-        if found {
-            cx.emit(EditorEvent::ReviewCommentResolutionChanged { ids, resolved });
-            cx.notify();
+        if !record_ids.is_empty() {
+            cx.emit(EditorEvent::StackReviewCommentResolutionChanged {
+                record_ids,
+                resolved,
+            });
         }
-        found
+        if !legacy_ids.is_empty() {
+            cx.emit(EditorEvent::ReviewCommentResolutionChanged {
+                ids: legacy_ids,
+                resolved,
+            });
+        }
+        cx.notify();
+        true
     }
 
     pub(super) fn toggle_active_review_comment_resolved(
@@ -3481,6 +3637,7 @@ impl Editor {
         editor_handle: WeakEntity<Editor>,
     ) -> impl IntoElement {
         let comment_id = comment.id;
+        let checkpoint_requested_event = comment.checkpoint_requested_event();
         let is_editing = inline_editor.is_some();
         let cancel_editor = editor_handle.clone();
         let confirm_editor = editor_handle.clone();
@@ -3636,9 +3793,7 @@ impl Editor {
                             .on_click(move |_, _, cx| {
                                 if let Some(editor) = checkpoint_editor.upgrade() {
                                     editor.update(cx, |_, cx| {
-                                        cx.emit(EditorEvent::ReviewCommentCheckpointRequested {
-                                            id: comment_id,
-                                        });
+                                        cx.emit(checkpoint_requested_event.clone());
                                     });
                                 }
                             }),

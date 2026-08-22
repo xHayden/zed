@@ -42,6 +42,8 @@ pub enum StackReviewCommentSource {
 #[serde(rename_all = "camelCase")]
 pub struct StackReviewComment {
     pub id: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
     pub path: String,
     pub start_row: u32,
     pub start_column: u32,
@@ -58,9 +60,11 @@ pub struct StackReviewComment {
     pub source: StackReviewCommentSource,
     #[serde(default)]
     pub reply_to: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_record_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StackReviewCommentSide {
     Left,
@@ -305,6 +309,291 @@ impl StackReviewCommentRecord {
     pub fn is_resolved(&self) -> bool {
         self.local_resolution.unwrap_or(self.resolved)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StackReviewCommentClass {
+    Inline,
+    TopLevel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentThreadPartition {
+    pub storage_key: String,
+    pub base_oid: String,
+    pub head_oid: String,
+    pub path: Option<String>,
+    pub side: StackReviewCommentSide,
+    pub class: StackReviewCommentClass,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CommentThreadKey {
+    Normal {
+        partition: CommentThreadPartition,
+        root_record_id: String,
+    },
+    MissingParent {
+        partition: CommentThreadPartition,
+        missing_parent_id: String,
+    },
+    BoundaryViolation {
+        partition: CommentThreadPartition,
+        foreign_parent_id: String,
+    },
+    Cycle {
+        partition: CommentThreadPartition,
+        canonical_member_id: String,
+    },
+}
+
+impl CommentThreadKey {
+    pub fn to_stable_string(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn from_stable_string(serialized: &str) -> Result<Self> {
+        Ok(serde_json::from_str(serialized)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentThread {
+    pub key: CommentThreadKey,
+    pub placement_record_id: String,
+    pub member_record_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CommentThreadIndex {
+    thread_key_by_record_id: HashMap<String, CommentThreadKey>,
+    threads: Vec<CommentThread>,
+}
+
+impl CommentThreadIndex {
+    pub fn new<'a>(
+        storage_key: impl Into<String>,
+        records: impl IntoIterator<Item = &'a StackReviewCommentRecord>,
+    ) -> Result<Self> {
+        let storage_key = storage_key.into();
+        let mut records_by_id = BTreeMap::new();
+        for record in records {
+            if records_by_id.insert(record.id.clone(), record).is_some() {
+                bail!("duplicate Stack Review comment record id {:?}", record.id);
+            }
+        }
+
+        let mut thread_key_by_record_id = HashMap::new();
+        for record in records_by_id.values() {
+            let partition = comment_thread_partition(&storage_key, record);
+            let mut root = *record;
+            let mut ancestry: Vec<&str> = Vec::new();
+            let mut ancestry_positions: HashMap<&str, usize> = HashMap::new();
+            let key = loop {
+                if let Some(cycle_start) = ancestry_positions.get(root.id.as_str()) {
+                    let Some(cycle_members) = ancestry.get(*cycle_start..) else {
+                        bail!("invalid Stack Review comment cycle position");
+                    };
+                    let Some(canonical_member_id) = cycle_members.iter().min() else {
+                        bail!("empty Stack Review comment cycle");
+                    };
+                    break CommentThreadKey::Cycle {
+                        partition,
+                        canonical_member_id: (*canonical_member_id).to_owned(),
+                    };
+                }
+                ancestry_positions.insert(root.id.as_str(), ancestry.len());
+                ancestry.push(root.id.as_str());
+                let Some(parent_id) = root.reply_to.as_deref() else {
+                    break CommentThreadKey::Normal {
+                        partition,
+                        root_record_id: root.id.clone(),
+                    };
+                };
+                let Some(parent) = records_by_id.get(parent_id) else {
+                    break CommentThreadKey::MissingParent {
+                        partition,
+                        missing_parent_id: parent_id.to_owned(),
+                    };
+                };
+                if comment_thread_partition(&storage_key, parent) != partition {
+                    break CommentThreadKey::BoundaryViolation {
+                        partition,
+                        foreign_parent_id: parent_id.to_owned(),
+                    };
+                }
+                root = parent;
+            };
+            thread_key_by_record_id.insert(record.id.clone(), key);
+        }
+
+        let mut member_ids_by_key = BTreeMap::<CommentThreadKey, Vec<String>>::new();
+        for (record_id, key) in &thread_key_by_record_id {
+            member_ids_by_key
+                .entry(key.clone())
+                .or_default()
+                .push(record_id.clone());
+        }
+        let mut threads = Vec::with_capacity(member_ids_by_key.len());
+        for (key, member_ids) in member_ids_by_key {
+            let placement_record_id = match &key {
+                CommentThreadKey::Normal { root_record_id, .. } => root_record_id.clone(),
+                _ => {
+                    let Some(record_id) = member_ids
+                        .iter()
+                        .min_by(|left, right| {
+                            compare_comment_record_ids(&records_by_id, left, right)
+                        })
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    record_id
+                }
+            };
+            let member_record_ids =
+                ordered_comment_thread_members(&records_by_id, &member_ids, &key);
+            threads.push(CommentThread {
+                key,
+                placement_record_id,
+                member_record_ids,
+            });
+        }
+        threads.sort_by(|left, right| {
+            compare_comment_record_ids(
+                &records_by_id,
+                &left.placement_record_id,
+                &right.placement_record_id,
+            )
+            .then_with(|| left.key.cmp(&right.key))
+        });
+
+        Ok(Self {
+            thread_key_by_record_id,
+            threads,
+        })
+    }
+
+    pub fn thread_key_for(&self, record_id: &str) -> Option<&CommentThreadKey> {
+        self.thread_key_by_record_id.get(record_id)
+    }
+
+    pub fn thread(&self, key: &CommentThreadKey) -> Option<&CommentThread> {
+        self.threads.iter().find(|thread| &thread.key == key)
+    }
+
+    pub fn threads(&self) -> &[CommentThread] {
+        &self.threads
+    }
+}
+
+fn comment_thread_partition(
+    storage_key: &str,
+    record: &StackReviewCommentRecord,
+) -> CommentThreadPartition {
+    CommentThreadPartition {
+        storage_key: storage_key.to_owned(),
+        base_oid: record.base_oid.clone(),
+        head_oid: record.head_oid.clone(),
+        path: record.path.clone(),
+        side: record.side,
+        class: if record.side == StackReviewCommentSide::TopLevel {
+            StackReviewCommentClass::TopLevel
+        } else {
+            StackReviewCommentClass::Inline
+        },
+    }
+}
+
+fn comment_record_timestamp_nanos(record: &StackReviewCommentRecord) -> i128 {
+    time::OffsetDateTime::parse(
+        &record.created_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map(|timestamp| timestamp.unix_timestamp_nanos())
+    .unwrap_or(i128::MIN)
+}
+
+fn compare_comment_record_ids(
+    records_by_id: &BTreeMap<String, &StackReviewCommentRecord>,
+    left_id: &str,
+    right_id: &str,
+) -> std::cmp::Ordering {
+    records_by_id
+        .get(left_id)
+        .map(|record| comment_record_timestamp_nanos(record))
+        .unwrap_or(i128::MIN)
+        .cmp(
+            &records_by_id
+                .get(right_id)
+                .map(|record| comment_record_timestamp_nanos(record))
+                .unwrap_or(i128::MIN),
+        )
+        .then_with(|| left_id.cmp(right_id))
+}
+
+fn ordered_comment_thread_members(
+    records_by_id: &BTreeMap<String, &StackReviewCommentRecord>,
+    member_ids: &[String],
+    key: &CommentThreadKey,
+) -> Vec<String> {
+    let member_ids = member_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut children_by_parent = HashMap::<&str, Vec<&str>>::new();
+    for member_id in &member_ids {
+        let Some(record) = records_by_id.get(*member_id) else {
+            continue;
+        };
+        if let Some(parent_id) = record.reply_to.as_deref()
+            && member_ids.contains(parent_id)
+        {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(member_id);
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_by(|left, right| compare_comment_record_ids(records_by_id, left, right));
+    }
+
+    let mut ordered = Vec::with_capacity(member_ids.len());
+    let mut roots = member_ids
+        .iter()
+        .filter(|record_id| {
+            records_by_id
+                .get(**record_id)
+                .and_then(|record| record.reply_to.as_deref())
+                .is_none_or(|parent_id| !member_ids.contains(parent_id))
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if roots.is_empty()
+        && let CommentThreadKey::Cycle {
+            canonical_member_id,
+            ..
+        } = key
+    {
+        roots.push(canonical_member_id);
+    }
+    roots.sort_by(|left, right| compare_comment_record_ids(records_by_id, left, right));
+    let mut pending = roots.into_iter().rev().collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    while let Some(record_id) = pending.pop() {
+        if !visited.insert(record_id) {
+            continue;
+        }
+        ordered.push(record_id.to_owned());
+        if let Some(children) = children_by_parent.get(record_id) {
+            pending.extend(children.iter().rev().copied());
+        }
+    }
+    ordered
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1001,6 +1290,419 @@ fn resolve_branch(
 mod tests {
     use super::*;
     use crate::repository::GitBinary;
+
+    fn thread_record(
+        id: &str,
+        reply_to: Option<&str>,
+        created_at: &str,
+    ) -> StackReviewCommentRecord {
+        StackReviewCommentRecord::new_inline(
+            id.to_owned(),
+            "base".into(),
+            "head".into(),
+            "src/lib.rs".into(),
+            1,
+            0,
+            1,
+            1,
+            id.to_owned(),
+            StackReviewCommentAuthor::default(),
+            StackReviewCommentSource::Github,
+            reply_to.map(str::to_owned),
+            created_at.to_owned(),
+        )
+    }
+
+    #[test]
+    fn comment_thread_index_maps_a_deep_chain_to_its_stable_root() {
+        let records = [
+            thread_record("grandchild", Some("child"), "2026-08-21T12:02:00Z"),
+            thread_record("root", None, "2026-08-21T12:00:00Z"),
+            thread_record("child", Some("root"), "2026-08-21T12:01:00Z"),
+        ];
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build comment thread index");
+        let expected_key = CommentThreadKey::Normal {
+            partition: CommentThreadPartition {
+                storage_key: "base-head".into(),
+                base_oid: "base".into(),
+                head_oid: "head".into(),
+                path: Some("src/lib.rs".into()),
+                side: StackReviewCommentSide::Right,
+                class: StackReviewCommentClass::Inline,
+            },
+            root_record_id: "root".into(),
+        };
+
+        assert_eq!(index.thread_key_for("grandchild"), Some(&expected_key));
+        assert_eq!(
+            index
+                .thread(&expected_key)
+                .expect("normal thread")
+                .member_record_ids,
+            ["root", "child", "grandchild"]
+        );
+    }
+    #[test]
+    fn comment_thread_index_preserves_a_deep_normal_chain() {
+        let record_ids = (0..64)
+            .map(|depth| format!("node-{depth:02}"))
+            .collect::<Vec<_>>();
+        let records = record_ids
+            .iter()
+            .enumerate()
+            .map(|(depth, record_id)| {
+                thread_record(
+                    record_id,
+                    depth
+                        .checked_sub(1)
+                        .and_then(|parent_depth| record_ids.get(parent_depth))
+                        .map(String::as_str),
+                    "2026-08-21T12:00:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build deep normal comment thread index");
+        let deepest_record_id = record_ids.last().expect("deepest record id");
+        let key = index
+            .thread_key_for(deepest_record_id)
+            .expect("deep normal thread key");
+
+        assert!(matches!(
+            key,
+            CommentThreadKey::Normal { root_record_id, .. } if root_record_id == "node-00"
+        ));
+        assert_eq!(
+            &index
+                .thread(key)
+                .expect("deep normal thread")
+                .member_record_ids,
+            &record_ids
+        );
+    }
+
+    #[test]
+    fn comment_thread_index_marks_missing_parent_groups_as_degraded() {
+        let records = [
+            thread_record("descendant", Some("orphan"), "2026-08-21T12:02:00Z"),
+            thread_record("orphan", Some("missing"), "2026-08-21T12:01:00Z"),
+        ];
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build degraded comment thread index");
+        let key = index
+            .thread_key_for("descendant")
+            .expect("missing-parent key");
+        assert!(matches!(
+            key,
+            CommentThreadKey::MissingParent {
+                missing_parent_id,
+                ..
+            } if missing_parent_id == "missing"
+        ));
+        let thread = index.thread(key).expect("missing-parent thread");
+        assert_eq!(thread.placement_record_id, "orphan");
+        assert_eq!(thread.member_record_ids, ["orphan", "descendant"]);
+    }
+
+    #[test]
+    fn comment_thread_index_marks_cross_side_parents_as_boundary_violations() {
+        let mut left_parent = thread_record("left-parent", None, "2026-08-21T12:00:00.000000001Z");
+        left_parent.side = StackReviewCommentSide::Left;
+        let right_child = thread_record(
+            "right-child",
+            Some("left-parent"),
+            "2026-08-21T12:00:00.000000002Z",
+        );
+        let records = [left_parent, right_child];
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build boundary-qualified comment thread index");
+        let child_key = index
+            .thread_key_for("right-child")
+            .expect("boundary-violation key");
+        assert!(matches!(
+            child_key,
+            CommentThreadKey::BoundaryViolation {
+                partition,
+                foreign_parent_id,
+            } if partition.side == StackReviewCommentSide::Right
+                && foreign_parent_id == "left-parent"
+        ));
+        assert_ne!(
+            child_key,
+            index
+                .thread_key_for("left-parent")
+                .expect("normal LEFT root key")
+        );
+    }
+
+    #[test]
+    fn comment_thread_index_keeps_cross_boundary_descendants_in_exact_partitions() {
+        let root = thread_record("root", None, "2026-08-21T12:00:00.000000001Z");
+        let normal_child = thread_record(
+            "normal-child",
+            Some("root"),
+            "2026-08-21T12:00:00.000000002Z",
+        );
+
+        let mut path_child =
+            thread_record("path-child", Some("root"), "2026-08-21T12:00:00.000000003Z");
+        path_child.path = Some("src/other.rs".into());
+        let mut path_descendant = thread_record(
+            "path-descendant",
+            Some("path-child"),
+            "2026-08-21T12:00:00.000000004Z",
+        );
+        path_descendant.path = path_child.path.clone();
+
+        let mut snapshot_child = thread_record(
+            "snapshot-child",
+            Some("root"),
+            "2026-08-21T12:00:00.000000005Z",
+        );
+        snapshot_child.base_oid = "other-base".into();
+        snapshot_child.head_oid = "other-head".into();
+        let mut snapshot_descendant = thread_record(
+            "snapshot-descendant",
+            Some("snapshot-child"),
+            "2026-08-21T12:00:00.000000006Z",
+        );
+        snapshot_descendant.base_oid = snapshot_child.base_oid.clone();
+        snapshot_descendant.head_oid = snapshot_child.head_oid.clone();
+
+        let mut side_child =
+            thread_record("side-child", Some("root"), "2026-08-21T12:00:00.000000007Z");
+        side_child.side = StackReviewCommentSide::Left;
+        let mut side_descendant = thread_record(
+            "side-descendant",
+            Some("side-child"),
+            "2026-08-21T12:00:00.000000008Z",
+        );
+        side_descendant.side = StackReviewCommentSide::Left;
+
+        let mut top_level_child = thread_record(
+            "top-level-child",
+            Some("root"),
+            "2026-08-21T12:00:00.000000009Z",
+        );
+        top_level_child.path = None;
+        top_level_child.start_row = None;
+        top_level_child.start_column = None;
+        top_level_child.end_row = None;
+        top_level_child.end_column = None;
+        top_level_child.side = StackReviewCommentSide::TopLevel;
+        let mut top_level_descendant = thread_record(
+            "top-level-descendant",
+            Some("top-level-child"),
+            "2026-08-21T12:00:00.000000010Z",
+        );
+        top_level_descendant.path = None;
+        top_level_descendant.start_row = None;
+        top_level_descendant.start_column = None;
+        top_level_descendant.end_row = None;
+        top_level_descendant.end_column = None;
+        top_level_descendant.side = StackReviewCommentSide::TopLevel;
+
+        let records = [
+            root,
+            normal_child,
+            path_child,
+            path_descendant,
+            snapshot_child,
+            snapshot_descendant,
+            side_child,
+            side_descendant,
+            top_level_child,
+            top_level_descendant,
+        ];
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build boundary-qualified comment thread index");
+
+        let normal_key = index.thread_key_for("root").expect("normal key");
+        assert_eq!(
+            index
+                .thread(normal_key)
+                .expect("normal thread")
+                .member_record_ids,
+            ["root", "normal-child"]
+        );
+        for (child_id, descendant_id) in [
+            ("path-child", "path-descendant"),
+            ("snapshot-child", "snapshot-descendant"),
+            ("side-child", "side-descendant"),
+            ("top-level-child", "top-level-descendant"),
+        ] {
+            let key = index.thread_key_for(child_id).expect("boundary key");
+            assert!(matches!(key, CommentThreadKey::BoundaryViolation { .. }));
+            assert_ne!(key, normal_key);
+            assert_eq!(
+                index
+                    .thread(key)
+                    .expect("boundary thread")
+                    .member_record_ids,
+                [child_id, descendant_id]
+            );
+            assert_eq!(index.thread_key_for(descendant_id), Some(key));
+        }
+        let boundary_keys = [
+            "path-child",
+            "snapshot-child",
+            "side-child",
+            "top-level-child",
+        ]
+        .map(|record_id| index.thread_key_for(record_id).expect("partition key"));
+        for (index, left) in boundary_keys.iter().enumerate() {
+            for right in &boundary_keys[index.saturating_add(1)..] {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn comment_thread_index_is_input_order_independent_for_acyclic_graphs() {
+        let records = vec![
+            thread_record("root-b", None, "2026-08-21T12:00:00.000000004Z"),
+            thread_record("child-b", Some("root-b"), "2026-08-21T12:00:00.000000006Z"),
+            thread_record("root-a", None, "2026-08-21T12:00:00.000000001Z"),
+            thread_record(
+                "child-a-2",
+                Some("root-a"),
+                "2026-08-21T12:00:00.000000003Z",
+            ),
+            thread_record(
+                "child-a-1",
+                Some("root-a"),
+                "2026-08-21T12:00:00.000000002Z",
+            ),
+            thread_record("orphan", Some("missing"), "2026-08-21T12:00:00.000000005Z"),
+        ];
+        let reversed = records.iter().rev().cloned().collect::<Vec<_>>();
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build acyclic comment thread index");
+        let reversed_index = CommentThreadIndex::new("base-head", reversed.iter())
+            .expect("build reversed acyclic comment thread index");
+
+        assert_eq!(index.threads(), reversed_index.threads());
+        for record in &records {
+            assert_eq!(
+                index.thread_key_for(&record.id),
+                reversed_index.thread_key_for(&record.id)
+            );
+        }
+    }
+
+    #[test]
+    fn comment_thread_index_canonicalizes_cycles_independent_of_input_order() {
+        let records = [
+            thread_record("b", Some("c"), "2026-08-21T12:00:00.000000002Z"),
+            thread_record("descendant", Some("b"), "2026-08-21T12:00:00.000000004Z"),
+            thread_record("a", Some("b"), "2026-08-21T12:00:00.000000001Z"),
+            thread_record("c", Some("a"), "2026-08-21T12:00:00.000000003Z"),
+        ];
+        let reversed = records.iter().rev().cloned().collect::<Vec<_>>();
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build cycle-degraded comment thread index");
+        let reversed_index = CommentThreadIndex::new("base-head", reversed.iter())
+            .expect("build reversed cycle-degraded comment thread index");
+        let key = index.thread_key_for("descendant").expect("cycle key");
+        assert!(matches!(
+            key,
+            CommentThreadKey::Cycle {
+                canonical_member_id,
+                ..
+            } if canonical_member_id == "a"
+        ));
+        assert_eq!(reversed_index.thread_key_for("b"), Some(key));
+        assert_eq!(
+            index.thread(key).expect("cycle thread").member_record_ids,
+            reversed_index
+                .thread(key)
+                .expect("reversed cycle thread")
+                .member_record_ids
+        );
+        assert_eq!(
+            index.thread(key).expect("cycle thread").member_record_ids,
+            ["a", "c", "b", "descendant"]
+        );
+    }
+
+    #[test]
+    fn comment_thread_index_orders_normal_threads_by_their_roots() {
+        let records = [
+            thread_record("root-a", None, "2026-08-21T12:00:00.000000002Z"),
+            thread_record("root-z", None, "2026-08-21T12:00:00.000000003Z"),
+            thread_record(
+                "early-child",
+                Some("root-z"),
+                "2026-08-21T12:00:00.000000001Z",
+            ),
+        ];
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build ordered comment thread index");
+        let ordered_roots = index
+            .threads()
+            .iter()
+            .map(|thread| thread.placement_record_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered_roots, ["root-a", "root-z"]);
+    }
+
+    #[test]
+    fn comment_thread_index_orders_siblings_by_nanoseconds_then_stable_id() {
+        let records = [
+            thread_record("root", None, "2026-08-21T12:00:00Z"),
+            thread_record("z", Some("root"), "2026-08-21T12:00:00.000000003Z"),
+            thread_record("b", Some("root"), "2026-08-21T12:00:00.000000002Z"),
+            thread_record("a", Some("root"), "2026-08-21T12:00:00.000000002Z"),
+        ];
+
+        let index = CommentThreadIndex::new("base-head", records.iter())
+            .expect("build ordered comment thread index");
+        let key = index.thread_key_for("root").expect("root key");
+
+        assert_eq!(
+            index.thread(key).expect("ordered thread").member_record_ids,
+            ["root", "a", "b", "z"]
+        );
+    }
+
+    #[test]
+    fn comment_thread_key_has_a_stable_round_trip_representation() {
+        let key = CommentThreadKey::MissingParent {
+            partition: CommentThreadPartition {
+                storage_key: "base-head".into(),
+                base_oid: "base".into(),
+                head_oid: "head".into(),
+                path: Some("src/a b.rs".into()),
+                side: StackReviewCommentSide::Left,
+                class: StackReviewCommentClass::Inline,
+            },
+            missing_parent_id: "github:42".into(),
+        };
+
+        let serialized = key
+            .to_stable_string()
+            .expect("serialize stable comment thread key");
+
+        assert_eq!(
+            serialized,
+            r#"{"kind":"missingParent","partition":{"storageKey":"base-head","baseOid":"base","headOid":"head","path":"src/a b.rs","side":"left","class":"inline"},"missing_parent_id":"github:42"}"#
+        );
+        assert_eq!(
+            CommentThreadKey::from_stable_string(&serialized)
+                .expect("deserialize stable comment thread key"),
+            key
+        );
+    }
+
     use std::path::Path;
 
     async fn run_git(
@@ -1746,6 +2448,7 @@ mod tests {
         let mut state = StackReviewState::new("base-a", "head-a");
         state.set_comments(vec![StackReviewComment {
             id: 7,
+            record_id: Some("record-7".into()),
             path: "src/lib.rs".into(),
             start_row: 4,
             start_column: 2,
@@ -1760,6 +2463,7 @@ mod tests {
             },
             source: StackReviewCommentSource::LocalAgent,
             reply_to: Some(3),
+            reply_to_record_id: Some("record-3".into()),
         }]);
 
         let restored = StackReviewState::from_json(&state.to_json().expect("serialize state"))
@@ -1767,6 +2471,10 @@ mod tests {
 
         assert_eq!(restored.comments().len(), 1);
         assert_eq!(restored.comments()[0].id, 7);
+        assert_eq!(
+            restored.comments()[0].record_id.as_deref(),
+            Some("record-7")
+        );
         assert_eq!(restored.comments()[0].path, "src/lib.rs");
         assert_eq!(restored.comments()[0].start_row, 4);
         assert_eq!(restored.comments()[0].end_column, 8);
@@ -1777,6 +2485,10 @@ mod tests {
             StackReviewCommentSource::LocalAgent
         );
         assert_eq!(restored.comments()[0].reply_to, Some(3));
+        assert_eq!(
+            restored.comments()[0].reply_to_record_id.as_deref(),
+            Some("record-3")
+        );
     }
 
     #[test]
@@ -1803,6 +2515,8 @@ mod tests {
             StackReviewCommentSource::LocalHuman
         );
         assert_eq!(restored.comments()[0].reply_to, None);
+        assert_eq!(restored.comments()[0].record_id, None);
+        assert_eq!(restored.comments()[0].reply_to_record_id, None);
     }
 
     #[test]
@@ -1811,6 +2525,7 @@ mod tests {
         state.set_comments(vec![
             StackReviewComment {
                 id: 1,
+                record_id: None,
                 path: "src/lib.rs".into(),
                 start_row: 1,
                 start_column: 0,
@@ -1822,9 +2537,11 @@ mod tests {
                 author: StackReviewCommentAuthor::default(),
                 source: StackReviewCommentSource::LocalHuman,
                 reply_to: None,
+                reply_to_record_id: None,
             },
             StackReviewComment {
                 id: 2,
+                record_id: None,
                 path: "src/lib.rs".into(),
                 start_row: 200,
                 start_column: 0,
@@ -1836,6 +2553,7 @@ mod tests {
                 author: StackReviewCommentAuthor::default(),
                 source: StackReviewCommentSource::LocalHuman,
                 reply_to: None,
+                reply_to_record_id: None,
             },
         ]);
 

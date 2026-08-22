@@ -668,6 +668,7 @@ mod tests {
 
         let persisted_comment = git::stack_review::StackReviewComment {
             id: 11,
+            record_id: Some("comment-11".into()),
             path: "src/main.rs".into(),
             start_row: 0,
             start_column: 0,
@@ -682,9 +683,11 @@ mod tests {
             },
             source: git::stack_review::StackReviewCommentSource::LocalHuman,
             reply_to: None,
+            reply_to_record_id: None,
         };
         let persisted_reply = git::stack_review::StackReviewComment {
             id: 12,
+            record_id: Some("comment-12".into()),
             path: "src/main.rs".into(),
             start_row: 0,
             start_column: 0,
@@ -699,6 +702,7 @@ mod tests {
             },
             source: git::stack_review::StackReviewCommentSource::LocalAgent,
             reply_to: Some(11),
+            reply_to_record_id: Some("comment-11".into()),
         };
         let editor = view.read_with(&visual_context, |view, _| view.editor());
         editor.update_in(&mut visual_context, |editor, window, cx| {

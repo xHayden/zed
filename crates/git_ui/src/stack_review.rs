@@ -7,11 +7,11 @@ use futures::{StreamExt as _, channel::oneshot};
 use git::{
     repository::RevisionContent,
     stack_review::{
-        BranchRef, PullRequestRef, Stack, StackFile, StackReviewComment, StackReviewCommentAuthor,
-        StackReviewCommentRecord, StackReviewCommentSide, StackReviewCommentSource,
-        StackReviewContentKind, StackReviewCurrentManifest, StackReviewFileProvenance,
-        StackReviewFileStatus, StackReviewGitHubCommentIdentity, StackReviewGitHubCommentKind,
-        StackReviewState, StackSnapshot, parse_stack_file,
+        BranchRef, CommentThreadIndex, PullRequestRef, Stack, StackFile, StackReviewComment,
+        StackReviewCommentAuthor, StackReviewCommentRecord, StackReviewCommentSide,
+        StackReviewCommentSource, StackReviewContentKind, StackReviewCurrentManifest,
+        StackReviewFileProvenance, StackReviewFileStatus, StackReviewGitHubCommentIdentity,
+        StackReviewGitHubCommentKind, StackReviewState, StackSnapshot, parse_stack_file,
     },
 };
 use gpui::{
@@ -1088,70 +1088,47 @@ fn is_reviewer_comment(record: &StackReviewCommentRecord, reviewer_login: Option
 
 fn summarize_file_comments(
     records: &HashMap<String, LoadedCommentRecord>,
+    thread_index: &CommentThreadIndex,
     reviewer_login: Option<&str>,
 ) -> HashMap<String, FileCommentSummary> {
-    let active_records = records
-        .values()
-        .filter(|loaded| {
-            loaded.record.path.is_some()
-                && loaded.record.side != StackReviewCommentSide::TopLevel
-                && !loaded.record.outdated
-                && !loaded.record.is_resolved()
-        })
-        .collect::<Vec<_>>();
-    let records_by_id = active_records
-        .iter()
-        .map(|loaded| (loaded.record.id.as_str(), *loaded))
-        .collect::<HashMap<_, _>>();
+    let is_active = |loaded: &&LoadedCommentRecord| {
+        loaded.record.path.is_some()
+            && loaded.record.side != StackReviewCommentSide::TopLevel
+            && !loaded.record.outdated
+            && !loaded.record.is_resolved()
+    };
     let mut comment_counts = HashMap::<String, usize>::new();
-    for loaded in &active_records {
+    for loaded in records.values().filter(is_active) {
         if let Some(path) = loaded.record.path.as_ref() {
             *comment_counts.entry(path.clone()).or_default() += 1;
         }
     }
-    let mut latest_by_thread = HashMap::<(String, String), &LoadedCommentRecord>::new();
-
-    for loaded in active_records {
-        let record = &loaded.record;
-        let path = record.path.as_deref().unwrap_or_default();
-        let mut root_id = record.id.as_str();
-        let mut seen = HashSet::new();
-        while seen.insert(root_id) {
-            let Some(parent_id) = records_by_id
-                .get(root_id)
-                .and_then(|parent| parent.record.reply_to.as_deref())
-            else {
-                break;
-            };
-            let Some(parent) = records_by_id.get(parent_id) else {
-                break;
-            };
-            if parent.record.path.as_deref() != Some(path) {
-                break;
-            }
-            root_id = parent.record.id.as_str();
-        }
-
-        let thread_key = (path.to_owned(), root_id.to_owned());
-        let replace = latest_by_thread.get(&thread_key).is_none_or(|latest| {
-            (comment_timestamp_nanos(record), &record.id)
-                > (comment_timestamp_nanos(&latest.record), &latest.record.id)
-        });
-        if replace {
-            latest_by_thread.insert(thread_key, loaded);
-        }
-    }
 
     let mut statuses = HashMap::new();
-    for ((path, _), latest) in latest_by_thread {
+    for thread in thread_index.threads() {
+        let latest = thread
+            .member_record_ids
+            .iter()
+            .filter_map(|record_id| records.get(record_id))
+            .filter(is_active)
+            .max_by(|left, right| {
+                (comment_timestamp_nanos(&left.record), &left.record.id)
+                    .cmp(&(comment_timestamp_nanos(&right.record), &right.record.id))
+            });
+        let Some(latest) = latest else {
+            continue;
+        };
+        let Some(path) = latest.record.path.as_ref() else {
+            continue;
+        };
         let status = if is_reviewer_comment(&latest.record, reviewer_login) {
             FileCommentStatus::Comments
         } else {
             FileCommentStatus::AwaitingResponse
         };
-        let comment_count = comment_counts.get(&path).copied().unwrap_or_default();
+        let comment_count = comment_counts.get(path).copied().unwrap_or_default();
         statuses
-            .entry(path)
+            .entry(path.clone())
             .and_modify(|current: &mut FileCommentSummary| {
                 if status == FileCommentStatus::AwaitingResponse {
                     current.status = status;
@@ -1171,10 +1148,38 @@ struct FileCommentProjection {
     right: Vec<StackReviewComment>,
 }
 
+type EditorCommentRecordIds = HashMap<(StackReviewCommentSide, usize), String>;
+
+fn editor_comment_record_id(
+    record_ids: &EditorCommentRecordIds,
+    side: StackReviewCommentSide,
+    editor_id: usize,
+) -> Option<&str> {
+    record_ids.get(&(side, editor_id)).map(String::as_str)
+}
+
+fn bind_editor_comment_record_id(
+    record_ids: &mut EditorCommentRecordIds,
+    side: StackReviewCommentSide,
+    editor_id: usize,
+    record_id: String,
+) {
+    record_ids.insert((side, editor_id), record_id);
+}
+
+fn remove_editor_comment_record_id(
+    record_ids: &mut EditorCommentRecordIds,
+    side: StackReviewCommentSide,
+    editor_id: usize,
+) -> Option<String> {
+    record_ids.remove(&(side, editor_id))
+}
+
 struct CommentProjection {
     comments_by_path: HashMap<String, FileCommentProjection>,
-    record_id_by_editor_id: HashMap<usize, String>,
+    record_id_by_editor_id: EditorCommentRecordIds,
     next_editor_id: usize,
+    thread_index: CommentThreadIndex,
 }
 
 enum CommentWrite {
@@ -1324,14 +1329,72 @@ fn merge_reloaded_local_comments(
     Ok(reloaded_local)
 }
 
+fn canonical_resolution_record_ids(
+    thread_index: &CommentThreadIndex,
+    seed_record_ids: &[String],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut record_ids = Vec::new();
+    for seed_record_id in seed_record_ids {
+        let members = thread_index
+            .thread_key_for(seed_record_id)
+            .and_then(|key| thread_index.thread(key))
+            .map(|thread| thread.member_record_ids.as_slice())
+            .unwrap_or_else(|| std::slice::from_ref(seed_record_id));
+        for record_id in members {
+            if seen.insert(record_id.clone()) {
+                record_ids.push(record_id.clone());
+            }
+        }
+    }
+    record_ids
+}
+
+fn projected_comment_record_id(
+    comment: &StackReviewComment,
+    side: StackReviewCommentSide,
+    record_id_by_editor_id: &EditorCommentRecordIds,
+) -> Option<String> {
+    comment.record_id.clone().or_else(|| {
+        editor_comment_record_id(record_id_by_editor_id, side, comment.id).map(str::to_owned)
+    })
+}
+
+fn projected_reply_to_record_id(
+    comment: &StackReviewComment,
+    side: StackReviewCommentSide,
+    record_id_by_editor_id: &EditorCommentRecordIds,
+) -> Option<String> {
+    comment.reply_to_record_id.clone().or_else(|| {
+        comment
+            .reply_to
+            .and_then(|reply_to| editor_comment_record_id(record_id_by_editor_id, side, reply_to))
+            .map(str::to_owned)
+    })
+}
+
 fn project_comment_records(
     records: &HashMap<String, LoadedCommentRecord>,
+    storage_key: &str,
+    base_oid: &str,
+    head_oid: &str,
     include_resolved: bool,
-    existing_record_ids: &HashMap<usize, String>,
+    existing_record_ids: &EditorCommentRecordIds,
     next_editor_id_floor: usize,
-) -> CommentProjection {
-    let mut inline_records = records
-        .values()
+) -> Result<CommentProjection> {
+    for loaded in records.values() {
+        anyhow::ensure!(
+            loaded.record.base_oid == base_oid && loaded.record.head_oid == head_oid,
+            "comment does not match the selected Git snapshot"
+        );
+    }
+    let thread_index =
+        CommentThreadIndex::new(storage_key, records.values().map(|loaded| &loaded.record))?;
+    let inline_records = thread_index
+        .threads()
+        .iter()
+        .flat_map(|thread| thread.member_record_ids.iter())
+        .filter_map(|record_id| records.get(record_id))
         .filter(|loaded| {
             matches!(
                 loaded.record.side,
@@ -1340,23 +1403,19 @@ fn project_comment_records(
                 && (include_resolved || !loaded.record.is_resolved())
         })
         .collect::<Vec<_>>();
-    inline_records.sort_by(|left, right| {
-        comment_timestamp_nanos(&left.record)
-            .cmp(&comment_timestamp_nanos(&right.record))
-            .then_with(|| left.record.id.cmp(&right.record.id))
-    });
     let mut record_id_by_editor_id = existing_record_ids
         .iter()
         .filter(|(_, record_id)| records.contains_key(record_id.as_str()))
-        .map(|(editor_id, record_id)| (*editor_id, record_id.clone()))
-        .collect::<HashMap<_, _>>();
+        .map(|(editor_key, record_id)| (*editor_key, record_id.clone()))
+        .collect::<EditorCommentRecordIds>();
     let mut editor_id_by_record_id = record_id_by_editor_id
         .iter()
-        .map(|(editor_id, record_id)| (record_id.clone(), *editor_id))
+        .map(|((_, editor_id), record_id)| (record_id.clone(), *editor_id))
         .collect::<HashMap<_, _>>();
     let mut next_editor_id = next_editor_id_floor.max(
         record_id_by_editor_id
             .keys()
+            .map(|(_, editor_id)| editor_id)
             .max()
             .map(|id| id.saturating_add(1))
             .unwrap_or_default(),
@@ -1366,17 +1425,26 @@ fn project_comment_records(
             let editor_id = next_editor_id;
             next_editor_id = next_editor_id.saturating_add(1);
             editor_id_by_record_id.insert(loaded.record.id.clone(), editor_id);
-            record_id_by_editor_id.insert(editor_id, loaded.record.id.clone());
+            bind_editor_comment_record_id(
+                &mut record_id_by_editor_id,
+                loaded.record.side,
+                editor_id,
+                loaded.record.id.clone(),
+            );
         }
     }
     let comments = inline_records
         .into_iter()
-        .map(|loaded| {
-            let editor_id = editor_id_by_record_id[&loaded.record.id];
-            (
+        .map(|loaded| -> Result<_> {
+            let editor_id = editor_id_by_record_id
+                .get(&loaded.record.id)
+                .copied()
+                .context("projected comment has no editor id")?;
+            Ok((
                 loaded.record.side,
                 StackReviewComment {
                     id: editor_id,
+                    record_id: Some(loaded.record.id.clone()),
                     path: loaded.record.path.clone().unwrap_or_default(),
                     start_row: loaded.record.start_row.unwrap_or_default(),
                     start_column: loaded.record.start_column.unwrap_or_default(),
@@ -1392,10 +1460,11 @@ fn project_comment_records(
                         .reply_to
                         .as_ref()
                         .and_then(|reply_to| editor_id_by_record_id.get(reply_to).copied()),
+                    reply_to_record_id: loaded.record.reply_to.clone(),
                 },
-            )
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let mut comments_by_path = HashMap::<String, FileCommentProjection>::new();
     for (side, comment) in comments {
         let projection = comments_by_path.entry(comment.path.clone()).or_default();
@@ -1405,11 +1474,12 @@ fn project_comment_records(
             StackReviewCommentSide::TopLevel => {}
         }
     }
-    CommentProjection {
+    Ok(CommentProjection {
         comments_by_path,
         record_id_by_editor_id,
         next_editor_id,
-    }
+        thread_index,
+    })
 }
 
 async fn migrate_legacy_comments(
@@ -1487,7 +1557,8 @@ struct LoadedStackReview {
     rendered_right_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
     comments_by_path: HashMap<String, FileCommentProjection>,
-    record_id_by_editor_id: HashMap<usize, String>,
+    comment_thread_index: CommentThreadIndex,
+    record_id_by_editor_id: EditorCommentRecordIds,
     next_comment_editor_id: usize,
     file_comment_statuses: HashMap<String, FileCommentSummary>,
     commenter_cutoffs: Vec<CommenterCutoff>,
@@ -1530,7 +1601,8 @@ pub struct StackReview {
     rendered_right_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
     comments_by_path: HashMap<String, FileCommentProjection>,
-    record_id_by_editor_id: HashMap<usize, String>,
+    comment_thread_index: CommentThreadIndex,
+    record_id_by_editor_id: EditorCommentRecordIds,
     next_comment_editor_id: usize,
     file_comment_statuses: HashMap<String, FileCommentSummary>,
     commenter_cutoffs: Vec<CommenterCutoff>,
@@ -1773,6 +1845,7 @@ impl StackReview {
             rendered_right_comment_ids: HashSet::new(),
             comment_records: HashMap::new(),
             comments_by_path: HashMap::new(),
+            comment_thread_index: CommentThreadIndex::default(),
             record_id_by_editor_id: HashMap::new(),
             next_comment_editor_id: 0,
             file_comment_statuses: HashMap::new(),
@@ -1844,6 +1917,7 @@ impl StackReview {
         self.rendered_right_comment_ids.clear();
         self.comment_records.clear();
         self.comments_by_path.clear();
+        self.comment_thread_index = CommentThreadIndex::default();
         self.record_id_by_editor_id.clear();
         self.next_comment_editor_id = 0;
         self.file_comment_statuses.clear();
@@ -2017,13 +2091,19 @@ impl StackReview {
                     .await?;
                 let comment_projection = project_comment_records(
                     &comment_records,
+                    &storage_key,
+                    &diff.base_ref,
+                    &diff.head_ref,
                     show_resolved_comments,
                     &HashMap::new(),
                     0,
-                );
+                )?;
                 let next_comment_id = comment_projection.next_editor_id;
-                let file_comment_statuses =
-                    summarize_file_comments(&comment_records, reviewer_login.as_deref());
+                let file_comment_statuses = summarize_file_comments(
+                    &comment_records,
+                    &comment_projection.thread_index,
+                    reviewer_login.as_deref(),
+                );
                 let commenter_cutoffs = latest_comment_cutoffs(&comment_records);
                 let files: Vec<StackReviewFileItem> = diff
                     .files
@@ -2092,6 +2172,7 @@ impl StackReview {
                     rendered_right_comment_ids,
                     comment_records,
                     comments_by_path: comment_projection.comments_by_path,
+                    comment_thread_index: comment_projection.thread_index,
                     record_id_by_editor_id: comment_projection.record_id_by_editor_id,
                     next_comment_editor_id: next_comment_id,
                     file_comment_statuses,
@@ -2143,6 +2224,7 @@ impl StackReview {
                     this.rendered_right_comment_ids = loaded.rendered_right_comment_ids;
                     this.comment_records = loaded.comment_records;
                     this.comments_by_path = loaded.comments_by_path;
+                    this.comment_thread_index = loaded.comment_thread_index;
                     this.record_id_by_editor_id = loaded.record_id_by_editor_id;
                     this.next_comment_editor_id = loaded.next_comment_editor_id;
                     this.file_comment_statuses = loaded.file_comment_statuses;
@@ -2238,10 +2320,21 @@ impl StackReview {
                         this.reconcile_editor_comments(&active_path, side, comments, cx);
                     }
                     EditorEvent::ReviewCommentResolutionChanged { ids, resolved } => {
-                        this.persist_comment_resolution(ids, *resolved, window, cx);
+                        this.persist_comment_resolution(ids, side, *resolved, window, cx);
+                    }
+                    EditorEvent::StackReviewCommentResolutionChanged {
+                        record_ids,
+                        resolved,
+                    } => {
+                        this.persist_comment_resolution_by_record_ids(
+                            record_ids, *resolved, window, cx,
+                        );
                     }
                     EditorEvent::ReviewCommentCheckpointRequested { id } => {
-                        this.use_comment_as_from(*id, window, cx);
+                        this.use_comment_as_from(*id, side, window, cx);
+                    }
+                    EditorEvent::StackReviewCommentCheckpointRequested { record_id } => {
+                        this.use_comment_record_as_from(record_id, window, cx);
                     }
                     _ => {}
                 }
@@ -2251,17 +2344,35 @@ impl StackReview {
 
     fn rebuild_comment_derived_state(&mut self) {
         self.review_comment_count = self.comment_records.len();
-        let projection = project_comment_records(
+        let Some(review_state) = self.review_state.as_ref() else {
+            self.state_error = Some("Unable to project comments without review state".into());
+            return;
+        };
+        let storage_key = stack_review_storage_key(&review_state.base_oid, &review_state.head_oid);
+        let projection = match project_comment_records(
             &self.comment_records,
+            &storage_key,
+            &review_state.base_oid,
+            &review_state.head_oid,
             self.show_resolved_comments,
             &self.record_id_by_editor_id,
             self.next_comment_editor_id,
-        );
+        ) {
+            Ok(projection) => projection,
+            Err(error) => {
+                self.state_error = Some(error.to_string().into());
+                return;
+            }
+        };
         self.next_comment_editor_id = projection.next_editor_id;
         self.comments_by_path = projection.comments_by_path;
+        self.comment_thread_index = projection.thread_index;
         self.record_id_by_editor_id = projection.record_id_by_editor_id;
-        self.file_comment_statuses =
-            summarize_file_comments(&self.comment_records, self.reviewer_login.as_deref());
+        self.file_comment_statuses = summarize_file_comments(
+            &self.comment_records,
+            &self.comment_thread_index,
+            self.reviewer_login.as_deref(),
+        );
         self.commenter_cutoffs = latest_comment_cutoffs(&self.comment_records);
     }
 
@@ -2506,16 +2617,33 @@ impl StackReview {
     fn persist_comment_resolution(
         &mut self,
         editor_ids: &[usize],
+        side: StackReviewCommentSide,
         resolved: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let record_ids = editor_ids
+            .iter()
+            .filter_map(|editor_id| {
+                editor_comment_record_id(&self.record_id_by_editor_id, side, *editor_id)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        self.persist_comment_resolution_by_record_ids(&record_ids, resolved, window, cx);
+    }
+
+    fn persist_comment_resolution_by_record_ids(
+        &mut self,
+        seed_record_ids: &[String],
+        resolved: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let record_ids =
+            canonical_resolution_record_ids(&self.comment_thread_index, seed_record_ids);
         let mut writes = Vec::new();
-        for editor_id in editor_ids {
-            let Some(record_id) = self.record_id_by_editor_id.get(editor_id).cloned() else {
-                continue;
-            };
-            let Some(loaded) = self.comment_records.get_mut(&record_id) else {
+        for record_id in &record_ids {
+            let Some(loaded) = self.comment_records.get_mut(record_id) else {
                 continue;
             };
             let expected = loaded.serialized.clone();
@@ -2579,9 +2707,15 @@ impl StackReview {
             return;
         };
         for comment in &comments {
-            self.record_id_by_editor_id
-                .entry(comment.id)
-                .or_insert_with(|| Uuid::now_v7().to_string());
+            let record_id =
+                projected_comment_record_id(comment, side, &self.record_id_by_editor_id)
+                    .unwrap_or_else(|| Uuid::now_v7().to_string());
+            bind_editor_comment_record_id(
+                &mut self.record_id_by_editor_id,
+                side,
+                comment.id,
+                record_id,
+            );
         }
         let current_editor_ids = comments
             .iter()
@@ -2593,7 +2727,9 @@ impl StackReview {
             .copied()
             .collect::<Vec<_>>()
         {
-            let Some(record_id) = self.record_id_by_editor_id.remove(&editor_id) else {
+            let Some(record_id) =
+                remove_editor_comment_record_id(&mut self.record_id_by_editor_id, side, editor_id)
+            else {
                 continue;
             };
             let Some(loaded) = self.comment_records.get(&record_id) else {
@@ -2612,10 +2748,13 @@ impl StackReview {
         }
         let timestamp = stack_review_timestamp();
         for comment in comments {
-            let record_id = self.record_id_by_editor_id[&comment.id].clone();
-            let reply_to = comment
-                .reply_to
-                .and_then(|reply_to| self.record_id_by_editor_id.get(&reply_to).cloned());
+            let Some(record_id) =
+                projected_comment_record_id(&comment, side, &self.record_id_by_editor_id)
+            else {
+                continue;
+            };
+            let reply_to =
+                projected_reply_to_record_id(&comment, side, &self.record_id_by_editor_id);
             let existing = self.comment_records.get(&record_id).cloned();
             if existing
                 .as_ref()
@@ -2861,12 +3000,25 @@ impl StackReview {
     fn use_comment_as_from(
         &mut self,
         editor_id: usize,
+        side: StackReviewCommentSide,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(record_id) = self.record_id_by_editor_id.get(&editor_id) else {
+        let Some(record_id) =
+            editor_comment_record_id(&self.record_id_by_editor_id, side, editor_id)
+                .map(str::to_owned)
+        else {
             return;
         };
+        self.use_comment_record_as_from(&record_id, window, cx);
+    }
+
+    fn use_comment_record_as_from(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(record) = self
             .comment_records
             .get(record_id)
@@ -4040,6 +4192,33 @@ mod tests {
         }
     }
 
+    fn project_test_comment_records(
+        records: &HashMap<String, LoadedCommentRecord>,
+        include_resolved: bool,
+        existing_record_ids: &EditorCommentRecordIds,
+        next_editor_id_floor: usize,
+    ) -> Result<CommentProjection> {
+        project_comment_records(
+            records,
+            "base-head",
+            "base",
+            "head",
+            include_resolved,
+            existing_record_ids,
+            next_editor_id_floor,
+        )
+    }
+
+    fn summarize_test_file_comments(
+        records: &HashMap<String, LoadedCommentRecord>,
+        reviewer_login: Option<&str>,
+    ) -> HashMap<String, FileCommentSummary> {
+        let thread_index =
+            CommentThreadIndex::new("base-head", records.values().map(|loaded| &loaded.record))
+                .expect("build test comment thread index");
+        summarize_file_comments(records, &thread_index, reviewer_login)
+    }
+
     #[test]
     fn file_comment_status_is_white_after_the_reviewer_replies() {
         let records = HashMap::from([
@@ -4067,12 +4246,44 @@ mod tests {
             ),
         ]);
 
-        let summary = summarize_file_comments(&records, Some("xHayden"));
+        let summary = summarize_test_file_comments(&records, Some("xHayden"));
         assert_eq!(
             summary["src/replied.rs"].status,
             FileCommentStatus::Comments
         );
         assert_eq!(summary["src/replied.rs"].comment_count, 2);
+    }
+
+    #[test]
+    fn cross_side_reply_does_not_clear_another_threads_awaiting_response_badge() {
+        let mut left_parent = test_comment_record(
+            "left-parent",
+            "src/replied.rs",
+            StackReviewCommentSource::Github,
+            Some("other"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        left_parent.record.side = StackReviewCommentSide::Left;
+        let right_child = test_comment_record(
+            "right-child",
+            "src/replied.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            Some("left-parent"),
+            "2026-08-21T12:01:00Z",
+        );
+        let records = HashMap::from([
+            ("left-parent".into(), left_parent),
+            ("right-child".into(), right_child),
+        ]);
+
+        let summary = summarize_test_file_comments(&records, Some("xHayden"));
+
+        assert_eq!(
+            summary["src/replied.rs"].status,
+            FileCommentStatus::AwaitingResponse
+        );
     }
 
     #[test]
@@ -4102,7 +4313,7 @@ mod tests {
             ),
         ]);
 
-        let summary = summarize_file_comments(&records, Some("xHayden"));
+        let summary = summarize_test_file_comments(&records, Some("xHayden"));
         assert_eq!(
             summary["src/awaiting.rs"].status,
             FileCommentStatus::AwaitingResponse
@@ -4148,19 +4359,21 @@ mod tests {
             ),
         ]);
 
-        let projection = project_comment_records(&records, false, &HashMap::new(), 0);
+        let projection = project_test_comment_records(&records, false, &HashMap::new(), 0)
+            .expect("project comments");
         assert_eq!(projection.comments_by_path["src/first.rs"].left.len(), 1);
         assert_eq!(projection.comments_by_path["src/first.rs"].right.len(), 1);
         assert_eq!(projection.comments_by_path["src/second.rs"].right.len(), 1);
         let first_right_id = projection.comments_by_path["src/first.rs"].right[0].id;
         let mut after_left_delete = records;
         after_left_delete.remove("left");
-        let reprojected = project_comment_records(
+        let reprojected = project_test_comment_records(
             &after_left_delete,
             false,
             &projection.record_id_by_editor_id,
             projection.next_editor_id,
-        );
+        )
+        .expect("reproject comments after LEFT deletion");
         assert_eq!(
             reprojected.comments_by_path["src/first.rs"].right[0].id, first_right_id,
             "deleting a LEFT comment must not renumber the RIGHT editor"
@@ -4178,17 +4391,407 @@ mod tests {
                 "2026-08-21T12:02:00Z",
             ),
         );
-        let after_new_comment = project_comment_records(
+        let after_new_comment = project_test_comment_records(
             &after_highest_delete,
             false,
             &reprojected.record_id_by_editor_id,
             reprojected.next_editor_id,
-        );
+        )
+        .expect("project newly added comment");
         assert!(
             after_new_comment.comments_by_path["src/third.rs"].right[0].id
                 >= projection.next_editor_id,
             "deleted editor IDs must never be reused"
         );
+    }
+
+    #[test]
+    fn comment_projection_uses_canonical_thread_grouping_order() {
+        let records = HashMap::from([
+            (
+                "first-root".into(),
+                test_comment_record(
+                    "first-root",
+                    "src/lib.rs",
+                    StackReviewCommentSource::Github,
+                    Some("reviewer"),
+                    None,
+                    "2026-08-21T12:00:00Z",
+                ),
+            ),
+            (
+                "first-child".into(),
+                test_comment_record(
+                    "first-child",
+                    "src/lib.rs",
+                    StackReviewCommentSource::Github,
+                    Some("reviewer"),
+                    Some("first-root"),
+                    "2026-08-21T12:03:00Z",
+                ),
+            ),
+            (
+                "second-root".into(),
+                test_comment_record(
+                    "second-root",
+                    "src/lib.rs",
+                    StackReviewCommentSource::Github,
+                    Some("reviewer"),
+                    None,
+                    "2026-08-21T12:01:00Z",
+                ),
+            ),
+        ]);
+
+        let projection = project_test_comment_records(&records, false, &HashMap::new(), 0)
+            .expect("project comments");
+        let projected_record_ids = projection.comments_by_path["src/lib.rs"]
+            .right
+            .iter()
+            .filter_map(|comment| comment.record_id.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            projected_record_ids,
+            ["first-root", "first-child", "second-root"]
+        );
+    }
+
+    #[test]
+    fn comment_projection_rejects_records_from_a_different_snapshot() {
+        let selected = test_comment_record(
+            "selected",
+            "src/lib.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let mut foreign = test_comment_record(
+            "foreign",
+            "src/lib.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:01:00Z",
+        );
+        foreign.record.base_oid = "foreign-base".into();
+        foreign.record.head_oid = "foreign-head".into();
+        let records = HashMap::from([("selected".into(), selected), ("foreign".into(), foreign)]);
+
+        let error = match project_test_comment_records(&records, false, &HashMap::new(), 0) {
+            Ok(_) => panic!("mixed-snapshot projection must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("comment does not match the selected Git snapshot")
+        );
+    }
+
+    #[test]
+    fn comment_projection_indexes_complete_records_before_resolved_filtering() {
+        let mut parent = test_comment_record(
+            "parent",
+            "src/lib.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        parent.record.resolved = true;
+        let records = HashMap::from([
+            ("parent".into(), parent),
+            (
+                "child".into(),
+                test_comment_record(
+                    "child",
+                    "src/lib.rs",
+                    StackReviewCommentSource::Github,
+                    Some("other"),
+                    Some("parent"),
+                    "2026-08-21T12:01:00Z",
+                ),
+            ),
+        ]);
+
+        let projection = project_test_comment_records(&records, false, &HashMap::new(), 0)
+            .expect("project comments");
+
+        assert_eq!(projection.comments_by_path["src/lib.rs"].right.len(), 1);
+        let key = projection
+            .thread_index
+            .thread_key_for("child")
+            .expect("child thread key");
+        assert!(matches!(
+            key,
+            git::stack_review::CommentThreadKey::Normal { root_record_id, .. }
+                if root_record_id == "parent"
+        ));
+        assert_eq!(
+            projection
+                .thread_index
+                .thread(key)
+                .expect("complete thread")
+                .member_record_ids,
+            ["parent", "child"]
+        );
+    }
+
+    #[test]
+    fn comment_projection_indexes_outdated_records_before_filtering() {
+        let mut outdated_root = test_comment_record(
+            "outdated-root",
+            "src/lib.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        outdated_root.record.outdated = true;
+        let records = HashMap::from([
+            ("outdated-root".into(), outdated_root),
+            (
+                "current-child".into(),
+                test_comment_record(
+                    "current-child",
+                    "src/lib.rs",
+                    StackReviewCommentSource::Github,
+                    Some("reviewer"),
+                    Some("outdated-root"),
+                    "2026-08-21T12:01:00Z",
+                ),
+            ),
+        ]);
+
+        let projection = project_test_comment_records(&records, false, &HashMap::new(), 0)
+            .expect("project comments");
+        let key = projection
+            .thread_index
+            .thread_key_for("current-child")
+            .expect("current child thread key");
+
+        assert_eq!(projection.comments_by_path["src/lib.rs"].right.len(), 1);
+        assert_eq!(
+            projection
+                .thread_index
+                .thread(key)
+                .expect("complete outdated thread")
+                .member_record_ids,
+            ["outdated-root", "current-child"]
+        );
+    }
+
+    #[test]
+    fn canonical_resolution_expands_complete_degraded_and_filtered_threads() {
+        let mut boundary_parent = test_comment_record(
+            "boundary-parent",
+            "src/lib.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00.000000001Z",
+        );
+        boundary_parent.record.side = StackReviewCommentSide::Left;
+        let mut boundary_child = test_comment_record(
+            "boundary-child",
+            "src/lib.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            Some("boundary-parent"),
+            "2026-08-21T12:00:00.000000002Z",
+        );
+        boundary_child.record.side = StackReviewCommentSide::Right;
+        let mut boundary_sibling = test_comment_record(
+            "boundary-sibling",
+            "src/lib.rs",
+            StackReviewCommentSource::LocalAgent,
+            None,
+            Some("boundary-parent"),
+            "2026-08-21T12:00:00.000000003Z",
+        );
+        boundary_sibling.record.side = StackReviewCommentSide::Right;
+        let mut cycle_a = test_comment_record(
+            "cycle-a",
+            "src/cycle.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            Some("cycle-b"),
+            "2026-08-21T12:00:00.000000004Z",
+        );
+        let cycle_b = test_comment_record(
+            "cycle-b",
+            "src/cycle.rs",
+            StackReviewCommentSource::LocalAgent,
+            None,
+            Some("cycle-a"),
+            "2026-08-21T12:00:00.000000005Z",
+        );
+        let mut cycle_filtered = test_comment_record(
+            "cycle-filtered",
+            "src/cycle.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            Some("cycle-a"),
+            "2026-08-21T12:00:00.000000006Z",
+        );
+        cycle_filtered.record.outdated = true;
+        cycle_a.record.resolved = true;
+        let records: HashMap<String, LoadedCommentRecord> = HashMap::from([
+            (
+                "missing-a".into(),
+                test_comment_record(
+                    "missing-a",
+                    "src/missing.rs",
+                    StackReviewCommentSource::LocalHuman,
+                    None,
+                    Some("missing-parent"),
+                    "2026-08-21T12:00:00.000000001Z",
+                ),
+            ),
+            (
+                "missing-b".into(),
+                test_comment_record(
+                    "missing-b",
+                    "src/missing.rs",
+                    StackReviewCommentSource::LocalAgent,
+                    None,
+                    Some("missing-parent"),
+                    "2026-08-21T12:00:00.000000002Z",
+                ),
+            ),
+            ("boundary-parent".into(), boundary_parent),
+            ("boundary-child".into(), boundary_child),
+            ("boundary-sibling".into(), boundary_sibling),
+            ("cycle-a".into(), cycle_a),
+            ("cycle-b".into(), cycle_b),
+            ("cycle-filtered".into(), cycle_filtered),
+        ]);
+        let index =
+            CommentThreadIndex::new("base-head", records.values().map(|loaded| &loaded.record))
+                .expect("canonical thread index");
+
+        assert_eq!(
+            canonical_resolution_record_ids(&index, &["missing-a".into()]),
+            ["missing-a", "missing-b"]
+        );
+        assert_eq!(
+            canonical_resolution_record_ids(&index, &["boundary-child".into()]),
+            ["boundary-child", "boundary-sibling"]
+        );
+        assert_eq!(
+            canonical_resolution_record_ids(&index, &["cycle-b".into()]),
+            ["cycle-a", "cycle-b", "cycle-filtered"]
+        );
+    }
+
+    #[test]
+    fn transient_editor_identity_is_scoped_by_side() {
+        let mut record_ids = EditorCommentRecordIds::new();
+        bind_editor_comment_record_id(
+            &mut record_ids,
+            StackReviewCommentSide::Left,
+            0,
+            "left-record".into(),
+        );
+        bind_editor_comment_record_id(
+            &mut record_ids,
+            StackReviewCommentSide::Right,
+            0,
+            "right-record".into(),
+        );
+
+        assert_eq!(
+            remove_editor_comment_record_id(&mut record_ids, StackReviewCommentSide::Left, 0)
+                .as_deref(),
+            Some("left-record")
+        );
+        assert_eq!(
+            editor_comment_record_id(&record_ids, StackReviewCommentSide::Right, 0),
+            Some("right-record")
+        );
+    }
+
+    #[test]
+    fn projected_stable_identity_wins_over_conflicting_transient_editor_ids() {
+        let comment = StackReviewComment {
+            id: 7,
+            record_id: Some("stable-child".into()),
+            path: "src/lib.rs".into(),
+            start_row: 1,
+            start_column: 0,
+            end_row: 1,
+            end_column: 1,
+            body: "child".into(),
+            created_at: "2026-08-21T12:00:00Z".into(),
+            resolved: false,
+            author: StackReviewCommentAuthor::default(),
+            source: StackReviewCommentSource::LocalHuman,
+            reply_to: Some(3),
+            reply_to_record_id: Some("stable-parent".into()),
+        };
+        let transient_ids = HashMap::from([
+            (
+                (StackReviewCommentSide::Right, 7),
+                "unrelated-child".to_owned(),
+            ),
+            (
+                (StackReviewCommentSide::Right, 3),
+                "unrelated-parent".to_owned(),
+            ),
+        ]);
+
+        assert_eq!(
+            projected_comment_record_id(&comment, StackReviewCommentSide::Right, &transient_ids,)
+                .as_deref(),
+            Some("stable-child")
+        );
+        assert_eq!(
+            projected_reply_to_record_id(&comment, StackReviewCommentSide::Right, &transient_ids,)
+                .as_deref(),
+            Some("stable-parent")
+        );
+    }
+
+    #[test]
+    fn comment_projection_carries_stable_identity_when_transient_ids_are_reused() {
+        let first_records = HashMap::from([(
+            "first".into(),
+            test_comment_record(
+                "first",
+                "src/first.rs",
+                StackReviewCommentSource::LocalAgent,
+                None,
+                None,
+                "2026-08-21T12:00:00Z",
+            ),
+        )]);
+        let first_projection =
+            project_test_comment_records(&first_records, false, &HashMap::new(), 0)
+                .expect("project first comment");
+        let first_comment = &first_projection.comments_by_path["src/first.rs"].right[0];
+
+        let second_records = HashMap::from([(
+            "second".into(),
+            test_comment_record(
+                "second",
+                "src/second.rs",
+                StackReviewCommentSource::LocalAgent,
+                None,
+                None,
+                "2026-08-21T12:01:00Z",
+            ),
+        )]);
+        let second_projection =
+            project_test_comment_records(&second_records, false, &HashMap::new(), 0)
+                .expect("project second comment");
+        let second_comment = &second_projection.comments_by_path["src/second.rs"].right[0];
+
+        assert_eq!(first_comment.id, second_comment.id);
+        assert_eq!(first_comment.record_id.as_deref(), Some("first"));
+        assert_eq!(second_comment.record_id.as_deref(), Some("second"));
     }
 
     #[test]
@@ -4328,7 +4931,7 @@ mod tests {
         outdated.record.outdated = true;
         let records = HashMap::from([("resolved".into(), resolved), ("outdated".into(), outdated)]);
 
-        assert!(summarize_file_comments(&records, Some("xHayden")).is_empty());
+        assert!(summarize_test_file_comments(&records, Some("xHayden")).is_empty());
     }
 
     #[gpui::test]
@@ -4346,6 +4949,7 @@ mod tests {
             "head",
             vec![StackReviewComment {
                 id: 7,
+                record_id: None,
                 path: "src/lib.rs".into(),
                 start_row: 4,
                 start_column: 0,
@@ -4357,13 +4961,15 @@ mod tests {
                 author: git::stack_review::StackReviewCommentAuthor::default(),
                 source: StackReviewCommentSource::LocalHuman,
                 reply_to: None,
+                reply_to_record_id: None,
             }],
             &mut records,
         )
         .await
         .expect("migrate legacy comment");
         assert_eq!(records.len(), 1);
-        let projection = project_comment_records(&records, false, &HashMap::new(), 0);
+        let projection = project_test_comment_records(&records, false, &HashMap::new(), 0)
+            .expect("project comments");
         let comments = &projection.comments_by_path["src/lib.rs"].right;
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].body, "Migrated");
@@ -4377,12 +4983,14 @@ mod tests {
             .record
             .local_resolution = Some(true);
         assert!(
-            project_comment_records(&resolved_records, false, &HashMap::new(), 0)
+            project_test_comment_records(&resolved_records, false, &HashMap::new(), 0)
+                .expect("project hidden resolved comments")
                 .comments_by_path
                 .is_empty()
         );
         assert_eq!(
-            project_comment_records(&resolved_records, true, &HashMap::new(), 0)
+            project_test_comment_records(&resolved_records, true, &HashMap::new(), 0)
+                .expect("project visible resolved comments")
                 .comments_by_path
                 .values()
                 .map(|projection| projection.left.len() + projection.right.len())
@@ -4685,6 +5293,7 @@ mod tests {
                     rendered_right_comment_ids: HashSet::new(),
                     comment_records: HashMap::new(),
                     comments_by_path: HashMap::new(),
+                    comment_thread_index: CommentThreadIndex::default(),
                     record_id_by_editor_id: HashMap::new(),
                     next_comment_editor_id: 0,
                     file_comment_statuses: HashMap::new(),

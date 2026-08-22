@@ -11861,8 +11861,15 @@ pub enum EditorEvent {
         ids: Vec<usize>,
         resolved: bool,
     },
+    StackReviewCommentResolutionChanged {
+        record_ids: Vec<String>,
+        resolved: bool,
+    },
     ReviewCommentCheckpointRequested {
         id: usize,
+    },
+    StackReviewCommentCheckpointRequested {
+        record_id: String,
     },
     InputIgnored {
         text: Arc<str>,
