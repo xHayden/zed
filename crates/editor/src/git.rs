@@ -331,9 +331,7 @@ pub(super) struct DiffReviewDragState {
     current_anchor: Anchor,
 }
 
-// Custom block height is fixed before text layout, so reserve against a narrow
-// comment column rather than risking overlap when the editor is split.
-const STACK_REVIEW_COMMENT_WRAP_COLUMNS: usize = 24;
+const LEGACY_DIFF_REVIEW_COMMENT_WRAP_COLUMNS: usize = 24;
 
 /// Identifies a specific hunk in the diff buffer.
 /// Used as a key to group comments by their location.
@@ -366,6 +364,41 @@ pub(super) struct StoredReviewComment {
     pub(super) resolved: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ReviewCommentKey {
+    Stable(String),
+    Legacy(usize),
+}
+
+impl ReviewCommentKey {
+    fn matches(&self, comment: &StoredReviewComment) -> bool {
+        match self {
+            Self::Stable(record_id) => comment.record_id.as_ref() == Some(record_id),
+            Self::Legacy(id) => comment.record_id.is_none() && comment.id == *id,
+        }
+    }
+
+    fn debug_identity(&self) -> String {
+        match self {
+            Self::Stable(record_id) => format!("stable:{record_id}"),
+            Self::Legacy(id) => format!("legacy:{id}"),
+        }
+    }
+}
+
+impl StoredReviewComment {
+    fn routing_key(&self) -> ReviewCommentKey {
+        self.record_id
+            .clone()
+            .map(ReviewCommentKey::Stable)
+            .unwrap_or(ReviewCommentKey::Legacy(self.id))
+    }
+
+    fn debug_identity(&self) -> String {
+        self.routing_key().debug_identity()
+    }
+}
+
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
 pub(super) struct DiffReviewOverlay {
     pub(super) anchor_range: Range<Anchor>,
@@ -380,12 +413,13 @@ pub(super) struct DiffReviewOverlay {
     pub(super) composer_visible: bool,
     pub(super) comment_author: StackReviewCommentAuthor,
     pub(super) pending_reply_to: Option<usize>,
+    pub(super) pending_reply_to_record_id: Option<String>,
     /// Editors for comments currently being edited inline.
     /// Key: comment ID, Value: Editor entity for inline editing.
-    pub(super) inline_edit_editors: HashMap<usize, Entity<Editor>>,
+    inline_edit_editors: HashMap<ReviewCommentKey, Entity<Editor>>,
     /// Subscriptions for inline edit editors' action handlers.
     /// Key: comment ID, Value: Subscription keeping the Newline action handler alive.
-    pub(super) inline_edit_subscriptions: HashMap<usize, Subscription>,
+    inline_edit_subscriptions: HashMap<ReviewCommentKey, Subscription>,
     /// The current user's avatar URI for display in comment rows.
     pub(super) user_avatar_uri: Option<SharedUri>,
     /// Subscription to keep the action handler alive.
@@ -451,15 +485,102 @@ pub(super) enum StackReviewThreadItem {
     Comment {
         comment: StoredReviewComment,
         depth: usize,
+        reply_metadata: Option<StackReviewReplyMetadata>,
     },
     Composer {
         depth: usize,
+        target_metadata: StackReviewComposerMetadata,
     },
+}
+
+#[derive(Clone)]
+pub(super) enum StackReviewReplyMetadata {
+    Parent { identity: String, author: String },
+    Unavailable,
+}
+
+pub(super) fn stack_review_debug_selector(prefix: &str, identities: &[&str]) -> String {
+    let mut material = Vec::new();
+    for identity in identities {
+        material.extend_from_slice(&(identity.len() as u64).to_le_bytes());
+        material.extend_from_slice(identity.as_bytes());
+    }
+    format!(
+        "{prefix}-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &material)
+    )
+}
+
+pub(super) fn stack_review_comment_debug_identity(record_id: Option<&str>, id: usize) -> String {
+    record_id
+        .map(|record_id| ReviewCommentKey::Stable(record_id.to_owned()))
+        .unwrap_or(ReviewCommentKey::Legacy(id))
+        .debug_identity()
+}
+
+pub(super) fn stack_review_comment_instance_debug_selector(
+    prefix: &str,
+    record_id: Option<&str>,
+    id: usize,
+    occurrence: usize,
+) -> String {
+    let identity = stack_review_comment_debug_identity(record_id, id);
+    let occurrence = format!("occurrence:{occurrence}");
+    stack_review_debug_selector(prefix, &[&identity, &occurrence])
+}
+
+impl StackReviewReplyMetadata {
+    fn label(&self) -> String {
+        match self {
+            Self::Parent { author, .. } => format!("Replying to {author}"),
+            Self::Unavailable => "Replying to unavailable parent".into(),
+        }
+    }
+
+    fn selector(&self, comment: &StoredReviewComment, occurrence: usize) -> String {
+        let comment_identity = comment.debug_identity();
+        let occurrence = format!("occurrence:{occurrence}");
+        let parent_identity = match self {
+            Self::Parent { identity, .. } => identity.as_str(),
+            Self::Unavailable => "unavailable",
+        };
+        stack_review_debug_selector(
+            "STACK_REVIEW_REPLY_META",
+            &[&comment_identity, parent_identity, &occurrence],
+        )
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum StackReviewComposerMetadata {
+    Target { identity: String, author: String },
+    Unavailable,
+}
+
+impl StackReviewComposerMetadata {
+    fn label(&self) -> String {
+        match self {
+            Self::Target { author, .. } => format!("Replying to {author}"),
+            Self::Unavailable => "Replying to unavailable parent".into(),
+        }
+    }
+
+    fn selector(&self) -> String {
+        match self {
+            Self::Target { identity, .. } => {
+                stack_review_debug_selector("STACK_REVIEW_REPLY_COMPOSER_META", &[identity])
+            }
+            Self::Unavailable => {
+                stack_review_debug_selector("STACK_REVIEW_REPLY_COMPOSER_META", &["unavailable"])
+            }
+        }
+    }
 }
 
 pub(super) fn stack_review_thread_items(
     comments: Vec<StoredReviewComment>,
     pending_reply_to: Option<usize>,
+    pending_reply_to_record_id: Option<&str>,
 ) -> Vec<StackReviewThreadItem> {
     let mut indices_by_record_id = HashMap::<String, Vec<usize>>::default();
     let mut indices_by_numeric_id = HashMap::<usize, Vec<usize>>::default();
@@ -469,11 +590,12 @@ pub(super) fn stack_review_thread_items(
                 .entry(record_id.clone())
                 .or_default()
                 .push(index);
+        } else {
+            indices_by_numeric_id
+                .entry(comment.id)
+                .or_default()
+                .push(index);
         }
-        indices_by_numeric_id
-            .entry(comment.id)
-            .or_default()
-            .push(index);
     }
     let exact_index = |indices: Option<&Vec<usize>>| match indices.map(Vec::as_slice) {
         Some([index]) => Some(*index),
@@ -481,18 +603,31 @@ pub(super) fn stack_review_thread_items(
     };
     let mut roots = Vec::new();
     let mut children = HashMap::<usize, Vec<usize>>::default();
+    let mut reply_metadata = vec![None; comments.len()];
     for (index, comment) in comments.iter().enumerate() {
-        let parent_index = comment
+        let stable_parent_index = comment
             .reply_to_record_id
             .as_ref()
-            .and_then(|record_id| exact_index(indices_by_record_id.get(record_id)))
-            .or_else(|| {
-                comment.record_id.is_none().then_some(())?;
-                comment
-                    .reply_to
-                    .and_then(|parent_id| exact_index(indices_by_numeric_id.get(&parent_id)))
-            })
+            .and_then(|record_id| exact_index(indices_by_record_id.get(record_id)));
+        let legacy_parent_index = comment
+            .reply_to_record_id
+            .is_none()
+            .then_some(())
+            .and_then(|()| comment.record_id.is_none().then_some(()))
+            .and_then(|()| comment.reply_to)
+            .and_then(|parent_id| exact_index(indices_by_numeric_id.get(&parent_id)));
+        let parent_index = stable_parent_index
+            .or(legacy_parent_index)
             .filter(|parent_index| *parent_index != index);
+        let has_parent_reference =
+            comment.reply_to_record_id.is_some() || comment.reply_to.is_some();
+        reply_metadata[index] = parent_index
+            .and_then(|parent_index| comments.get(parent_index))
+            .map(|parent| StackReviewReplyMetadata::Parent {
+                identity: parent.debug_identity(),
+                author: parent.author.name.clone(),
+            })
+            .or_else(|| has_parent_reference.then_some(StackReviewReplyMetadata::Unavailable));
         if let Some(parent_index) = parent_index {
             children.entry(parent_index).or_default().push(index);
         } else {
@@ -524,10 +659,32 @@ pub(super) fn stack_review_thread_items(
         child_indices.sort_by(compare_indices);
     }
 
-    let pending_reply_index =
-        pending_reply_to.and_then(|comment_id| exact_index(indices_by_numeric_id.get(&comment_id)));
+    let pending_reply_index = pending_reply_to_record_id
+        .and_then(|record_id| exact_index(indices_by_record_id.get(record_id)))
+        .or_else(|| {
+            pending_reply_to_record_id.is_none().then_some(())?;
+            pending_reply_to
+                .and_then(|comment_id| exact_index(indices_by_numeric_id.get(&comment_id)))
+        });
+    let pending_reply_metadata = pending_reply_index
+        .and_then(|index| comments.get(index).map(|comment| (index, comment)))
+        .map(|(index, comment)| {
+            let stable_identity_is_exact = comment.record_id.as_ref().is_some_and(|record_id| {
+                exact_index(indices_by_record_id.get(record_id)) == Some(index)
+            });
+            if stable_identity_is_exact || comment.record_id.is_none() {
+                StackReviewComposerMetadata::Target {
+                    identity: comment.debug_identity(),
+                    author: comment.author.name.clone(),
+                }
+            } else {
+                StackReviewComposerMetadata::Unavailable
+            }
+        })
+        .unwrap_or(StackReviewComposerMetadata::Unavailable);
     let mut items = Vec::new();
     let mut visited = HashSet::default();
+    let mut composer_inserted = false;
     let mut all_indices = (0..comments.len()).collect::<Vec<_>>();
     all_indices.sort_by(compare_indices);
     roots.extend(all_indices);
@@ -543,11 +700,17 @@ pub(super) fn stack_review_thread_items(
             let Some(comment) = comments.get(comment_index).cloned() else {
                 continue;
             };
-            items.push(StackReviewThreadItem::Comment { comment, depth });
+            items.push(StackReviewThreadItem::Comment {
+                comment,
+                depth,
+                reply_metadata: reply_metadata.get(comment_index).cloned().flatten(),
+            });
             if pending_reply_index == Some(comment_index) {
                 items.push(StackReviewThreadItem::Composer {
                     depth: depth.saturating_add(1),
+                    target_metadata: pending_reply_metadata.clone(),
                 });
+                composer_inserted = true;
             }
             if let Some(child_indices) = children.get(&comment_index) {
                 for child_index in child_indices.iter().rev() {
@@ -555,6 +718,12 @@ pub(super) fn stack_review_thread_items(
                 }
             }
         }
+    }
+    if (pending_reply_to_record_id.is_some() || pending_reply_to.is_some()) && !composer_inserted {
+        items.push(StackReviewThreadItem::Composer {
+            depth: 0,
+            target_metadata: StackReviewComposerMetadata::Unavailable,
+        });
     }
     items
 }
@@ -1138,6 +1307,7 @@ impl Editor {
                 existing_overlay.composer_visible |= composer_visible;
                 if composer_visible {
                     existing_overlay.pending_reply_to = None;
+                    existing_overlay.pending_reply_to_record_id = None;
                     existing_overlay
                         .prompt_editor
                         .update(cx, |prompt_editor, cx| {
@@ -1216,9 +1386,11 @@ impl Editor {
             })
         });
 
-        // Calculate initial height based on existing comments for this hunk
-        let initial_height =
-            self.calculate_overlay_height(&hunk_key, true, composer_visible, &buffer_snapshot);
+        let initial_height = if self.is_stack_review {
+            1
+        } else {
+            self.calculate_overlay_height(&hunk_key, true, composer_visible, &buffer_snapshot)
+        };
 
         // Create the overlay block
         let prompt_editor_for_render = prompt_editor.clone();
@@ -1254,6 +1426,7 @@ impl Editor {
             composer_visible,
             comment_author,
             pending_reply_to: None,
+            pending_reply_to_record_id: None,
             inline_edit_editors: HashMap::default(),
             inline_edit_subscriptions: HashMap::default(),
             user_avatar_uri,
@@ -1290,6 +1463,34 @@ impl Editor {
         let hunk_key = overlay.hunk_key.clone();
         let author = overlay.comment_author.clone();
         let reply_to = overlay.pending_reply_to;
+        let reply_to_record_id = overlay.pending_reply_to_record_id.clone();
+
+        if self.is_stack_review && (reply_to.is_some() || reply_to_record_id.is_some()) {
+            let snapshot = self.buffer.read(cx).snapshot(cx);
+            let reply_record_id = reply_to_record_id.as_deref();
+            let mut matches =
+                self.stored_review_comments
+                    .iter()
+                    .flat_map(|(candidate_key, comments)| {
+                        comments.iter().filter_map(move |comment| {
+                            let matches = if let Some(record_id) = reply_record_id {
+                                comment.record_id.as_deref() == Some(record_id)
+                            } else {
+                                reply_to == Some(comment.id) && comment.record_id.is_none()
+                            };
+                            matches.then_some((candidate_key, comment))
+                        })
+                    });
+            let Some((candidate_key, parent)) = matches.next() else {
+                return;
+            };
+            if matches.next().is_some()
+                || !Self::hunk_keys_match(candidate_key, &hunk_key, &snapshot)
+                || reply_to != Some(parent.id)
+            {
+                return;
+            }
+        }
 
         self.add_review_comment_with_metadata(
             hunk_key.clone(),
@@ -1298,6 +1499,7 @@ impl Editor {
             author,
             StackReviewCommentSource::LocalHuman,
             reply_to,
+            reply_to_record_id,
             cx,
         );
 
@@ -1313,6 +1515,8 @@ impl Editor {
         {
             overlay.composer_visible = false;
             overlay.pending_reply_to = None;
+            overlay.pending_reply_to_record_id = None;
+            window.focus(&self.focus_handle(cx), cx);
         }
 
         // Refresh the overlay to update the block height for the new comment
@@ -1370,6 +1574,7 @@ impl Editor {
             StackReviewCommentAuthor::default(),
             StackReviewCommentSource::LocalHuman,
             None,
+            None,
             cx,
         )
     }
@@ -1382,18 +1587,26 @@ impl Editor {
         author: StackReviewCommentAuthor,
         source: StackReviewCommentSource,
         reply_to: Option<usize>,
+        reply_to_record_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> usize {
         let id = self.next_review_comment_id;
         self.next_review_comment_id += 1;
 
         let (record_id, reply_to_record_id) = if self.is_stack_review {
-            let reply_to_record_id = reply_to.and_then(|reply_to| {
-                self.stored_review_comments
+            let reply_to_record_id = reply_to_record_id.or_else(|| {
+                let reply_to = reply_to?;
+                let mut matches = self
+                    .stored_review_comments
                     .iter()
                     .flat_map(|(_, comments)| comments)
-                    .find(|comment| comment.id == reply_to)
-                    .and_then(|comment| comment.record_id.clone())
+                    .filter(|comment| comment.record_id.is_none() && comment.id == reply_to);
+                let parent = matches.next()?;
+                matches
+                    .next()
+                    .is_none()
+                    .then(|| parent.record_id.clone())
+                    .flatten()
             });
             (Some(uuid::Uuid::now_v7().to_string()), reply_to_record_id)
         } else {
@@ -1840,6 +2053,7 @@ impl Editor {
     }
 
     /// Updates a review comment's text by ID.
+    #[cfg(test)]
     pub(super) fn update_review_comment(
         &mut self,
         id: usize,
@@ -1860,6 +2074,36 @@ impl Editor {
         false
     }
 
+    pub fn set_stack_review_comment_resolved(
+        &mut self,
+        record_id: &str,
+        resolved: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = ReviewCommentKey::Stable(record_id.to_owned());
+        let match_count = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| key.matches(comment))
+            .count();
+        if match_count != 1 {
+            return false;
+        }
+        for (_, comments) in &mut self.stored_review_comments {
+            if let Some(comment) = comments.iter_mut().find(|comment| key.matches(comment)) {
+                comment.resolved = resolved;
+                break;
+            }
+        }
+        cx.emit(EditorEvent::StackReviewCommentResolutionChanged {
+            record_ids: vec![record_id.to_owned()],
+            resolved,
+        });
+        cx.notify();
+        true
+    }
+
     pub fn set_review_comment_resolved(
         &mut self,
         id: usize,
@@ -1872,7 +2116,7 @@ impl Editor {
             .flat_map(|(_, comments)| comments.iter().cloned())
             .collect::<Vec<_>>();
         let mut indices_by_record_id = HashMap::<String, Vec<usize>>::default();
-        let mut indices_by_numeric_id = HashMap::<usize, Vec<usize>>::default();
+        let mut legacy_indices_by_numeric_id = HashMap::<usize, Vec<usize>>::default();
         for (index, comment) in comments.iter().enumerate() {
             if let Some(record_id) = &comment.record_id {
                 indices_by_record_id
@@ -1880,33 +2124,20 @@ impl Editor {
                     .or_default()
                     .push(index);
             }
-            indices_by_numeric_id
-                .entry(comment.id)
-                .or_default()
-                .push(index);
+            if comment.record_id.is_none() {
+                legacy_indices_by_numeric_id
+                    .entry(comment.id)
+                    .or_default()
+                    .push(index);
+            }
         }
         let exact_index = |indices: Option<&Vec<usize>>| match indices.map(Vec::as_slice) {
             Some([index]) => Some(*index),
             _ => None,
         };
-        let Some(selected_index) = exact_index(indices_by_numeric_id.get(&id)) else {
+        let Some(selected_index) = exact_index(legacy_indices_by_numeric_id.get(&id)) else {
             return false;
         };
-        if let Some(record_id) = comments[selected_index].record_id.clone() {
-            for (_, comments) in &mut self.stored_review_comments {
-                for comment in comments {
-                    if comment.record_id.as_ref() == Some(&record_id) {
-                        comment.resolved = resolved;
-                    }
-                }
-            }
-            cx.emit(EditorEvent::StackReviewCommentResolutionChanged {
-                record_ids: vec![record_id],
-                resolved,
-            });
-            cx.notify();
-            return true;
-        }
         let mut root_index = selected_index;
         let parent_indices = comments
             .iter()
@@ -1919,7 +2150,7 @@ impl Editor {
                     .or_else(|| {
                         comment.record_id.is_none().then_some(())?;
                         comment.reply_to.and_then(|parent_id| {
-                            exact_index(indices_by_numeric_id.get(&parent_id))
+                            exact_index(legacy_indices_by_numeric_id.get(&parent_id))
                         })
                     })
                     .filter(|parent_index| *parent_index != index)
@@ -2014,26 +2245,53 @@ impl Editor {
                 start.row <= cursor.row && cursor.row <= end.row
             })
             .min_by_key(|comment| comment.resolved)
-            .map(|comment| (comment.id, comment.resolved));
-        if let Some((id, resolved)) = candidate {
-            self.set_review_comment_resolved(id, !resolved, cx);
+            .map(|comment| (comment.routing_key(), comment.resolved));
+        if let Some((key, resolved)) = candidate {
+            match key {
+                ReviewCommentKey::Stable(record_id) => {
+                    self.set_stack_review_comment_resolved(&record_id, !resolved, cx);
+                }
+                ReviewCommentKey::Legacy(id) => {
+                    self.set_review_comment_resolved(id, !resolved, cx);
+                }
+            }
         }
     }
 
     /// Sets a comment's editing state.
+    #[cfg(test)]
     pub(super) fn set_comment_editing(
         &mut self,
         id: usize,
         is_editing: bool,
         cx: &mut Context<Self>,
     ) {
-        for (_, comments) in self.stored_review_comments.iter_mut() {
-            if let Some(comment) = comments.iter_mut().find(|c| c.id == id) {
+        self.set_comment_editing_by_key(&ReviewCommentKey::Legacy(id), is_editing, cx);
+    }
+
+    fn set_comment_editing_by_key(
+        &mut self,
+        key: &ReviewCommentKey,
+        is_editing: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let match_count = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| key.matches(comment))
+            .count();
+        if match_count != 1 {
+            return false;
+        }
+        for (_, comments) in &mut self.stored_review_comments {
+            if let Some(comment) = comments.iter_mut().find(|comment| key.matches(comment)) {
                 comment.is_editing = is_editing;
                 cx.notify();
-                return;
+                return true;
             }
         }
+        false
     }
 
     /// Removes review comments whose anchors are no longer valid or whose
@@ -2120,6 +2378,29 @@ impl Editor {
         cx.notify();
     }
 
+    pub(super) fn request_stack_review_comment_checkpoint(
+        &mut self,
+        record_id: Option<&str>,
+        id: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let key = record_id
+            .map(|record_id| ReviewCommentKey::Stable(record_id.to_owned()))
+            .unwrap_or(ReviewCommentKey::Legacy(id));
+        let mut matches = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| key.matches(comment));
+        let Some(comment) = matches.next() else {
+            return;
+        };
+        if matches.next().is_some() || comment.source != StackReviewCommentSource::Github {
+            return;
+        }
+        cx.emit(comment.checkpoint_requested_event());
+    }
+
     pub(super) fn reply_to_review_comment(
         &mut self,
         action: &ReplyToReviewComment,
@@ -2127,18 +2408,59 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let comment_id = action.id;
-        let Some(hunk_key) = self
+        let legacy_only = self.is_stack_review;
+        let mut matches = self
             .stored_review_comments
             .iter()
-            .find_map(|(key, comments)| {
+            .flat_map(|(key, comments)| {
                 comments
                     .iter()
-                    .any(|comment| comment.id == comment_id)
-                    .then(|| key.clone())
-            })
-        else {
+                    .filter(move |comment| {
+                        comment.id == comment_id && (!legacy_only || comment.record_id.is_none())
+                    })
+                    .map(move |_| key.clone())
+            });
+        let Some(hunk_key) = matches.next() else {
             return;
         };
+        if matches.next().is_some() {
+            return;
+        }
+        self.show_reply_composer(hunk_key, comment_id, None, window, cx);
+    }
+
+    pub(super) fn reply_to_stack_review_comment(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut matches = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(key, comments)| {
+                comments
+                    .iter()
+                    .filter(move |comment| comment.record_id.as_deref() == Some(record_id))
+                    .map(move |comment| (key.clone(), comment.id))
+            });
+        let Some((hunk_key, comment_id)) = matches.next() else {
+            return;
+        };
+        if matches.next().is_some() {
+            return;
+        }
+        self.show_reply_composer(hunk_key, comment_id, Some(record_id.to_owned()), window, cx);
+    }
+
+    fn show_reply_composer(
+        &mut self,
+        hunk_key: DiffHunkKey,
+        comment_id: usize,
+        record_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let Some(overlay) = self
             .diff_review_overlays
@@ -2148,6 +2470,7 @@ impl Editor {
             return;
         };
         overlay.pending_reply_to = Some(comment_id);
+        overlay.pending_reply_to_record_id = record_id;
         overlay.composer_visible = true;
         overlay.prompt_editor.update(cx, |prompt_editor, cx| {
             prompt_editor.clear(window, cx);
@@ -2166,87 +2489,84 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let comment_id = action.id;
-        if self
+        self.edit_review_comment_by_key(ReviewCommentKey::Legacy(action.id), window, cx);
+    }
+
+    pub(super) fn edit_stack_review_comment(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_review_comment_by_key(ReviewCommentKey::Stable(record_id.to_owned()), window, cx);
+    }
+
+    fn edit_review_comment_by_key(
+        &mut self,
+        key: ReviewCommentKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut matches = self
             .stored_review_comments
             .iter()
-            .flat_map(|(_, comments)| comments)
-            .find(|comment| comment.id == comment_id)
-            .is_some_and(|comment| comment.source == StackReviewCommentSource::Github)
-        {
+            .flat_map(|(hunk_key, comments)| {
+                comments
+                    .iter()
+                    .filter(|comment| key.matches(comment))
+                    .map(move |comment| (hunk_key.clone(), comment.comment.clone(), comment.source))
+            });
+        let Some((hunk_key, comment_text, source)) = matches.next() else {
+            return;
+        };
+        if matches.next().is_some() || source == StackReviewCommentSource::Github {
+            return;
+        }
+        if !self.set_comment_editing_by_key(&key, true, cx) {
             return;
         }
 
-        // Set the comment to editing mode
-        self.set_comment_editing(comment_id, true, cx);
-
-        // Find the overlay that contains this comment and create an inline editor if needed
-        // First, find which hunk this comment belongs to
-        let hunk_key = self
-            .stored_review_comments
-            .iter()
-            .find_map(|(key, comments)| {
-                if comments.iter().any(|c| c.id == comment_id) {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            });
-
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        if let Some(hunk_key) = hunk_key {
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+        if let Some(overlay) = self
+            .diff_review_overlays
+            .iter_mut()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+        {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                overlay.inline_edit_editors.entry(key.clone())
             {
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    overlay.inline_edit_editors.entry(comment_id)
-                {
-                    // Find the comment text
-                    let comment_text = self
-                        .stored_review_comments
-                        .iter()
-                        .flat_map(|(_, comments)| comments)
-                        .find(|c| c.id == comment_id)
-                        .map(|c| c.comment.clone())
-                        .unwrap_or_default();
+                let parent_editor = cx.entity().downgrade();
+                let inline_editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_text(&*comment_text, window, cx);
+                    editor.select_all(&crate::actions::SelectAll, window, cx);
+                    editor
+                });
 
-                    // Create inline editor
-                    let parent_editor = cx.entity().downgrade();
-                    let inline_editor = cx.new(|cx| {
-                        let mut editor = Editor::single_line(window, cx);
-                        editor.set_text(&*comment_text, window, cx);
-                        // Select all text for easy replacement
-                        editor.select_all(&crate::actions::SelectAll, window, cx);
-                        editor
-                    });
-
-                    // Register the Newline action to confirm the edit
-                    let subscription = inline_editor.update(cx, |inline_editor, _cx| {
-                        inline_editor.register_action({
-                            let parent_editor = parent_editor.clone();
-                            move |_: &crate::actions::Newline, window, cx| {
-                                if let Some(editor) = parent_editor.upgrade() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.confirm_edit_review_comment(comment_id, window, cx);
-                                    });
-                                }
+                let key_for_submit = key.clone();
+                let subscription = inline_editor.update(cx, |inline_editor, _cx| {
+                    inline_editor.register_action({
+                        let parent_editor = parent_editor.clone();
+                        move |_: &crate::actions::Newline, window, cx| {
+                            if let Some(editor) = parent_editor.upgrade() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.confirm_review_comment_edit_by_key(
+                                        key_for_submit.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
                             }
-                        })
-                    });
+                        }
+                    })
+                });
 
-                    // Store the subscription to keep the action handler alive
-                    overlay
-                        .inline_edit_subscriptions
-                        .insert(comment_id, subscription);
-
-                    // Focus the inline editor
-                    let focus_handle = inline_editor.focus_handle(cx);
-                    window.focus(&focus_handle, cx);
-
-                    entry.insert(inline_editor);
-                }
+                overlay
+                    .inline_edit_subscriptions
+                    .insert(key.clone(), subscription);
+                let focus_handle = inline_editor.focus_handle(cx);
+                window.focus(&focus_handle, cx);
+                entry.insert(inline_editor);
             }
         }
 
@@ -2257,90 +2577,131 @@ impl Editor {
     pub(super) fn confirm_edit_review_comment(
         &mut self,
         comment_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_review_comment_edit_by_key(ReviewCommentKey::Legacy(comment_id), window, cx);
+    }
+
+    pub(super) fn confirm_stack_review_comment_edit(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_review_comment_edit_by_key(
+            ReviewCommentKey::Stable(record_id.to_owned()),
+            window,
+            cx,
+        );
+    }
+
+    fn confirm_review_comment_edit_by_key(
+        &mut self,
+        key: ReviewCommentKey,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Get the new text from the inline editor
-        // Find the overlay containing this comment's inline editor
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        let hunk_key = self
+        let mut matches = self
             .stored_review_comments
             .iter()
-            .find_map(|(key, comments)| {
-                if comments.iter().any(|c| c.id == comment_id) {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            });
-
-        let new_text = hunk_key
-            .as_ref()
-            .and_then(|hunk_key| {
-                self.diff_review_overlays
+            .flat_map(|(hunk_key, comments)| {
+                comments
                     .iter()
-                    .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, &snapshot))
-            })
-            .as_ref()
-            .and_then(|overlay| overlay.inline_edit_editors.get(&comment_id))
+                    .filter(|comment| key.matches(comment))
+                    .map(move |_| hunk_key.clone())
+            });
+        let Some(hunk_key) = matches.next() else {
+            return;
+        };
+        if matches.next().is_some() {
+            return;
+        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let new_text = self
+            .diff_review_overlays
+            .iter()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+            .and_then(|overlay| overlay.inline_edit_editors.get(&key))
             .map(|editor| editor.read(cx).text(cx).trim().to_string());
 
-        if let Some(new_text) = new_text {
-            if !new_text.is_empty() {
-                self.update_review_comment(comment_id, new_text, cx);
+        if let Some(new_text) = new_text.filter(|text| !text.is_empty()) {
+            for (_, comments) in &mut self.stored_review_comments {
+                if let Some(comment) = comments.iter_mut().find(|comment| key.matches(comment)) {
+                    comment.comment = new_text;
+                    comment.is_editing = false;
+                    break;
+                }
             }
+            cx.emit(EditorEvent::ReviewCommentsChanged {
+                total_count: self.total_review_comment_count(),
+            });
         }
-
-        // Remove the inline editor and its subscription
-        if let Some(hunk_key) = hunk_key {
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            {
-                overlay.inline_edit_editors.remove(&comment_id);
-                overlay.inline_edit_subscriptions.remove(&comment_id);
-            }
+        if let Some(overlay) = self
+            .diff_review_overlays
+            .iter_mut()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+        {
+            overlay.inline_edit_editors.remove(&key);
+            overlay.inline_edit_subscriptions.remove(&key);
         }
-
-        // Clear editing state
-        self.set_comment_editing(comment_id, false, cx);
+        self.set_comment_editing_by_key(&key, false, cx);
     }
 
     /// Cancels an inline edit of a review comment.
     pub(super) fn cancel_edit_review_comment(
         &mut self,
         comment_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_review_comment_edit_by_key(ReviewCommentKey::Legacy(comment_id), window, cx);
+    }
+
+    pub(super) fn cancel_stack_review_comment_edit(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_review_comment_edit_by_key(
+            ReviewCommentKey::Stable(record_id.to_owned()),
+            window,
+            cx,
+        );
+    }
+
+    fn cancel_review_comment_edit_by_key(
+        &mut self,
+        key: ReviewCommentKey,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Find which hunk this comment belongs to
-        let hunk_key = self
+        let mut matches = self
             .stored_review_comments
             .iter()
-            .find_map(|(key, comments)| {
-                if comments.iter().any(|c| c.id == comment_id) {
-                    Some(key.clone())
-                } else {
-                    None
-                }
+            .flat_map(|(hunk_key, comments)| {
+                comments
+                    .iter()
+                    .filter(|comment| key.matches(comment))
+                    .map(move |_| hunk_key.clone())
             });
-
-        // Remove the inline editor and its subscription
-        if let Some(hunk_key) = hunk_key {
-            let snapshot = self.buffer.read(cx).snapshot(cx);
-            if let Some(overlay) = self
-                .diff_review_overlays
-                .iter_mut()
-                .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
-            {
-                overlay.inline_edit_editors.remove(&comment_id);
-                overlay.inline_edit_subscriptions.remove(&comment_id);
-            }
+        let Some(hunk_key) = matches.next() else {
+            return;
+        };
+        if matches.next().is_some() {
+            return;
         }
-
-        // Clear editing state
-        self.set_comment_editing(comment_id, false, cx);
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        if let Some(overlay) = self
+            .diff_review_overlays
+            .iter_mut()
+            .find(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+        {
+            overlay.inline_edit_editors.remove(&key);
+            overlay.inline_edit_subscriptions.remove(&key);
+        }
+        self.set_comment_editing_by_key(&key, false, cx);
     }
 
     /// Action handler for ConfirmEditReviewComment.
@@ -2363,6 +2724,73 @@ impl Editor {
         self.cancel_edit_review_comment(action.id, window, cx);
     }
 
+    pub(super) fn delete_stack_review_comment(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_review_comment_by_key(
+            ReviewCommentKey::Stable(record_id.to_owned()),
+            window,
+            cx,
+        );
+    }
+
+    fn delete_review_comment_by_key(
+        &mut self,
+        key: ReviewCommentKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut matches = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(hunk_key, comments)| {
+                comments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, comment)| key.matches(comment))
+                    .map(move |(index, comment)| (hunk_key.clone(), index, comment.source))
+            });
+        let Some((hunk_key, comment_index, source)) = matches.next() else {
+            return;
+        };
+        if matches.next().is_some() || source == StackReviewCommentSource::Github {
+            return;
+        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let Some((_, comments)) = self
+            .stored_review_comments
+            .iter_mut()
+            .find(|(candidate, _)| Self::hunk_keys_match(candidate, &hunk_key, &snapshot))
+        else {
+            return;
+        };
+        if comment_index >= comments.len() || !key.matches(&comments[comment_index]) {
+            return;
+        }
+        comments.remove(comment_index);
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.total_review_comment_count(),
+        });
+        if self.hunk_comment_count(&hunk_key, &snapshot) == 0 {
+            if let Some(index) = self
+                .diff_review_overlays
+                .iter()
+                .position(|overlay| Self::hunk_keys_match(&overlay.hunk_key, &hunk_key, &snapshot))
+            {
+                let overlay = self.diff_review_overlays.remove(index);
+                let mut block_ids = HashSet::default();
+                block_ids.insert(overlay.block_id);
+                self.remove_blocks(block_ids, None, cx);
+            }
+        } else {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+        cx.notify();
+    }
+
     /// Handles the DeleteReviewComment action - removes a comment.
     pub(super) fn delete_review_comment(
         &mut self,
@@ -2370,6 +2798,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_stack_review {
+            self.delete_review_comment_by_key(ReviewCommentKey::Legacy(action.id), window, cx);
+            return;
+        }
         // Get the hunk key before removing the comment
         // Find the hunk key from the comment itself
         let comment_id = action.id;
@@ -2851,9 +3283,7 @@ impl Editor {
         );
     }
 
-    /// Calculates the appropriate block height for the diff review overlay.
-    /// Height is in lines: 2 for input row, 1 for header when comments exist,
-    /// and 2 lines per comment when expanded.
+    /// Calculates the legacy ordinary diff-review block height before layout.
     pub(super) fn calculate_overlay_height(
         &self,
         hunk_key: &DiffHunkKey,
@@ -2871,7 +3301,8 @@ impl Editor {
             let comments_height = comments.iter().fold(0u32, |height, comment| {
                 let body_lines = comment.comment.split('\n').fold(0u32, |lines, line| {
                     let character_count = line.chars().count().max(1);
-                    let visual_lines = character_count.div_ceil(STACK_REVIEW_COMMENT_WRAP_COLUMNS);
+                    let visual_lines =
+                        character_count.div_ceil(LEGACY_DIFF_REVIEW_COMMENT_WRAP_COLUMNS);
                     lines.saturating_add(u32::try_from(visual_lines).unwrap_or(u32::MAX))
                 });
                 height.saturating_add(body_lines.saturating_add(1))
@@ -3159,6 +3590,7 @@ impl Editor {
                 if overlay.composer_visible {
                     overlay.composer_visible = false;
                     overlay.pending_reply_to = None;
+                    overlay.pending_reply_to_record_id = None;
                     hunk_keys_to_resize.push(overlay.hunk_key.clone());
                 }
             } else {
@@ -3176,6 +3608,7 @@ impl Editor {
         }
         let changed = removed_empty_overlays || !hunk_keys_to_resize.is_empty();
         if changed {
+            window.focus(&self.focus_handle(cx), cx);
             cx.notify();
         }
         changed
@@ -3189,6 +3622,11 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_stack_review {
+            cx.notify();
+            return;
+        }
+
         // Extract all needed data from overlay first to avoid borrow conflicts
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let (comments_expanded, composer_visible, block_id, prompt_editor) = {
@@ -3279,6 +3717,7 @@ impl Editor {
             comments_expanded,
             composer_visible,
             pending_reply_to,
+            pending_reply_to_record_id,
             is_stack_review,
             inline_editors,
             user_avatar_uri,
@@ -3293,6 +3732,7 @@ impl Editor {
                     expanded,
                     composer_visible,
                     pending_reply_to,
+                    pending_reply_to_record_id,
                     editors,
                     avatar_uri,
                     line_ranges,
@@ -3317,6 +3757,7 @@ impl Editor {
                             o.comments_expanded,
                             o.composer_visible,
                             o.pending_reply_to,
+                            o.pending_reply_to_record_id.clone(),
                             o.inline_edit_editors.clone(),
                             o.user_avatar_uri.clone(),
                             if ranges.is_empty() {
@@ -3326,12 +3767,13 @@ impl Editor {
                             },
                         )
                     })
-                    .unwrap_or((true, true, None, HashMap::default(), None, None));
+                    .unwrap_or((true, true, None, None, HashMap::default(), None, None));
                 (
                     comments,
                     expanded,
                     composer_visible,
                     pending_reply_to,
+                    pending_reply_to_record_id,
                     editor.is_stack_review,
                     editors,
                     avatar_uri,
@@ -3342,6 +3784,7 @@ impl Editor {
                 Vec::new(),
                 true,
                 true,
+                None,
                 None,
                 false,
                 HashMap::default(),
@@ -3378,79 +3821,86 @@ impl Editor {
                 }
             })
             // Top row: editable input with user's avatar
-            .when(composer_visible && pending_reply_to.is_none(), |element| {
-                element.child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .bg(colors.surface_background)
-                        .child(
-                            div()
-                                .size(avatar_size)
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .overflow_hidden()
-                                .child(if let Some(ref avatar_uri) = user_avatar_uri {
-                                    Avatar::new(avatar_uri.clone())
-                                        .size(avatar_size)
-                                        .into_any_element()
-                                } else {
-                                    Icon::new(IconName::Person)
-                                        .size(IconSize::Small)
-                                        .color(ui::Color::Muted)
-                                        .into_any_element()
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .border_1()
-                                .border_color(colors.border)
-                                .rounded_md()
-                                .bg(colors.editor_background)
-                                .px_2()
-                                .py_1()
-                                .child(prompt_editor.clone()),
-                        )
-                        .child(
-                            h_flex()
-                                .flex_shrink_0()
-                                .gap_1()
-                                .child(
-                                    IconButton::new("diff-review-close", IconName::Close)
-                                        .icon_color(ui::Color::Muted)
-                                        .icon_size(action_icon_size)
-                                        .tooltip(Tooltip::text("Close"))
-                                        .on_click(move |_, window, cx| {
-                                            if let Some(editor) = close_editor.upgrade() {
-                                                editor.update(cx, |editor, cx| {
-                                                    editor.dismiss_stack_review_comment_composers(
-                                                        window, cx,
-                                                    );
-                                                });
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    IconButton::new("diff-review-add", IconName::Return)
-                                        .icon_color(ui::Color::Muted)
-                                        .icon_size(action_icon_size)
-                                        .tooltip(Tooltip::text("Add comment"))
-                                        .on_click(move |_, window, cx| {
-                                            if let Some(editor) = submit_editor.upgrade() {
-                                                editor.update(cx, |editor, cx| {
-                                                    editor.submit_diff_review_comment(window, cx);
-                                                });
-                                            }
-                                        }),
-                                ),
-                        ),
-                )
-            })
+            .when(
+                composer_visible
+                    && pending_reply_to.is_none()
+                    && pending_reply_to_record_id.is_none(),
+                |element| {
+                    element.child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1p5()
+                            .rounded_md()
+                            .bg(colors.surface_background)
+                            .child(
+                                div()
+                                    .size(avatar_size)
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .overflow_hidden()
+                                    .child(if let Some(ref avatar_uri) = user_avatar_uri {
+                                        Avatar::new(avatar_uri.clone())
+                                            .size(avatar_size)
+                                            .into_any_element()
+                                    } else {
+                                        Icon::new(IconName::Person)
+                                            .size(IconSize::Small)
+                                            .color(ui::Color::Muted)
+                                            .into_any_element()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .rounded_md()
+                                    .bg(colors.editor_background)
+                                    .px_2()
+                                    .py_1()
+                                    .child(prompt_editor.clone()),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .gap_1()
+                                    .child(
+                                        IconButton::new("diff-review-close", IconName::Close)
+                                            .icon_color(ui::Color::Muted)
+                                            .icon_size(action_icon_size)
+                                            .tooltip(Tooltip::text("Close"))
+                                            .on_click(move |_, window, cx| {
+                                                if let Some(editor) = close_editor.upgrade() {
+                                                    editor.update(cx, |editor, cx| {
+                                                        editor
+                                                            .dismiss_stack_review_comment_composers(
+                                                                window, cx,
+                                                            );
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        IconButton::new("diff-review-add", IconName::Return)
+                                            .icon_color(ui::Color::Muted)
+                                            .icon_size(action_icon_size)
+                                            .tooltip(Tooltip::text("Add comment"))
+                                            .on_click(move |_, window, cx| {
+                                                if let Some(editor) = submit_editor.upgrade() {
+                                                    editor.update(cx, |editor, cx| {
+                                                        editor
+                                                            .submit_diff_review_comment(window, cx);
+                                                    });
+                                                }
+                                            }),
+                                    ),
+                            ),
+                    )
+                },
+            )
             // Expandable comments section (only shown when there are comments)
             .when(comment_count > 0, |el| {
                 el.child(Self::render_comments_section(
@@ -3458,6 +3908,7 @@ impl Editor {
                     comments_expanded,
                     composer_visible,
                     pending_reply_to,
+                    pending_reply_to_record_id.as_deref(),
                     is_stack_review,
                     prompt_editor.clone(),
                     inline_editors,
@@ -3477,9 +3928,10 @@ impl Editor {
         expanded: bool,
         composer_visible: bool,
         pending_reply_to: Option<usize>,
+        pending_reply_to_record_id: Option<&str>,
         is_stack_review: bool,
         prompt_editor: Entity<Editor>,
-        inline_editors: HashMap<usize, Entity<Editor>>,
+        inline_editors: HashMap<ReviewCommentKey, Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
         avatar_size: Pixels,
         action_icon_size: IconSize,
@@ -3492,6 +3944,9 @@ impl Editor {
         let thread_items = stack_review_thread_items(
             comments,
             composer_visible.then_some(pending_reply_to).flatten(),
+            composer_visible
+                .then_some(pending_reply_to_record_id)
+                .flatten(),
         );
         let editor_handle_for_toggle = editor_handle.clone();
         let hunk_key_for_toggle = hunk_key;
@@ -3548,13 +4003,19 @@ impl Editor {
             )
             // Comments list (when expanded)
             .when(expanded, |el| {
-                el.children(thread_items.into_iter().map(|item| {
-                    match item {
-                        StackReviewThreadItem::Comment { comment, depth } => {
-                            let inline_editor = inline_editors.get(&comment.id).cloned();
+                el.children(thread_items.into_iter().enumerate().map(
+                    |(occurrence, item)| match item {
+                        StackReviewThreadItem::Comment {
+                            comment,
+                            depth,
+                            reply_metadata,
+                        } => {
+                            let inline_editor = inline_editors.get(&comment.routing_key()).cloned();
                             Self::render_comment_row(
                                 comment,
+                                occurrence,
                                 depth,
+                                reply_metadata,
                                 is_stack_review,
                                 inline_editor,
                                 user_avatar_uri.clone(),
@@ -3565,29 +4026,43 @@ impl Editor {
                             )
                             .into_any_element()
                         }
-                        StackReviewThreadItem::Composer { depth } => div()
-                            .pl(px((depth.min(4) * 12) as f32))
-                            .child(Self::render_reply_composer(
+                        StackReviewThreadItem::Composer {
+                            depth,
+                            target_metadata,
+                        } => {
+                            let composer = Self::render_reply_composer(
                                 prompt_editor.clone(),
+                                is_stack_review.then_some(target_metadata),
                                 action_icon_size,
                                 colors,
                                 editor_handle.clone(),
-                            ))
-                            .into_any_element(),
-                    }
-                }))
+                            );
+                            if is_stack_review {
+                                composer.into_any_element()
+                            } else {
+                                div()
+                                    .pl(px((depth.min(4) * 12) as f32))
+                                    .child(composer)
+                                    .into_any_element()
+                            }
+                        }
+                    },
+                ))
             })
     }
 
     fn render_reply_composer(
         prompt_editor: Entity<Editor>,
+        target_metadata: Option<StackReviewComposerMetadata>,
         action_icon_size: IconSize,
         colors: &theme::ThemeColors,
         editor_handle: WeakEntity<Editor>,
     ) -> impl IntoElement {
         let close_editor = editor_handle.clone();
         let submit_editor = editor_handle;
-        h_flex()
+        let target_metadata =
+            target_metadata.map(|metadata| (metadata.selector(), metadata.label()));
+        v_flex()
             .w_full()
             .gap_1()
             .rounded_md()
@@ -3596,38 +4071,53 @@ impl Editor {
             .border_color(colors.border)
             .px_2()
             .py_1()
-            .child(div().min_w_0().flex_1().child(prompt_editor))
+            .debug_selector(|| "STACK_REVIEW_REPLY_COMPOSER".into())
+            .when_some(target_metadata, |composer, (selector, label)| {
+                composer.child(
+                    div()
+                        .debug_selector(move || selector)
+                        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+                )
+            })
             .child(
-                IconButton::new("diff-review-close-reply", IconName::Close)
-                    .icon_color(ui::Color::Muted)
-                    .icon_size(action_icon_size)
-                    .tooltip(Tooltip::text("Cancel reply"))
-                    .on_click(move |_, window, cx| {
-                        if let Some(editor) = close_editor.upgrade() {
-                            editor.update(cx, |editor, cx| {
-                                editor.dismiss_stack_review_comment_composers(window, cx);
-                            });
-                        }
-                    }),
-            )
-            .child(
-                IconButton::new("diff-review-submit-reply", IconName::Return)
-                    .icon_color(ui::Color::Muted)
-                    .icon_size(action_icon_size)
-                    .tooltip(Tooltip::text("Add reply"))
-                    .on_click(move |_, window, cx| {
-                        if let Some(editor) = submit_editor.upgrade() {
-                            editor.update(cx, |editor, cx| {
-                                editor.submit_diff_review_comment(window, cx);
-                            });
-                        }
-                    }),
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(div().min_w_0().flex_1().child(prompt_editor))
+                    .child(
+                        IconButton::new("diff-review-close-reply", IconName::Close)
+                            .icon_color(ui::Color::Muted)
+                            .icon_size(action_icon_size)
+                            .tooltip(Tooltip::text("Cancel reply"))
+                            .on_click(move |_, window, cx| {
+                                if let Some(editor) = close_editor.upgrade() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.dismiss_stack_review_comment_composers(window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        IconButton::new("diff-review-submit-reply", IconName::Return)
+                            .icon_color(ui::Color::Muted)
+                            .icon_size(action_icon_size)
+                            .tooltip(Tooltip::text("Add reply"))
+                            .on_click(move |_, window, cx| {
+                                if let Some(editor) = submit_editor.upgrade() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.submit_diff_review_comment(window, cx);
+                                    });
+                                }
+                            }),
+                    ),
             )
     }
 
     fn render_comment_row(
         comment: StoredReviewComment,
-        depth: usize,
+        occurrence: usize,
+        _depth: usize,
+        reply_metadata: Option<StackReviewReplyMetadata>,
         is_stack_review: bool,
         inline_editor: Option<Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
@@ -3637,7 +4127,7 @@ impl Editor {
         editor_handle: WeakEntity<Editor>,
     ) -> impl IntoElement {
         let comment_id = comment.id;
-        let checkpoint_requested_event = comment.checkpoint_requested_event();
+        let checkpoint_record_id = comment.record_id.clone();
         let is_editing = inline_editor.is_some();
         let cancel_editor = editor_handle.clone();
         let confirm_editor = editor_handle.clone();
@@ -3648,6 +4138,45 @@ impl Editor {
         let resolution_editor = editor_handle;
         let resolved = comment.resolved;
         let comment_text = comment.comment.clone();
+        let reply_record_id = comment.record_id.clone();
+        let comment_identity = comment.debug_identity();
+        let action_identity = if is_stack_review {
+            stack_review_comment_instance_debug_selector(
+                "STACK_REVIEW_COMMENT_ACTION",
+                comment.record_id.as_deref(),
+                comment_id,
+                occurrence,
+            )
+        } else {
+            comment_id.to_string()
+        };
+        let confirm_record_id = comment.record_id.clone();
+        let cancel_record_id = comment.record_id.clone();
+        let resolution_record_id = comment.record_id.clone();
+        let edit_record_id = comment.record_id.clone();
+        let delete_record_id = comment.record_id.clone();
+        let content_selector = if is_stack_review {
+            stack_review_comment_instance_debug_selector(
+                "STACK_REVIEW_COMMENT_CONTENT",
+                comment.record_id.as_deref(),
+                comment_id,
+                occurrence,
+            )
+        } else {
+            stack_review_debug_selector("STACK_REVIEW_COMMENT_CONTENT", &[&comment_identity])
+        };
+        let row_selector = if is_stack_review {
+            stack_review_comment_instance_debug_selector(
+                "STACK_REVIEW_COMMENT_ROW",
+                comment.record_id.as_deref(),
+                comment_id,
+                occurrence,
+            )
+        } else {
+            stack_review_debug_selector("STACK_REVIEW_COMMENT_ROW", &[&comment_identity])
+        };
+        let reply_metadata = reply_metadata
+            .map(|metadata| (metadata.selector(&comment, occurrence), metadata.label()));
 
         let source = comment.source;
         let mut author_label = match source {
@@ -3687,11 +4216,7 @@ impl Editor {
             .py_1p5()
             .rounded_md()
             .bg(colors.surface_background)
-            .pl(px(if is_stack_review {
-                (depth.min(4) * 12) as f32
-            } else {
-                0.
-            }))
+            .debug_selector(move || row_selector)
             .child(
                 div()
                     .size(avatar_size)
@@ -3721,6 +4246,14 @@ impl Editor {
                     .min_w_0()
                     .flex_1()
                     .gap_0p5()
+                    .debug_selector(move || content_selector)
+                    .when_some(reply_metadata, |content, (selector, label)| {
+                        content.child(
+                            div().debug_selector(move || selector).child(
+                                Label::new(label).size(LabelSize::Small).color(Color::Muted),
+                            ),
+                        )
+                    })
                     .child(
                         Label::new(author_label)
                             .size(LabelSize::Small)
@@ -3739,7 +4272,7 @@ impl Editor {
                     .gap_1()
                     .child(
                         IconButton::new(
-                            format!("diff-review-cancel-edit-{comment_id}"),
+                            format!("diff-review-cancel-edit-{action_identity}"),
                             IconName::Close,
                         )
                         .icon_color(ui::Color::Muted)
@@ -3748,14 +4281,25 @@ impl Editor {
                         .on_click(move |_, window, cx| {
                             if let Some(editor) = cancel_editor.upgrade() {
                                 editor.update(cx, |editor, cx| {
-                                    editor.cancel_edit_review_comment(comment_id, window, cx);
+                                    if is_stack_review {
+                                        if let Some(record_id) = cancel_record_id.as_deref() {
+                                            editor.cancel_stack_review_comment_edit(
+                                                record_id, window, cx,
+                                            );
+                                        } else {
+                                            editor
+                                                .cancel_edit_review_comment(comment_id, window, cx);
+                                        }
+                                    } else {
+                                        editor.cancel_edit_review_comment(comment_id, window, cx);
+                                    }
                                 });
                             }
                         }),
                     )
                     .child(
                         IconButton::new(
-                            format!("diff-review-confirm-edit-{comment_id}"),
+                            format!("diff-review-confirm-edit-{action_identity}"),
                             IconName::Return,
                         )
                         .icon_color(ui::Color::Muted)
@@ -3764,7 +4308,19 @@ impl Editor {
                         .on_click(move |_, window, cx| {
                             if let Some(editor) = confirm_editor.upgrade() {
                                 editor.update(cx, |editor, cx| {
-                                    editor.confirm_edit_review_comment(comment_id, window, cx);
+                                    if is_stack_review {
+                                        if let Some(record_id) = confirm_record_id.as_deref() {
+                                            editor.confirm_stack_review_comment_edit(
+                                                record_id, window, cx,
+                                            );
+                                        } else {
+                                            editor.confirm_edit_review_comment(
+                                                comment_id, window, cx,
+                                            );
+                                        }
+                                    } else {
+                                        editor.confirm_edit_review_comment(comment_id, window, cx);
+                                    }
                                 });
                             }
                         }),
@@ -3775,14 +4331,17 @@ impl Editor {
                     .flex_none()
                     .gap_1()
                     .child(
-                        CopyButton::new(format!("diff-review-copy-{comment_id}"), comment_text)
-                            .icon_size(action_icon_size)
-                            .tooltip_label("Copy comment"),
+                        CopyButton::new(
+                            format!("diff-review-copy-{action_identity}"),
+                            comment_text,
+                        )
+                        .icon_size(action_icon_size)
+                        .tooltip_label("Copy comment"),
                     )
                     .when(source == StackReviewCommentSource::Github, |actions| {
                         actions.child(
                             IconButton::new(
-                                format!("diff-review-use-comment-checkpoint-{comment_id}"),
+                                format!("diff-review-use-comment-checkpoint-{action_identity}"),
                                 IconName::Diff,
                             )
                             .icon_color(ui::Color::Muted)
@@ -3792,8 +4351,12 @@ impl Editor {
                             ))
                             .on_click(move |_, _, cx| {
                                 if let Some(editor) = checkpoint_editor.upgrade() {
-                                    editor.update(cx, |_, cx| {
-                                        cx.emit(checkpoint_requested_event.clone());
+                                    editor.update(cx, |editor, cx| {
+                                        editor.request_stack_review_comment_checkpoint(
+                                            checkpoint_record_id.as_deref(),
+                                            comment_id,
+                                            cx,
+                                        );
                                     });
                                 }
                             }),
@@ -3801,7 +4364,7 @@ impl Editor {
                     })
                     .child(
                         IconButton::new(
-                            format!("diff-review-resolution-{comment_id}"),
+                            format!("diff-review-resolution-{action_identity}"),
                             if resolved {
                                 IconName::Undo
                             } else {
@@ -3818,14 +4381,27 @@ impl Editor {
                         .on_click(move |_, _, cx| {
                             if let Some(editor) = resolution_editor.upgrade() {
                                 editor.update(cx, |editor, cx| {
-                                    editor.set_review_comment_resolved(comment_id, !resolved, cx);
+                                    if is_stack_review {
+                                        if let Some(record_id) = resolution_record_id.as_deref() {
+                                            editor.set_stack_review_comment_resolved(
+                                                record_id, !resolved, cx,
+                                            );
+                                        } else {
+                                            editor.set_review_comment_resolved(
+                                                comment_id, !resolved, cx,
+                                            );
+                                        }
+                                    } else {
+                                        editor
+                                            .set_review_comment_resolved(comment_id, !resolved, cx);
+                                    }
                                 });
                             }
                         }),
                     )
                     .child(
                         IconButton::new(
-                            format!("diff-review-reply-{comment_id}"),
+                            format!("diff-review-reply-{action_identity}"),
                             IconName::ReplyArrowRight,
                         )
                         .icon_color(ui::Color::Muted)
@@ -3834,11 +4410,25 @@ impl Editor {
                         .on_click(move |_, window, cx| {
                             if let Some(editor) = reply_editor.upgrade() {
                                 editor.update(cx, |editor, cx| {
-                                    editor.reply_to_review_comment(
-                                        &ReplyToReviewComment { id: comment_id },
-                                        window,
-                                        cx,
-                                    );
+                                    if is_stack_review {
+                                        if let Some(record_id) = reply_record_id.as_deref() {
+                                            editor.reply_to_stack_review_comment(
+                                                record_id, window, cx,
+                                            );
+                                        } else {
+                                            editor.reply_to_review_comment(
+                                                &ReplyToReviewComment { id: comment_id },
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    } else {
+                                        editor.reply_to_review_comment(
+                                            &ReplyToReviewComment { id: comment_id },
+                                            window,
+                                            cx,
+                                        );
+                                    }
                                 });
                             }
                         }),
@@ -3847,7 +4437,7 @@ impl Editor {
                         actions
                             .child(
                                 IconButton::new(
-                                    format!("diff-review-edit-{comment_id}"),
+                                    format!("diff-review-edit-{action_identity}"),
                                     IconName::Pencil,
                                 )
                                 .icon_color(ui::Color::Muted)
@@ -3856,18 +4446,24 @@ impl Editor {
                                 .on_click(move |_, window, cx| {
                                     if let Some(editor) = edit_editor.upgrade() {
                                         editor.update(cx, |editor, cx| {
-                                            editor.edit_review_comment(
-                                                &EditReviewComment { id: comment_id },
-                                                window,
-                                                cx,
-                                            );
+                                            if let Some(record_id) = edit_record_id.as_deref() {
+                                                editor.edit_stack_review_comment(
+                                                    record_id, window, cx,
+                                                );
+                                            } else {
+                                                editor.edit_review_comment(
+                                                    &EditReviewComment { id: comment_id },
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
                                         });
                                     }
                                 }),
                             )
                             .child(
                                 IconButton::new(
-                                    format!("diff-review-delete-{comment_id}"),
+                                    format!("diff-review-delete-{action_identity}"),
                                     IconName::Trash,
                                 )
                                 .icon_color(ui::Color::Muted)
@@ -3876,11 +4472,17 @@ impl Editor {
                                 .on_click(move |_, window, cx| {
                                     if let Some(editor) = delete_editor.upgrade() {
                                         editor.update(cx, |editor, cx| {
-                                            editor.delete_review_comment(
-                                                &DeleteReviewComment { id: comment_id },
-                                                window,
-                                                cx,
-                                            );
+                                            if let Some(record_id) = delete_record_id.as_deref() {
+                                                editor.delete_stack_review_comment(
+                                                    record_id, window, cx,
+                                                );
+                                            } else {
+                                                editor.delete_review_comment(
+                                                    &DeleteReviewComment { id: comment_id },
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
                                         });
                                     }
                                 }),

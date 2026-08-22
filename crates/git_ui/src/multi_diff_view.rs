@@ -274,7 +274,7 @@ impl MultiDiffView {
                 view.update(cx, |view, cx| {
                     view.editor.update(cx, |editor, cx| {
                         editor.set_show_diff_review_button(true, cx);
-                        editor.set_stack_review_mode(true, cx);
+                        editor.enable_stack_review_mode(cx);
                         editor.set_allow_git_diff_scrollbar_markers(true, cx);
                         editor.set_minimap_visibility(
                             editor::MinimapVisibility::Enabled {
@@ -287,7 +287,7 @@ impl MultiDiffView {
                     });
                     if let Some(left_editor) = view.left_editor(cx) {
                         left_editor.update(cx, |editor, cx| {
-                            editor.set_stack_review_mode(true, cx);
+                            editor.enable_stack_review_mode(cx);
                             editor.set_allow_git_diff_scrollbar_markers(true, cx);
                         });
                     }

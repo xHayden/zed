@@ -228,14 +228,12 @@ impl Editor {
         cx.notify();
     }
 
-    pub fn set_stack_review_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.is_stack_review = enabled;
-        if enabled {
-            self.enable_lsp_data = false;
-            self.needs_initial_data_update = false;
-            self.enable_runnables = false;
-            self.enable_code_lens = false;
-        }
+    pub fn enable_stack_review_mode(&mut self, cx: &mut Context<Self>) {
+        self.is_stack_review = true;
+        self.enable_lsp_data = false;
+        self.needs_initial_data_update = false;
+        self.enable_runnables = false;
+        self.enable_code_lens = false;
         cx.notify();
     }
 

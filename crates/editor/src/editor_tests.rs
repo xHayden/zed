@@ -40081,7 +40081,7 @@ async fn test_stack_review_mode_is_editor_local(cx: &mut TestAppContext) {
 
     editor.update(cx, |editor, cx| {
         assert!(!editor.is_stack_review());
-        editor.set_stack_review_mode(true, cx);
+        editor.enable_stack_review_mode(cx);
         assert!(editor.is_stack_review());
         assert!(!editor.lsp_data_enabled());
     });
@@ -40121,6 +40121,87 @@ fn add_test_comment(
     cx: &mut Context<Editor>,
 ) -> usize {
     editor.add_review_comment(key, comment.to_string(), Anchor::Min..Anchor::Max, cx)
+}
+
+fn first_custom_block_height(editor: &mut Editor, cx: &mut Context<Editor>) -> u32 {
+    let snapshot = editor.display_snapshot(cx);
+    let max_row = snapshot.max_point().row().next_row();
+    snapshot
+        .blocks_in_range(DisplayRow(0)..max_row)
+        .find_map(|(_, block)| match block {
+            crate::display_map::Block::Custom(_) => Some(block.height()),
+            _ => None,
+        })
+        .expect("review overlay block")
+}
+
+fn reopen_stack_review_test_composer(
+    editor: &mut Editor,
+    prompt_editor: &Entity<Editor>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let overlay = editor
+        .diff_review_overlays
+        .first_mut()
+        .expect("stack review overlay");
+    overlay.composer_visible = true;
+    overlay.pending_reply_to = None;
+    overlay.pending_reply_to_record_id = None;
+    window.focus(&prompt_editor.focus_handle(cx), cx);
+    cx.notify();
+}
+
+fn stack_review_test_instance_selector(
+    prefix: &str,
+    record_id: Option<&str>,
+    id: usize,
+    occurrence: usize,
+) -> &'static str {
+    Box::leak(
+        crate::git::stack_review_comment_instance_debug_selector(prefix, record_id, id, occurrence)
+            .into_boxed_str(),
+    )
+}
+
+fn stack_review_test_reply_meta_selector(
+    record_id: Option<&str>,
+    id: usize,
+    parent_record_id: Option<&str>,
+    parent_id: usize,
+    occurrence: usize,
+) -> &'static str {
+    let identity = crate::git::stack_review_comment_debug_identity(record_id, id);
+    let parent_identity = parent_record_id
+        .map(|record_id| {
+            crate::git::stack_review_comment_debug_identity(Some(record_id), parent_id)
+        })
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let occurrence = format!("occurrence:{occurrence}");
+    Box::leak(
+        crate::git::stack_review_debug_selector(
+            "STACK_REVIEW_REPLY_META",
+            &[&identity, &parent_identity, &occurrence],
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn stack_review_test_selector(prefix: &str, identities: &[&str]) -> &'static str {
+    let tagged = identities
+        .iter()
+        .map(|identity| {
+            if *identity == "unavailable" {
+                (*identity).to_owned()
+            } else if let Ok(id) = identity.parse::<usize>() {
+                crate::git::stack_review_comment_debug_identity(None, id)
+            } else {
+                crate::git::stack_review_comment_debug_identity(Some(identity), 0)
+            }
+        })
+        .collect::<Vec<_>>();
+    let tagged = tagged.iter().map(String::as_str).collect::<Vec<_>>();
+    Box::leak(crate::git::stack_review_debug_selector(prefix, &tagged).into_boxed_str())
 }
 
 #[gpui::test]
@@ -40356,7 +40437,7 @@ fn test_stack_review_cancel_keeps_overlays_with_saved_comments(cx: &mut TestAppC
             let hunk_key = overlay.hunk_key.clone();
             let anchor_range = overlay.anchor_range.clone();
             editor.add_review_comment(hunk_key, "Keep this visible".into(), anchor_range, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             editor.dismiss_menus_and_popups(true, window, cx);
         })
         .unwrap();
@@ -40403,7 +40484,7 @@ fn test_stack_review_submit_keeps_comment_inline_and_hides_composer(cx: &mut Tes
     editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40426,9 +40507,10 @@ fn test_stack_review_submit_keeps_comment_inline_and_hides_composer(cx: &mut Tes
             assert_eq!(comments[0].comment, "Persist inline");
             assert!(!comments[0].created_at.is_empty());
             assert!(!comments[0].resolved);
-            assert!(editor.set_review_comment_resolved(0, true, cx));
+            let record_id = comments[0].record_id.clone().expect("stable record id");
+            assert!(editor.set_stack_review_comment_resolved(&record_id, true, cx));
             assert!(editor.stored_review_comments[0].1[0].resolved);
-            assert!(editor.set_review_comment_resolved(0, false, cx));
+            assert!(editor.set_stack_review_comment_resolved(&record_id, false, cx));
             assert!(!editor.stored_review_comments[0].1[0].resolved);
         })
         .unwrap();
@@ -40442,7 +40524,7 @@ fn test_stack_review_reply_persists_parent_and_author(cx: &mut TestAppContext) {
     editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40451,20 +40533,20 @@ fn test_stack_review_reply_persists_parent_and_author(cx: &mut TestAppContext) {
                 prompt_editor.insert("Parent", window, cx);
             });
             editor.submit_diff_review_comment(window, cx);
-            editor.reply_to_review_comment(
-                &crate::actions::ReplyToReviewComment { id: 0 },
-                window,
-                cx,
-            );
+            let parent_record_id = editor.stored_review_comments[0].1[0]
+                .record_id
+                .clone()
+                .expect("stable parent");
+            editor.reply_to_stack_review_comment(&parent_record_id, window, cx);
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("Reply", window, cx);
             });
             editor.submit_diff_review_comment(window, cx);
-            editor.reply_to_review_comment(
-                &crate::actions::ReplyToReviewComment { id: 1 },
-                window,
-                cx,
-            );
+            let reply_record_id = editor.stored_review_comments[0].1[1]
+                .record_id
+                .clone()
+                .expect("stable reply");
+            editor.reply_to_stack_review_comment(&reply_record_id, window, cx);
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("Nested reply", window, cx);
             });
@@ -40495,22 +40577,30 @@ fn test_stack_review_reply_persists_parent_and_author(cx: &mut TestAppContext) {
                 comments[1].record_id.as_deref()
             );
 
-            let items = crate::git::stack_review_thread_items(comments.clone(), Some(1));
+            let items = crate::git::stack_review_thread_items(
+                comments.clone(),
+                Some(1),
+                comments[1].record_id.as_deref(),
+            );
             assert_eq!(
                 items
                     .iter()
                     .map(|item| match item {
-                        crate::git::StackReviewThreadItem::Comment { comment, depth } => {
+                        crate::git::StackReviewThreadItem::Comment { comment, depth, .. } => {
                             format!("comment:{}:{depth}", comment.id)
                         }
-                        crate::git::StackReviewThreadItem::Composer { depth } => {
+                        crate::git::StackReviewThreadItem::Composer { depth, .. } => {
                             format!("composer:{depth}")
                         }
                     })
                     .collect::<Vec<_>>(),
                 ["comment:0:0", "comment:1:1", "composer:2", "comment:2:2"]
             );
-            assert!(editor.set_review_comment_resolved(2, true, cx));
+            let selected_record_id = comments[2]
+                .record_id
+                .clone()
+                .expect("stable selected record id");
+            assert!(editor.set_stack_review_comment_resolved(&selected_record_id, true, cx,));
             assert!(!editor.stored_review_comments[0].1[0].resolved);
             assert!(!editor.stored_review_comments[0].1[1].resolved);
             assert!(editor.stored_review_comments[0].1[2].resolved);
@@ -40529,7 +40619,7 @@ fn test_disposable_stack_review_editors_create_distinct_stable_comment_ids(
     let left_identity = left_editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40545,7 +40635,7 @@ fn test_disposable_stack_review_editors_create_distinct_stable_comment_ids(
     let right_identity = right_editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40591,6 +40681,579 @@ fn test_non_stack_review_comment_creation_keeps_legacy_numeric_identity(cx: &mut
         .expect("update editor");
 }
 
+#[test]
+fn stack_review_debug_selectors_are_opaque_and_deterministic() {
+    let first = crate::git::stack_review_debug_selector(
+        "STACK_REVIEW_REPLY_META",
+        &["record/id with spaces", "Ada <ada@example.com>"],
+    );
+    let repeated = crate::git::stack_review_debug_selector(
+        "STACK_REVIEW_REPLY_META",
+        &["record/id with spaces", "Ada <ada@example.com>"],
+    );
+    let different = crate::git::stack_review_debug_selector(
+        "STACK_REVIEW_REPLY_META",
+        &["different-record", "Ada <ada@example.com>"],
+    );
+
+    assert_eq!(first, repeated);
+    assert_ne!(first, different);
+    assert!(first.starts_with("STACK_REVIEW_REPLY_META-"));
+    assert!(!first.contains("record/id with spaces"));
+    assert!(!first.contains("Ada"));
+    assert!(!first.contains("example.com"));
+}
+
+#[test]
+fn stack_review_stable_and_legacy_debug_identities_are_namespaced() {
+    let stable_identity = crate::git::stack_review_comment_debug_identity(Some("7"), 7);
+    let legacy_identity = crate::git::stack_review_comment_debug_identity(None, 7);
+    assert_ne!(stable_identity, legacy_identity);
+
+    let stable_selector =
+        crate::git::stack_review_debug_selector("STACK_REVIEW_COMMENT_ROW", &[&stable_identity]);
+    let legacy_selector =
+        crate::git::stack_review_debug_selector("STACK_REVIEW_COMMENT_ROW", &[&legacy_identity]);
+    assert_ne!(stable_selector, legacy_selector);
+    assert!(!stable_selector.contains("stable:7"));
+    assert!(!legacy_selector.contains("legacy:7"));
+}
+
+#[test]
+fn stack_review_duplicate_comments_get_distinct_instance_selectors() {
+    let stable_first = crate::git::stack_review_comment_instance_debug_selector(
+        "STACK_REVIEW_COMMENT_ROW",
+        Some("duplicate"),
+        7,
+        0,
+    );
+    let stable_second = crate::git::stack_review_comment_instance_debug_selector(
+        "STACK_REVIEW_COMMENT_ROW",
+        Some("duplicate"),
+        8,
+        1,
+    );
+    assert_ne!(stable_first, stable_second);
+
+    let legacy_first = crate::git::stack_review_comment_instance_debug_selector(
+        "STACK_REVIEW_COMMENT_ROW",
+        None,
+        7,
+        0,
+    );
+    let legacy_second = crate::git::stack_review_comment_instance_debug_selector(
+        "STACK_REVIEW_COMMENT_ROW",
+        None,
+        7,
+        1,
+    );
+    assert_ne!(legacy_first, legacy_second);
+    for selector in [stable_first, stable_second, legacy_first, legacy_second] {
+        assert!(!selector.contains("duplicate"));
+        assert!(!selector.contains("stable:"));
+        assert!(!selector.contains("legacy:"));
+    }
+}
+
+#[gpui::test]
+fn test_stack_review_deep_chain_renders_flat_with_direct_parent_metadata(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        editor.enable_stack_review_mode(cx);
+        let prompt_editor = editor
+            .diff_review_prompt_editor()
+            .cloned()
+            .expect("review prompt");
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.insert("Root", window, cx);
+        });
+        editor.submit_diff_review_comment(window, cx);
+
+        let comments = &mut editor.stored_review_comments[0].1;
+        comments[0].id = 0;
+        comments[0].record_id = Some("record-00".into());
+        comments[0].author.name = "Author 00".into();
+        comments[0].reply_to = None;
+        comments[0].reply_to_record_id = None;
+        let template = comments[0].clone();
+        for level in 1..=20 {
+            let mut comment = template.clone();
+            comment.id = level;
+            comment.record_id = Some(format!("record-{level:02}"));
+            comment.comment = format!("Comment {level}");
+            comment.author.name = format!("Author {level:02}");
+            comment.reply_to = Some(level - 1);
+            comment.reply_to_record_id = Some(format!("record-{:02}", level - 1));
+            comments.push(comment);
+        }
+        cx.notify();
+    });
+
+    cx.run_until_parked();
+
+    let root_bounds = cx
+        .debug_bounds(stack_review_test_instance_selector(
+            "STACK_REVIEW_COMMENT_CONTENT",
+            Some("record-00"),
+            0,
+            0,
+        ))
+        .expect("root comment content must render");
+    let deepest_bounds = cx
+        .debug_bounds(stack_review_test_instance_selector(
+            "STACK_REVIEW_COMMENT_CONTENT",
+            Some("record-20"),
+            20,
+            20,
+        ))
+        .expect("deepest comment content must render");
+    assert_eq!(root_bounds.left(), deepest_bounds.left());
+    assert_eq!(root_bounds.size.width, deepest_bounds.size.width);
+    assert!(
+        cx.debug_bounds(stack_review_test_reply_meta_selector(
+            Some("record-20"),
+            20,
+            Some("record-19"),
+            19,
+            20,
+        ))
+        .is_some(),
+        "deep reply metadata must name its exact direct stable parent"
+    );
+}
+
+#[gpui::test]
+fn test_stack_review_reply_composer_renders_full_width_with_target_metadata(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        editor.enable_stack_review_mode(cx);
+        let prompt_editor = editor
+            .diff_review_prompt_editor()
+            .cloned()
+            .expect("review prompt");
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.insert("Root", window, cx);
+        });
+        editor.submit_diff_review_comment(window, cx);
+        {
+            let root = &mut editor.stored_review_comments[0].1[0];
+            root.record_id = Some("stable-root".into());
+            root.author.name = "Ada".into();
+        }
+        editor.reply_to_stack_review_comment("stable-root", window, cx);
+    });
+
+    cx.run_until_parked();
+
+    let row_bounds = cx
+        .debug_bounds(stack_review_test_instance_selector(
+            "STACK_REVIEW_COMMENT_ROW",
+            Some("stable-root"),
+            0,
+            0,
+        ))
+        .expect("target row must render");
+    let composer_bounds = cx
+        .debug_bounds("STACK_REVIEW_REPLY_COMPOSER")
+        .expect("reply composer must render");
+    assert_eq!(row_bounds.left(), composer_bounds.left());
+    assert_eq!(row_bounds.size.width, composer_bounds.size.width);
+    assert!(
+        cx.debug_bounds(stack_review_test_selector(
+            "STACK_REVIEW_REPLY_COMPOSER_META",
+            &["stable-root"],
+        ))
+        .is_some(),
+        "reply composer must identify its exact target without indentation"
+    );
+}
+
+#[gpui::test]
+fn test_stack_review_reply_routes_by_stable_record_when_numeric_ids_collide(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.enable_stack_review_mode(cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            for body in ["First", "Second"] {
+                reopen_stack_review_test_composer(editor, &prompt_editor, window, cx);
+                prompt_editor.update(cx, |prompt_editor, cx| {
+                    prompt_editor.insert(body, window, cx);
+                });
+                editor.submit_diff_review_comment(window, cx);
+            }
+            let comments = &mut editor.stored_review_comments[0].1;
+            comments[0].id = 7;
+            comments[0].record_id = Some("stable-first".into());
+            comments[1].id = 7;
+            comments[1].record_id = Some("stable-second".into());
+
+            editor.reply_to_stack_review_comment("stable-second", window, cx);
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Exact reply", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            assert!(editor.focus_handle(cx).is_focused(window));
+        })
+        .expect("update editor");
+
+    editor
+        .update(cx, |editor, _window, _cx| {
+            let reply = editor.stored_review_comments[0]
+                .1
+                .last()
+                .expect("submitted reply");
+            assert_eq!(reply.reply_to, Some(7));
+            assert_eq!(reply.reply_to_record_id.as_deref(), Some("stable-second"));
+        })
+        .expect("read editor");
+}
+
+#[gpui::test]
+fn test_toggle_active_stack_review_resolution_uses_stable_identity(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let editor = cx.add_window({
+        let events = events.clone();
+        move |window, cx| {
+            let entity = cx.entity();
+            cx.subscribe_in(&entity, window, move |_, _, event: &EditorEvent, _, _| {
+                if let EditorEvent::StackReviewCommentResolutionChanged {
+                    record_ids,
+                    resolved,
+                } = event
+                {
+                    events.borrow_mut().push((record_ids.clone(), *resolved));
+                }
+            })
+            .detach();
+            Editor::single_line(window, cx)
+        }
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.enable_stack_review_mode(cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            for body in ["First", "Second"] {
+                reopen_stack_review_test_composer(editor, &prompt_editor, window, cx);
+                prompt_editor.update(cx, |prompt_editor, cx| {
+                    prompt_editor.insert(body, window, cx);
+                });
+                editor.submit_diff_review_comment(window, cx);
+            }
+            let comments = &mut editor.stored_review_comments[0].1;
+            comments[0].id = 7;
+            comments[0].record_id = Some("stable-first".into());
+            comments[1].id = 7;
+            comments[1].record_id = Some("stable-second".into());
+
+            editor.toggle_active_review_comment_resolved(
+                &crate::actions::ToggleActiveReviewCommentResolved,
+                window,
+                cx,
+            );
+            assert!(editor.stored_review_comments[0].1[0].resolved);
+            assert!(!editor.stored_review_comments[0].1[1].resolved);
+        })
+        .expect("update editor");
+
+    assert_eq!(
+        mem::take(&mut *events.borrow_mut()),
+        [(vec!["stable-first".to_owned()], true)]
+    );
+}
+
+#[gpui::test]
+fn test_stack_review_mutations_route_by_stable_record_when_numeric_ids_collide(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.enable_stack_review_mode(cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            for body in ["First", "Second"] {
+                reopen_stack_review_test_composer(editor, &prompt_editor, window, cx);
+                prompt_editor.update(cx, |prompt_editor, cx| {
+                    prompt_editor.insert(body, window, cx);
+                });
+                editor.submit_diff_review_comment(window, cx);
+            }
+            let comments = &mut editor.stored_review_comments[0].1;
+            comments[0].id = 7;
+            comments[0].record_id = Some("stable-first".into());
+            comments[1].id = 7;
+            comments[1].record_id = Some("stable-second".into());
+
+            assert!(editor.set_stack_review_comment_resolved("stable-second", true, cx));
+            assert!(!editor.stored_review_comments[0].1[0].resolved);
+            assert!(editor.stored_review_comments[0].1[1].resolved);
+
+            editor.edit_stack_review_comment("stable-second", window, cx);
+            assert!(!editor.stored_review_comments[0].1[0].is_editing);
+            assert!(editor.stored_review_comments[0].1[1].is_editing);
+            editor.cancel_stack_review_comment_edit("stable-second", window, cx);
+
+            editor.delete_stack_review_comment("stable-second", window, cx);
+            assert_eq!(editor.stored_review_comments[0].1.len(), 1);
+            assert_eq!(
+                editor.stored_review_comments[0].1[0].record_id.as_deref(),
+                Some("stable-first")
+            );
+        })
+        .expect("update editor");
+}
+
+#[gpui::test]
+fn test_non_stack_review_reply_composer_keeps_legacy_inset_and_metadata_free(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        let prompt_editor = editor
+            .diff_review_prompt_editor()
+            .cloned()
+            .expect("review prompt");
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.insert("Ordinary diff review", window, cx);
+        });
+        editor.submit_diff_review_comment(window, cx);
+        editor.reply_to_review_comment(&crate::actions::ReplyToReviewComment { id: 0 }, window, cx);
+    });
+    cx.run_until_parked();
+
+    let row_bounds = cx
+        .debug_bounds(stack_review_test_selector(
+            "STACK_REVIEW_COMMENT_ROW",
+            &["0"],
+        ))
+        .expect("ordinary comment row");
+    let composer_bounds = cx
+        .debug_bounds("STACK_REVIEW_REPLY_COMPOSER")
+        .expect("ordinary reply composer");
+    assert!(composer_bounds.left() > row_bounds.left());
+    assert!(composer_bounds.size.width < row_bounds.size.width);
+    assert!(
+        cx.debug_bounds(stack_review_test_selector(
+            "STACK_REVIEW_REPLY_COMPOSER_META",
+            &["0"],
+        ))
+        .is_none(),
+        "ordinary diff review must not gain Stack Review target metadata"
+    );
+}
+
+#[gpui::test]
+fn test_stack_review_degraded_parent_links_render_safe_metadata(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        editor.enable_stack_review_mode(cx);
+        let prompt_editor = editor
+            .diff_review_prompt_editor()
+            .cloned()
+            .expect("review prompt");
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.insert("First", window, cx);
+        });
+        editor.submit_diff_review_comment(window, cx);
+
+        let comments = &mut editor.stored_review_comments[0].1;
+        comments[0].id = 0;
+        comments[0].record_id = Some("duplicate-parent".into());
+        comments[0].author.name = "First".into();
+        let template = comments[0].clone();
+
+        let mut duplicate_parent = template.clone();
+        duplicate_parent.id = 1;
+        duplicate_parent.author.name = "Second".into();
+        comments.push(duplicate_parent);
+
+        let mut ambiguous_child = template.clone();
+        ambiguous_child.id = 2;
+        ambiguous_child.record_id = Some("ambiguous-child".into());
+        ambiguous_child.reply_to = Some(0);
+        ambiguous_child.reply_to_record_id = Some("duplicate-parent".into());
+        comments.push(ambiguous_child);
+
+        let mut missing_child = template;
+        missing_child.id = 3;
+        missing_child.record_id = Some("missing-child".into());
+        missing_child.reply_to = Some(99);
+        missing_child.reply_to_record_id = Some("does-not-exist".into());
+        comments.push(missing_child);
+
+        let mut stable_legacy_hint = comments[0].clone();
+        stable_legacy_hint.id = 4;
+        stable_legacy_hint.record_id = Some("stable-legacy-hint".into());
+        stable_legacy_hint.reply_to = Some(0);
+        stable_legacy_hint.reply_to_record_id = None;
+        comments.push(stable_legacy_hint);
+
+        editor.reply_to_review_comment(&crate::actions::ReplyToReviewComment { id: 0 }, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds(stack_review_test_reply_meta_selector(
+            Some("ambiguous-child"),
+            2,
+            None,
+            0,
+            0,
+        ))
+        .is_some()
+    );
+    assert!(
+        cx.debug_bounds(stack_review_test_reply_meta_selector(
+            Some("missing-child"),
+            3,
+            None,
+            0,
+            3,
+        ))
+        .is_some()
+    );
+    assert!(
+        cx.debug_bounds(stack_review_test_reply_meta_selector(
+            Some("stable-legacy-hint"),
+            4,
+            None,
+            0,
+            4,
+        ))
+        .is_some()
+    );
+    assert!(
+        cx.debug_bounds(stack_review_test_selector(
+            "STACK_REVIEW_REPLY_COMPOSER_META",
+            &["unavailable"],
+        ))
+        .is_none(),
+        "ambiguous stable targets must not open a reply composer"
+    );
+}
+
+#[gpui::test]
+fn test_stack_review_overlay_remeasures_wrapped_content_and_visibility_at_actual_widths(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+    let editor_entity_id = editor.entity_id();
+    cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(800.)));
+
+    let comment_id = editor.update_in(cx, |editor, window, cx| {
+        editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        editor.enable_stack_review_mode(cx);
+        let prompt_editor = editor
+            .diff_review_prompt_editor()
+            .cloned()
+            .expect("review prompt");
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.insert(&"wrapped Stack Review body text ".repeat(12), window, cx);
+        });
+        editor.submit_diff_review_comment(window, cx);
+        editor.stored_review_comments[0].1[0].id
+    });
+    cx.run_until_parked();
+    let wide_height = editor.update(cx, first_custom_block_height);
+
+    cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(800.)));
+    cx.run_until_parked();
+    let narrow_height = editor.update(cx, first_custom_block_height);
+    assert!(
+        narrow_height > wide_height,
+        "actual 360px width must wrap to more block rows than 1000px width: {narrow_height} <= {wide_height}"
+    );
+
+    cx.simulate_resize(gpui::size(gpui::px(1000.), gpui::px(800.)));
+    editor.update(cx, |editor, cx| {
+        assert!(editor.update_review_comment(
+            comment_id,
+            "substantially longer replacement body ".repeat(60),
+            cx,
+        ));
+    });
+    cx.run_until_parked();
+    let edited_height = editor.update(cx, first_custom_block_height);
+    assert!(edited_height > wide_height);
+
+    editor.update_in(cx, |editor, window, cx| {
+        let record_id = editor
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .find(|comment| comment.id == comment_id)
+            .and_then(|comment| comment.record_id.clone())
+            .expect("stable comment");
+        editor.reply_to_stack_review_comment(&record_id, window, cx);
+    });
+    cx.run_until_parked();
+    let composer_height = editor.update(cx, first_custom_block_height);
+    assert!(composer_height > edited_height);
+
+    editor.update_in(cx, |editor, window, cx| {
+        assert!(editor.dismiss_stack_review_comment_composers(window, cx));
+        assert!(editor.focus_handle(cx).is_focused(window));
+    });
+    cx.run_until_parked();
+    assert_eq!(editor.update(cx, first_custom_block_height), edited_height);
+    assert_eq!(editor.entity_id(), editor_entity_id);
+}
+
 #[gpui::test]
 fn test_stack_review_thread_items_prefer_stable_identity_over_reused_numeric_ids(
     cx: &mut TestAppContext,
@@ -40601,12 +41264,13 @@ fn test_stack_review_thread_items_prefer_stable_identity_over_reused_numeric_ids
     editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
                 .expect("review prompt");
             for body in ["Root", "Child", "Other root"] {
+                reopen_stack_review_test_composer(editor, &prompt_editor, window, cx);
                 prompt_editor.update(cx, |prompt_editor, cx| {
                     prompt_editor.insert(body, window, cx);
                 });
@@ -40627,7 +41291,7 @@ fn test_stack_review_thread_items_prefer_stable_identity_over_reused_numeric_ids
             comments[2].reply_to = None;
             comments[2].reply_to_record_id = None;
 
-            let record_ids = crate::git::stack_review_thread_items(comments, None)
+            let record_ids = crate::git::stack_review_thread_items(comments, None, None)
                 .into_iter()
                 .filter_map(|item| match item {
                     crate::git::StackReviewThreadItem::Comment { comment, .. } => comment.record_id,
@@ -40638,6 +41302,74 @@ fn test_stack_review_thread_items_prefer_stable_identity_over_reused_numeric_ids
             assert_eq!(record_ids, ["stable-root", "stable-child", "stable-other"]);
         })
         .expect("update editor");
+}
+
+#[gpui::test]
+fn test_stack_review_legacy_numeric_parent_does_not_bind_a_stable_comment(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let editor = cx.add_window({
+        let events = events.clone();
+        move |window, cx| {
+            let entity = cx.entity();
+            cx.subscribe_in(
+                &entity,
+                window,
+                move |_, _, event: &EditorEvent, _, _| match event {
+                    EditorEvent::StackReviewCommentResolutionChanged { record_ids, .. } => {
+                        events.borrow_mut().push(format!("stable:{record_ids:?}"));
+                    }
+                    EditorEvent::ReviewCommentResolutionChanged { ids, .. } => {
+                        events.borrow_mut().push(format!("legacy:{ids:?}"));
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+            Editor::single_line(window, cx)
+        }
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.enable_stack_review_mode(cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            for body in ["Stable", "Legacy"] {
+                reopen_stack_review_test_composer(editor, &prompt_editor, window, cx);
+                prompt_editor.update(cx, |prompt_editor, cx| {
+                    prompt_editor.insert(body, window, cx);
+                });
+                editor.submit_diff_review_comment(window, cx);
+            }
+            let comments = &mut editor.stored_review_comments[0].1;
+            comments[0].id = 7;
+            comments[0].record_id = Some("stable-7".into());
+            comments[1].id = 8;
+            comments[1].record_id = None;
+            comments[1].reply_to = Some(7);
+            comments[1].reply_to_record_id = None;
+
+            let thread_items = crate::git::stack_review_thread_items(comments.clone(), None, None);
+            assert!(thread_items.iter().any(|item| matches!(
+                item,
+                crate::git::StackReviewThreadItem::Comment {
+                    comment,
+                    reply_metadata: Some(crate::git::StackReviewReplyMetadata::Unavailable),
+                    ..
+                } if comment.id == 8
+            )));
+
+            assert!(editor.set_review_comment_resolved(8, true, cx));
+            assert!(!editor.stored_review_comments[0].1[0].resolved);
+            assert!(editor.stored_review_comments[0].1[1].resolved);
+        })
+        .expect("update editor");
+
+    assert_eq!(mem::take(&mut *events.borrow_mut()), ["legacy:[8]"]);
 }
 
 #[gpui::test]
@@ -40674,7 +41406,7 @@ fn test_stack_review_mixed_resolution_routes_stable_and_legacy_members_separatel
     editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40683,18 +41415,18 @@ fn test_stack_review_mixed_resolution_routes_stable_and_legacy_members_separatel
                 prompt_editor.insert("Stable root", window, cx);
             });
             editor.submit_diff_review_comment(window, cx);
-            editor.reply_to_review_comment(
-                &crate::actions::ReplyToReviewComment { id: 0 },
-                window,
-                cx,
-            );
+            let root_record_id = editor.stored_review_comments[0].1[0]
+                .record_id
+                .clone()
+                .expect("stable root");
+            editor.reply_to_stack_review_comment(&root_record_id, window, cx);
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("Legacy child", window, cx);
             });
             editor.submit_diff_review_comment(window, cx);
             editor.stored_review_comments[0].1[0].record_id = Some("stable-root".into());
             editor.stored_review_comments[0].1[1].record_id = None;
-            editor.stored_review_comments[0].1[1].reply_to_record_id = None;
+            editor.stored_review_comments[0].1[1].reply_to_record_id = Some("stable-root".into());
 
             assert!(editor.set_review_comment_resolved(1, true, cx));
         })
@@ -40731,7 +41463,7 @@ fn test_stack_review_resolution_event_uses_stable_record_ids(cx: &mut TestAppCon
     editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40741,7 +41473,7 @@ fn test_stack_review_resolution_event_uses_stable_record_ids(cx: &mut TestAppCon
             });
             editor.submit_diff_review_comment(window, cx);
             editor.stored_review_comments[0].1[0].record_id = Some("record-a".into());
-            assert!(editor.set_review_comment_resolved(0, true, cx));
+            assert!(editor.set_stack_review_comment_resolved("record-a", true, cx));
         })
         .expect("update editor");
 
@@ -40778,7 +41510,7 @@ fn test_stack_review_stable_resolution_emits_seed_without_local_cycle_walk(
     let record_id = editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40787,15 +41519,15 @@ fn test_stack_review_stable_resolution_emits_seed_without_local_cycle_walk(
                 prompt_editor.insert("Stable cycle member", window, cx);
             });
             editor.submit_diff_review_comment(window, cx);
-            let (comment_id, record_id) = {
+            let record_id = {
                 let comment = &mut editor.stored_review_comments[0].1[0];
                 let record_id = comment.record_id.clone().expect("stable record id");
                 comment.reply_to = Some(comment.id);
                 comment.reply_to_record_id = Some(record_id.clone());
-                (comment.id, record_id)
+                record_id
             };
 
-            assert!(editor.set_review_comment_resolved(comment_id, true, cx));
+            assert!(editor.set_stack_review_comment_resolved(&record_id, true, cx));
             record_id
         })
         .expect("update editor");
@@ -40807,6 +41539,77 @@ fn test_stack_review_stable_resolution_emits_seed_without_local_cycle_walk(
 }
 
 #[gpui::test]
+fn test_stack_review_checkpoint_requests_require_exact_identity(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let editor = cx.add_window({
+        let events = events.clone();
+        move |window, cx| {
+            let entity = cx.entity();
+            cx.subscribe_in(
+                &entity,
+                window,
+                move |_, _, event: &EditorEvent, _, _| match event {
+                    EditorEvent::StackReviewCommentCheckpointRequested { record_id } => {
+                        events.borrow_mut().push(format!("stable:{record_id}"));
+                    }
+                    EditorEvent::ReviewCommentCheckpointRequested { id } => {
+                        events.borrow_mut().push(format!("legacy:{id}"));
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+            Editor::single_line(window, cx)
+        }
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.enable_stack_review_mode(cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            for body in ["Stable", "Duplicate stable", "Legacy", "Duplicate legacy"] {
+                reopen_stack_review_test_composer(editor, &prompt_editor, window, cx);
+                prompt_editor.update(cx, |prompt_editor, cx| {
+                    prompt_editor.insert(body, window, cx);
+                });
+                editor.submit_diff_review_comment(window, cx);
+            }
+            let comments = &mut editor.stored_review_comments[0].1;
+            comments[0].id = 7;
+            comments[0].record_id = Some("stable-a".into());
+            comments[0].source = ::git::stack_review::StackReviewCommentSource::Github;
+            comments[1].id = 8;
+            comments[1].record_id = Some("stable-b".into());
+            comments[1].source = ::git::stack_review::StackReviewCommentSource::Github;
+            comments[2].id = 9;
+            comments[2].record_id = None;
+            comments[2].source = ::git::stack_review::StackReviewCommentSource::Github;
+            comments[3].id = 10;
+            comments[3].record_id = None;
+            comments[3].source = ::git::stack_review::StackReviewCommentSource::Github;
+
+            editor.request_stack_review_comment_checkpoint(Some("stable-a"), 7, cx);
+            editor.request_stack_review_comment_checkpoint(None, 9, cx);
+
+            editor.stored_review_comments[0].1[1].record_id = Some("stable-a".into());
+            editor.stored_review_comments[0].1[3].id = 9;
+            editor.request_stack_review_comment_checkpoint(Some("stable-a"), 7, cx);
+            editor.request_stack_review_comment_checkpoint(None, 9, cx);
+        })
+        .expect("update editor");
+
+    assert_eq!(
+        mem::take(&mut *events.borrow_mut()),
+        ["stable:stable-a", "legacy:9"]
+    );
+}
+
+#[gpui::test]
 fn test_stack_review_checkpoint_event_uses_stable_record_id(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
@@ -40814,7 +41617,7 @@ fn test_stack_review_checkpoint_event_uses_stable_record_id(cx: &mut TestAppCont
     let event = editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40860,7 +41663,7 @@ fn test_stack_review_legacy_resolution_event_uses_exact_numeric_thread_members(
     editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
@@ -40869,11 +41672,11 @@ fn test_stack_review_legacy_resolution_event_uses_exact_numeric_thread_members(
                 prompt_editor.insert("Legacy root", window, cx);
             });
             editor.submit_diff_review_comment(window, cx);
-            editor.reply_to_review_comment(
-                &crate::actions::ReplyToReviewComment { id: 0 },
-                window,
-                cx,
-            );
+            let root_record_id = editor.stored_review_comments[0].1[0]
+                .record_id
+                .clone()
+                .expect("stable root before legacy migration");
+            editor.reply_to_stack_review_comment(&root_record_id, window, cx);
             prompt_editor.update(cx, |prompt_editor, cx| {
                 prompt_editor.insert("Legacy child", window, cx);
             });
@@ -40898,7 +41701,7 @@ fn test_stack_review_legacy_checkpoint_event_uses_numeric_id(cx: &mut TestAppCon
     let event = editor
         .update(cx, |editor, window, cx| {
             editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
-            editor.set_stack_review_mode(true, cx);
+            editor.enable_stack_review_mode(cx);
             let prompt_editor = editor
                 .diff_review_prompt_editor()
                 .cloned()
