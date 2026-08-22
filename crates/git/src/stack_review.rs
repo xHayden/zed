@@ -11,6 +11,14 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const REVIEW_STATE_SCHEMA_VERSION: u32 = 1;
 const COMMENT_SCHEMA_VERSION: u32 = 1;
 const CURRENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const PRESENTATION_STATE_SCHEMA_VERSION: u32 = 1;
+pub const STACK_REVIEW_REVIEW_BINDING_KEY: &str = "review";
+const STACK_REVIEW_COMMENT_BINDING_PREFIX: &str = "comment:";
+
+pub fn stack_review_storage_key(base_oid: &str, head_oid: &str) -> String {
+    format!("{base_oid}-{head_oid}")
+        .replace(|character: char| !character.is_ascii_alphanumeric(), "_")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,6 +366,184 @@ impl CommentThreadKey {
     pub fn from_stable_string(serialized: &str) -> Result<Self> {
         Ok(serde_json::from_str(serialized)?)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StackReviewPresentationState {
+    schema_version: u32,
+    pub base_oid: String,
+    pub head_oid: String,
+    #[serde(default)]
+    stashed_thread_roots: BTreeSet<String>,
+    #[serde(default)]
+    ai_thread_bindings: BTreeMap<String, String>,
+}
+
+impl StackReviewPresentationState {
+    pub fn new(base_oid: impl Into<String>, head_oid: impl Into<String>) -> Self {
+        Self {
+            schema_version: PRESENTATION_STATE_SCHEMA_VERSION,
+            base_oid: base_oid.into(),
+            head_oid: head_oid.into(),
+            stashed_thread_roots: BTreeSet::new(),
+            ai_thread_bindings: BTreeMap::new(),
+        }
+    }
+
+    pub fn from_json(contents: &str, base_oid: &str, head_oid: &str) -> Result<Self> {
+        let state: Self = serde_json::from_str(contents)?;
+        state.validate(base_oid, head_oid)?;
+        Ok(state)
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        self.validate(&self.base_oid, &self.head_oid)?;
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    fn validate(&self, base_oid: &str, head_oid: &str) -> Result<()> {
+        if self.schema_version != PRESENTATION_STATE_SCHEMA_VERSION {
+            bail!(
+                "unsupported presentation-state schema {}",
+                self.schema_version
+            );
+        }
+        if self.base_oid != base_oid || self.head_oid != head_oid {
+            bail!("presentation state does not match the selected Git snapshot");
+        }
+        for serialized_root in &self.stashed_thread_roots {
+            validate_serialized_comment_thread_key(serialized_root, base_oid, head_oid)
+                .context("invalid stashed comment thread root")?;
+        }
+        for (binding_key, session_id) in &self.ai_thread_bindings {
+            validate_ai_thread_session_id(session_id)?;
+            validate_ai_thread_binding_key(binding_key, base_oid, head_oid)?;
+        }
+        Ok(())
+    }
+
+    pub fn stash_root(&mut self, root: &CommentThreadKey) -> Result<bool> {
+        let root = self.serialized_root(root)?;
+        Ok(self.stashed_thread_roots.insert(root))
+    }
+
+    pub fn restore_root(&mut self, root: &CommentThreadKey) -> Result<bool> {
+        let root = self.serialized_root(root)?;
+        Ok(self.stashed_thread_roots.remove(&root))
+    }
+
+    pub fn is_stashed(&self, root: &CommentThreadKey) -> Result<bool> {
+        let root = self.serialized_root(root)?;
+        Ok(self.stashed_thread_roots.contains(&root))
+    }
+
+    fn serialized_root(&self, root: &CommentThreadKey) -> Result<String> {
+        let root = root.to_stable_string()?;
+        validate_serialized_comment_thread_key(&root, &self.base_oid, &self.head_oid)?;
+        Ok(root)
+    }
+
+    pub fn stashed_roots(&self) -> Result<Vec<CommentThreadKey>> {
+        self.stashed_thread_roots
+            .iter()
+            .map(|root| {
+                validate_serialized_comment_thread_key(root, &self.base_oid, &self.head_oid)
+            })
+            .collect()
+    }
+
+    pub fn bind_thread(
+        &mut self,
+        binding_key: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Result<Option<String>> {
+        let binding_key = binding_key.into();
+        let session_id = session_id.into();
+        validate_ai_thread_binding_key(&binding_key, &self.base_oid, &self.head_oid)?;
+        validate_ai_thread_session_id(&session_id)?;
+        Ok(self.ai_thread_bindings.insert(binding_key, session_id))
+    }
+
+    pub fn unbind_thread(&mut self, binding_key: &str) -> Result<Option<String>> {
+        validate_ai_thread_binding_key(binding_key, &self.base_oid, &self.head_oid)?;
+        Ok(self.ai_thread_bindings.remove(binding_key))
+    }
+
+    pub fn binding(&self, binding_key: &str) -> Result<Option<&str>> {
+        validate_ai_thread_binding_key(binding_key, &self.base_oid, &self.head_oid)?;
+        Ok(self.ai_thread_bindings.get(binding_key).map(String::as_str))
+    }
+}
+
+fn validate_serialized_comment_thread_key(
+    serialized: &str,
+    base_oid: &str,
+    head_oid: &str,
+) -> Result<CommentThreadKey> {
+    let key = CommentThreadKey::from_stable_string(serialized)?;
+    if key.to_stable_string()? != serialized {
+        bail!("comment thread key is not canonical");
+    }
+    let (partition, identifier) = match &key {
+        CommentThreadKey::Normal {
+            partition,
+            root_record_id,
+        } => (partition, root_record_id),
+        CommentThreadKey::MissingParent {
+            partition,
+            missing_parent_id,
+        } => (partition, missing_parent_id),
+        CommentThreadKey::BoundaryViolation {
+            partition,
+            foreign_parent_id,
+        } => (partition, foreign_parent_id),
+        CommentThreadKey::Cycle {
+            partition,
+            canonical_member_id,
+        } => (partition, canonical_member_id),
+    };
+    if identifier.trim().is_empty() {
+        bail!("comment thread key identifier is empty");
+    }
+    if partition.storage_key.trim().is_empty() {
+        bail!("comment thread partition storage key is empty");
+    }
+    if partition.base_oid != base_oid || partition.head_oid != head_oid {
+        bail!("comment thread key does not match the snapshot");
+    }
+    if partition.storage_key != stack_review_storage_key(base_oid, head_oid) {
+        bail!("comment thread key does not match the storage key");
+    }
+    match (partition.side, partition.class, partition.path.as_deref()) {
+        (
+            StackReviewCommentSide::Left | StackReviewCommentSide::Right,
+            StackReviewCommentClass::Inline,
+            Some(path),
+        ) if !path.trim().is_empty() => {}
+        (StackReviewCommentSide::TopLevel, StackReviewCommentClass::TopLevel, None) => {}
+        _ => bail!("invalid comment thread partition"),
+    }
+    Ok(key)
+}
+
+fn validate_ai_thread_binding_key(binding_key: &str, base_oid: &str, head_oid: &str) -> Result<()> {
+    if binding_key == STACK_REVIEW_REVIEW_BINDING_KEY {
+        return Ok(());
+    }
+    let serialized_key = binding_key
+        .strip_prefix(STACK_REVIEW_COMMENT_BINDING_PREFIX)
+        .context("invalid AI thread binding key")?;
+    validate_serialized_comment_thread_key(serialized_key, base_oid, head_oid)
+        .context("invalid AI thread binding key")?;
+    Ok(())
+}
+
+fn validate_ai_thread_session_id(session_id: &str) -> Result<()> {
+    if session_id.trim().is_empty() {
+        bail!("AI thread session ID is empty");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1311,6 +1497,408 @@ mod tests {
             reply_to.map(str::to_owned),
             created_at.to_owned(),
         )
+    }
+
+    fn presentation_thread_key(root_record_id: &str) -> CommentThreadKey {
+        CommentThreadKey::Normal {
+            partition: CommentThreadPartition {
+                storage_key: stack_review_storage_key("base", "head"),
+                base_oid: "base".into(),
+                head_oid: "head".into(),
+                path: Some("src/lib.rs".into()),
+                side: StackReviewCommentSide::Right,
+                class: StackReviewCommentClass::Inline,
+            },
+            root_record_id: root_record_id.into(),
+        }
+    }
+
+    #[test]
+    fn presentation_state_round_trip_is_deterministic_and_deduplicates_roots() {
+        let root_a = presentation_thread_key("a")
+            .to_stable_string()
+            .expect("serialize root a");
+        let root_z = presentation_thread_key("z")
+            .to_stable_string()
+            .expect("serialize root z");
+        let contents = serde_json::json!({
+            "schemaVersion": 1,
+            "baseOid": "base",
+            "headOid": "head",
+            "stashedThreadRoots": [root_z, root_a, root_a],
+            "aiThreadBindings": {
+                format!("comment:{root_z}"): "session-z",
+                "review": "session-review",
+                format!("comment:{root_a}"): "session-a"
+            }
+        })
+        .to_string();
+
+        let state = StackReviewPresentationState::from_json(&contents, "base", "head")
+            .expect("load presentation state");
+        let serialized = state.to_json().expect("serialize presentation state");
+        let reopened = StackReviewPresentationState::from_json(&serialized, "base", "head")
+            .expect("reopen presentation state");
+        let value: serde_json::Value =
+            serde_json::from_str(&serialized).expect("parse serialized presentation state");
+        let mut expected_roots = vec![root_a, root_z];
+        expected_roots.sort();
+
+        assert_eq!(reopened, state);
+        assert_eq!(reopened.to_json().expect("reserialize state"), serialized);
+        assert_eq!(
+            value["stashedThreadRoots"],
+            serde_json::to_value(expected_roots).expect("serialize expected roots")
+        );
+    }
+
+    #[test]
+    fn presentation_state_defaults_absent_v1_collections() {
+        let state = StackReviewPresentationState::from_json(
+            r#"{
+                "schemaVersion": 1,
+                "baseOid": "base",
+                "headOid": "head"
+            }"#,
+            "base",
+            "head",
+        )
+        .expect("load legacy presentation state");
+
+        assert_eq!(state, StackReviewPresentationState::new("base", "head"));
+        assert!(
+            state
+                .stashed_roots()
+                .expect("list stashed roots")
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .binding(STACK_REVIEW_REVIEW_BINDING_KEY)
+                .expect("review binding"),
+            None
+        );
+    }
+
+    #[test]
+    fn presentation_state_rejects_unknown_schema_versions() {
+        let error = StackReviewPresentationState::from_json(
+            r#"{
+                "schemaVersion": 2,
+                "baseOid": "base",
+                "headOid": "head"
+            }"#,
+            "base",
+            "head",
+        )
+        .expect_err("unknown presentation-state schema must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported presentation-state schema 2")
+        );
+    }
+
+    #[test]
+    fn presentation_state_rejects_unknown_fields() {
+        let error = StackReviewPresentationState::from_json(
+            r#"{
+                "schemaVersion": 1,
+                "baseOid": "base",
+                "headOid": "head",
+                "selectedContext": "stale-comment"
+            }"#,
+            "base",
+            "head",
+        )
+        .expect_err("unknown presentation-state fields must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `selectedContext`")
+        );
+    }
+
+    #[test]
+    fn presentation_state_rejects_a_different_snapshot() {
+        let error = StackReviewPresentationState::from_json(
+            r#"{
+                "schemaVersion": 1,
+                "baseOid": "other-base",
+                "headOid": "head"
+            }"#,
+            "base",
+            "head",
+        )
+        .expect_err("mismatched presentation-state snapshot must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("presentation state does not match the selected Git snapshot")
+        );
+    }
+
+    #[test]
+    fn presentation_state_rejects_malformed_stashed_thread_keys() {
+        let error = StackReviewPresentationState::from_json(
+            r#"{
+                "schemaVersion": 1,
+                "baseOid": "base",
+                "headOid": "head",
+                "stashedThreadRoots": ["not-json"]
+            }"#,
+            "base",
+            "head",
+        )
+        .expect_err("malformed stashed thread key must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid stashed comment thread root")
+        );
+    }
+
+    #[test]
+    fn presentation_state_rejects_empty_comment_thread_key_identifiers() {
+        let empty_root = presentation_thread_key("")
+            .to_stable_string()
+            .expect("serialize empty root key");
+        let contents = serde_json::json!({
+            "schemaVersion": 1,
+            "baseOid": "base",
+            "headOid": "head",
+            "stashedThreadRoots": [empty_root]
+        })
+        .to_string();
+
+        let error = StackReviewPresentationState::from_json(&contents, "base", "head")
+            .expect_err("empty comment thread key identifier must fail");
+
+        assert!(format!("{error:#}").contains("comment thread key identifier is empty"));
+    }
+
+    #[test]
+    fn presentation_state_rejects_comment_thread_keys_from_another_snapshot() {
+        let mut foreign_root = presentation_thread_key("root");
+        let CommentThreadKey::Normal { partition, .. } = &mut foreign_root else {
+            panic!("expected normal thread key");
+        };
+        partition.base_oid = "other-base".into();
+        let foreign_root = foreign_root
+            .to_stable_string()
+            .expect("serialize foreign root key");
+        let contents = serde_json::json!({
+            "schemaVersion": 1,
+            "baseOid": "base",
+            "headOid": "head",
+            "stashedThreadRoots": [foreign_root]
+        })
+        .to_string();
+
+        let error = StackReviewPresentationState::from_json(&contents, "base", "head")
+            .expect_err("foreign comment thread key must fail");
+
+        assert!(format!("{error:#}").contains("comment thread key does not match the snapshot"));
+    }
+
+    #[test]
+    fn presentation_state_rejects_comment_thread_keys_from_another_storage_key() {
+        let mut foreign_root = presentation_thread_key("root");
+        let CommentThreadKey::Normal { partition, .. } = &mut foreign_root else {
+            panic!("expected normal thread key");
+        };
+        partition.storage_key = "different-storage-key".into();
+        let foreign_root = foreign_root
+            .to_stable_string()
+            .expect("serialize foreign storage root key");
+        let contents = serde_json::json!({
+            "schemaVersion": 1,
+            "baseOid": "base",
+            "headOid": "head",
+            "stashedThreadRoots": [foreign_root]
+        })
+        .to_string();
+
+        let error = StackReviewPresentationState::from_json(&contents, "base", "head")
+            .expect_err("foreign storage key must fail");
+
+        assert!(format!("{error:#}").contains("comment thread key does not match the storage key"));
+    }
+
+    #[test]
+    fn presentation_state_rejects_empty_comment_thread_partition_keys() {
+        let mut root = presentation_thread_key("root");
+        let CommentThreadKey::Normal { partition, .. } = &mut root else {
+            panic!("expected normal thread key");
+        };
+        partition.storage_key.clear();
+        let root = root
+            .to_stable_string()
+            .expect("serialize empty-partition root key");
+        let contents = serde_json::json!({
+            "schemaVersion": 1,
+            "baseOid": "base",
+            "headOid": "head",
+            "stashedThreadRoots": [root]
+        })
+        .to_string();
+
+        let error = StackReviewPresentationState::from_json(&contents, "base", "head")
+            .expect_err("empty comment thread partition key must fail");
+
+        assert!(format!("{error:#}").contains("comment thread partition storage key is empty"));
+    }
+
+    #[test]
+    fn presentation_state_rejects_inconsistent_comment_thread_partitions() {
+        let mut root = presentation_thread_key("root");
+        let CommentThreadKey::Normal { partition, .. } = &mut root else {
+            panic!("expected normal thread key");
+        };
+        partition.class = StackReviewCommentClass::TopLevel;
+        let root = root
+            .to_stable_string()
+            .expect("serialize inconsistent root key");
+        let contents = serde_json::json!({
+            "schemaVersion": 1,
+            "baseOid": "base",
+            "headOid": "head",
+            "stashedThreadRoots": [root]
+        })
+        .to_string();
+
+        let error = StackReviewPresentationState::from_json(&contents, "base", "head")
+            .expect_err("inconsistent comment thread partition must fail");
+
+        assert!(format!("{error:#}").contains("invalid comment thread partition"));
+    }
+
+    #[test]
+    fn presentation_state_rejects_noncanonical_comment_thread_keys() {
+        let root = presentation_thread_key("root")
+            .to_stable_string()
+            .expect("serialize root key");
+        let contents = serde_json::json!({
+            "schemaVersion": 1,
+            "baseOid": "base",
+            "headOid": "head",
+            "stashedThreadRoots": [format!(" {root}")]
+        })
+        .to_string();
+
+        let error = StackReviewPresentationState::from_json(&contents, "base", "head")
+            .expect_err("noncanonical comment thread key must fail");
+
+        assert!(format!("{error:#}").contains("comment thread key is not canonical"));
+    }
+
+    #[test]
+    fn presentation_state_rejects_malformed_comment_binding_keys() {
+        let error = StackReviewPresentationState::from_json(
+            r#"{
+                "schemaVersion": 1,
+                "baseOid": "base",
+                "headOid": "head",
+                "aiThreadBindings": { "comment:not-json": "session" }
+            }"#,
+            "base",
+            "head",
+        )
+        .expect_err("malformed comment binding key must fail");
+
+        assert!(error.to_string().contains("invalid AI thread binding key"));
+    }
+
+    #[test]
+    fn presentation_state_rejects_empty_ai_session_bindings() {
+        let error = StackReviewPresentationState::from_json(
+            r#"{
+                "schemaVersion": 1,
+                "baseOid": "base",
+                "headOid": "head",
+                "aiThreadBindings": { "review": "" }
+            }"#,
+            "base",
+            "head",
+        )
+        .expect_err("empty AI session binding must fail");
+
+        assert!(error.to_string().contains("AI thread session ID is empty"));
+    }
+
+    #[test]
+    fn presentation_state_helpers_manage_stashes_and_thread_bindings() {
+        let root = presentation_thread_key("root");
+        let comment_binding_key = format!(
+            "comment:{}",
+            root.to_stable_string().expect("serialize comment root")
+        );
+        let mut state = StackReviewPresentationState::new("base", "head");
+
+        assert!(!state.is_stashed(&root).expect("check unstashed root"));
+        assert!(state.stash_root(&root).expect("stash root"));
+        assert!(!state.stash_root(&root).expect("deduplicate stashed root"));
+        assert!(state.is_stashed(&root).expect("check stashed root"));
+        assert_eq!(
+            state.stashed_roots().expect("list stashed roots"),
+            std::slice::from_ref(&root)
+        );
+        assert!(state.restore_root(&root).expect("restore root"));
+        assert!(!state.restore_root(&root).expect("root already restored"));
+
+        assert_eq!(state.binding("review").expect("review binding"), None);
+        assert_eq!(
+            state
+                .bind_thread("review", "review-session")
+                .expect("bind review thread"),
+            None
+        );
+        assert_eq!(
+            state.binding("review").expect("bound review thread"),
+            Some("review-session")
+        );
+        assert_eq!(
+            state
+                .bind_thread(&comment_binding_key, "comment-session")
+                .expect("bind comment thread"),
+            None
+        );
+        assert_eq!(
+            state
+                .unbind_thread(&comment_binding_key)
+                .expect("unbind comment thread"),
+            Some("comment-session".to_owned())
+        );
+    }
+
+    #[test]
+    fn presentation_state_stash_helpers_reject_foreign_snapshot_roots() {
+        let mut foreign_root = presentation_thread_key("root");
+        let CommentThreadKey::Normal { partition, .. } = &mut foreign_root else {
+            panic!("expected normal thread key");
+        };
+        partition.head_oid = "other-head".into();
+        let mut state = StackReviewPresentationState::new("base", "head");
+
+        let error = state
+            .stash_root(&foreign_root)
+            .expect_err("foreign root must not be stashed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("comment thread key does not match the snapshot")
+        );
+        assert!(
+            state
+                .stashed_roots()
+                .expect("list stashed roots")
+                .is_empty()
+        );
     }
 
     #[test]

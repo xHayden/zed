@@ -11,7 +11,8 @@ use git::{
         StackReviewCommentAuthor, StackReviewCommentRecord, StackReviewCommentSide,
         StackReviewCommentSource, StackReviewContentKind, StackReviewCurrentManifest,
         StackReviewFileProvenance, StackReviewFileStatus, StackReviewGitHubCommentIdentity,
-        StackReviewGitHubCommentKind, StackReviewState, StackSnapshot, parse_stack_file,
+        StackReviewGitHubCommentKind, StackReviewPresentationState, StackReviewState,
+        StackSnapshot, parse_stack_file, stack_review_storage_key,
     },
 };
 use gpui::{
@@ -1238,9 +1239,10 @@ async fn apply_comment_writes(
     Ok(())
 }
 
-fn stack_review_storage_key(base_oid: &str, head_oid: &str) -> String {
-    format!("{base_oid}-{head_oid}")
-        .replace(|character: char| !character.is_ascii_alphanumeric(), "_")
+fn presentation_state_path(state_root: &Path, storage_key: &str) -> PathBuf {
+    state_root
+        .join("presentation")
+        .join(format!("{storage_key}.json"))
 }
 
 fn stack_review_timestamp() -> String {
@@ -1544,11 +1546,158 @@ async fn migrate_legacy_comments(
     Ok(())
 }
 
+struct LoadedReviewState {
+    state: StackReviewState,
+    writable_path: Option<PathBuf>,
+    error: Option<SharedString>,
+}
+
+async fn load_review_state(
+    fs: &Arc<dyn Fs>,
+    write_lock: &Arc<futures::lock::Mutex<()>>,
+    path: PathBuf,
+    base_oid: &str,
+    head_oid: &str,
+) -> Result<LoadedReviewState> {
+    let _guard = write_lock.lock().await;
+    let parent = path.parent().context("review-state path has no parent")?;
+    fs.create_dir(parent).await?;
+    if fs.is_file(&path).await {
+        return match fs
+            .load(&path)
+            .await
+            .and_then(|contents| StackReviewState::from_json(&contents))
+        {
+            Ok(state) if state.matches_snapshot(base_oid, head_oid) => Ok(LoadedReviewState {
+                state,
+                writable_path: Some(path),
+                error: None,
+            }),
+            Ok(_) => Ok(LoadedReviewState {
+                state: StackReviewState::new(base_oid, head_oid),
+                writable_path: None,
+                error: Some("Review state does not match the selected Git snapshot".into()),
+            }),
+            Err(error) => Ok(LoadedReviewState {
+                state: StackReviewState::new(base_oid, head_oid),
+                writable_path: None,
+                error: Some(format!("Unable to load review state: {error}").into()),
+            }),
+        };
+    }
+    Ok(LoadedReviewState {
+        state: StackReviewState::new(base_oid, head_oid),
+        writable_path: Some(path),
+        error: None,
+    })
+}
+
+struct LoadedPresentationState {
+    state: StackReviewPresentationState,
+    writable_path: Option<PathBuf>,
+    error: Option<SharedString>,
+}
+
+async fn load_presentation_state(
+    fs: &Arc<dyn Fs>,
+    write_lock: &Arc<futures::lock::Mutex<()>>,
+    path: PathBuf,
+    base_oid: &str,
+    head_oid: &str,
+) -> Result<LoadedPresentationState> {
+    let _guard = write_lock.lock().await;
+    let parent = path
+        .parent()
+        .context("presentation-state path has no parent")?;
+    fs.create_dir(parent).await?;
+    if fs.is_file(&path).await {
+        return match fs.load(&path).await.and_then(|contents| {
+            StackReviewPresentationState::from_json(&contents, base_oid, head_oid)
+        }) {
+            Ok(state) => Ok(LoadedPresentationState {
+                state,
+                writable_path: Some(path),
+                error: None,
+            }),
+            Err(error) => Ok(LoadedPresentationState {
+                state: StackReviewPresentationState::new(base_oid, head_oid),
+                writable_path: None,
+                error: Some(format!("Unable to load presentation state: {error}").into()),
+            }),
+        };
+    }
+    Ok(LoadedPresentationState {
+        state: StackReviewPresentationState::new(base_oid, head_oid),
+        writable_path: Some(path),
+        error: None,
+    })
+}
+
+fn next_state_write_generation(
+    generations: &mut HashMap<PathBuf, Arc<AtomicU64>>,
+    path: &Path,
+) -> (Arc<AtomicU64>, u64) {
+    let latest_generation = generations
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+        .clone();
+    let generation = latest_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    (latest_generation, generation)
+}
+
+fn invalidate_state_write_generation(
+    generations: &mut HashMap<PathBuf, Arc<AtomicU64>>,
+    path: &Path,
+) {
+    let _ = next_state_write_generation(generations, path);
+}
+
+async fn write_latest_state(
+    fs: &Arc<dyn Fs>,
+    write_lock: &Arc<futures::lock::Mutex<()>>,
+    path: &Path,
+    contents: String,
+    latest_generation: &Arc<AtomicU64>,
+    generation: u64,
+) -> Result<bool> {
+    let _guard = write_lock.lock().await;
+    if latest_generation.load(Ordering::Acquire) != generation {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .context("state path has no parent directory")?;
+    fs.create_dir(parent).await?;
+    fs.atomic_write(path.to_path_buf(), contents).await?;
+    Ok(true)
+}
+
+#[derive(Clone, Default)]
+struct StackReviewStateErrors {
+    transient: Option<SharedString>,
+    presentation: Option<SharedString>,
+}
+
+impl StackReviewStateErrors {
+    fn display(&self) -> Option<SharedString> {
+        match (&self.transient, &self.presentation) {
+            (Some(transient), Some(presentation)) => {
+                Some(format!("{transient} · {presentation}").into())
+            }
+            (Some(error), None) | (None, Some(error)) => Some(error.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
 struct LoadedStackReview {
     diff_view: Entity<MultiDiffView>,
     provenance_summary: SharedString,
     review_state: StackReviewState,
     review_state_path: Option<PathBuf>,
+    presentation_state: StackReviewPresentationState,
+    presentation_state_path: Option<PathBuf>,
+    presentation_state_error: Option<SharedString>,
     state_error: Option<SharedString>,
     files: Vec<StackReviewFileItem>,
     content_entries: Vec<ContentDiffEntry>,
@@ -1588,6 +1737,9 @@ pub struct StackReview {
     work_directory: PathBuf,
     review_state: Option<StackReviewState>,
     review_state_path: Option<PathBuf>,
+    presentation_state: Option<StackReviewPresentationState>,
+    presentation_state_path: Option<PathBuf>,
+    presentation_state_error: Option<SharedString>,
     files: Vec<StackReviewFileItem>,
     content_entries: Vec<ContentDiffEntry>,
     selected_file_index: Option<usize>,
@@ -1832,6 +1984,9 @@ impl StackReview {
             work_directory,
             review_state: None,
             review_state_path: None,
+            presentation_state: None,
+            presentation_state_path: None,
+            presentation_state_error: None,
             files: Vec::new(),
             content_entries: Vec::new(),
             selected_file_index: None,
@@ -1909,6 +2064,9 @@ impl StackReview {
         self.provenance_summary = None;
         self.review_state = None;
         self.review_state_path = None;
+        self.presentation_state = None;
+        self.presentation_state_path = None;
+        self.presentation_state_error = None;
         self.files.clear();
         self.content_entries.clear();
         self.selected_file_index = None;
@@ -1938,6 +2096,21 @@ impl StackReview {
             .contains(&github_snapshot_key);
         let cached_reviewer_login = self.reviewer_login.clone();
         let cutoff = self.time_filter.cutoff();
+        let target_storage_key = stack_review_storage_key(&base_ref, &head_ref);
+        let target_review_state_path = self
+            .state_root
+            .join("reviews")
+            .join(format!("{target_storage_key}.json"));
+        let target_presentation_state_path =
+            presentation_state_path(&self.state_root, &target_storage_key);
+        invalidate_state_write_generation(
+            &mut self.state_write_generations,
+            &target_review_state_path,
+        );
+        invalidate_state_write_generation(
+            &mut self.state_write_generations,
+            &target_presentation_state_path,
+        );
         let receiver = self.repository.update(cx, |repository, _| {
             if let Some(cutoff) = cutoff {
                 repository.stack_review_diff_since(base_ref, head_ref, cutoff)
@@ -1948,6 +2121,7 @@ impl StackReview {
         let project = self.project.clone();
         let workspace = self.workspace.clone();
         let fs = self.fs.clone();
+        let state_write_lock = self.state_write_lock.clone();
         let state_root = self.state_root.clone();
         let work_directory = self.work_directory.clone();
         let show_resolved_comments = self.show_resolved_comments;
@@ -2009,49 +2183,31 @@ impl StackReview {
                 }
                 let provenance_summary: SharedString = provenance_parts.join(" · ").into();
                 let storage_key = stack_review_storage_key(&diff.base_ref, &diff.head_ref);
-                let review_state_path = state_root
-                    .join("reviews")
-                    .join(format!("{storage_key}.json"));
+                let review_state_path = target_review_state_path;
+                let presentation_state_path = target_presentation_state_path;
                 let comments_directory = state_root.join("comments").join(&storage_key);
                 let github_comments_directory = state_root.join("github").join(&storage_key);
-                fs.create_dir(
-                    review_state_path
-                        .parent()
-                        .context("review-state path has no parent")?,
-                )
-                .await?;
                 fs.create_dir(&comments_directory).await?;
                 fs.create_dir(&github_comments_directory).await?;
-                let (mut review_state, state_error, writable_review_state_path) = if fs
-                    .is_file(&review_state_path)
-                    .await
-                {
-                    match fs
-                        .load(&review_state_path)
-                        .await
-                        .and_then(|contents| StackReviewState::from_json(&contents))
-                    {
-                        Ok(state) if state.matches_snapshot(&diff.base_ref, &diff.head_ref) => {
-                            (state, None, Some(review_state_path.clone()))
-                        }
-                        Ok(_) => (
-                            StackReviewState::new(&diff.base_ref, &diff.head_ref),
-                            Some("Review state does not match the selected Git snapshot".into()),
-                            None,
-                        ),
-                        Err(error) => (
-                            StackReviewState::new(&diff.base_ref, &diff.head_ref),
-                            Some(format!("Unable to load review state: {error}").into()),
-                            None,
-                        ),
-                    }
-                } else {
-                    (
-                        StackReviewState::new(&diff.base_ref, &diff.head_ref),
-                        None,
-                        Some(review_state_path.clone()),
-                    )
-                };
+                let loaded_review_state = load_review_state(
+                    &fs,
+                    &state_write_lock,
+                    review_state_path,
+                    &diff.base_ref,
+                    &diff.head_ref,
+                )
+                .await?;
+                let mut review_state = loaded_review_state.state;
+                let state_error = loaded_review_state.error;
+                let writable_review_state_path = loaded_review_state.writable_path;
+                let loaded_presentation_state = load_presentation_state(
+                    &fs,
+                    &state_write_lock,
+                    presentation_state_path,
+                    &diff.base_ref,
+                    &diff.head_ref,
+                )
+                .await?;
                 let reviewer_login = cached_reviewer_login;
                 let mut comment_records = load_all_comment_records(
                     &fs,
@@ -2164,6 +2320,9 @@ impl StackReview {
                     provenance_summary,
                     review_state,
                     review_state_path: writable_review_state_path,
+                    presentation_state: loaded_presentation_state.state,
+                    presentation_state_path: loaded_presentation_state.writable_path,
+                    presentation_state_error: loaded_presentation_state.error,
                     state_error,
                     files,
                     content_entries,
@@ -2216,6 +2375,9 @@ impl StackReview {
                     this.provenance_summary = Some(loaded.provenance_summary);
                     this.review_state = Some(loaded.review_state);
                     this.review_state_path = loaded.review_state_path;
+                    this.presentation_state = Some(loaded.presentation_state);
+                    this.presentation_state_path = loaded.presentation_state_path;
+                    this.presentation_state_error = loaded.presentation_state_error;
                     this.files = loaded.files;
                     this.content_entries = loaded.content_entries;
                     this.selected_file_index = selected_file_index;
@@ -2289,6 +2451,9 @@ impl StackReview {
                     this.provenance_summary = None;
                     this.review_state = None;
                     this.review_state_path = None;
+                    this.presentation_state = None;
+                    this.presentation_state_path = None;
+                    this.presentation_state_error = None;
                     this.files.clear();
                     this.review_comment_count = 0;
                     this.state_error = None;
@@ -2886,25 +3051,21 @@ impl StackReview {
 
         let fs = self.fs.clone();
         let write_lock = self.state_write_lock.clone();
-        let latest_generation = self
-            .state_write_generations
-            .entry(review_state_path.clone())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone();
-        let generation = latest_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (latest_generation, generation) =
+            next_state_write_generation(&mut self.state_write_generations, &review_state_path);
         cx.spawn(async move |this, cx| {
-            let _guard = write_lock.lock().await;
-            if latest_generation.load(Ordering::Acquire) != generation {
+            let result = write_latest_state(
+                &fs,
+                &write_lock,
+                &review_state_path,
+                contents,
+                &latest_generation,
+                generation,
+            )
+            .await;
+            if matches!(&result, Ok(false)) {
                 return;
             }
-            let result = async {
-                let parent = review_state_path
-                    .parent()
-                    .context("review-state path has no parent directory")?;
-                fs.create_dir(parent).await?;
-                fs.atomic_write(review_state_path.clone(), contents).await
-            }
-            .await;
             if let Err(update_error) = this.update(cx, |this, cx| {
                 if this.review_state_path.as_ref() == Some(&review_state_path) {
                     this.state_error = result.err().map(|error| error.to_string().into());
@@ -2912,6 +3073,59 @@ impl StackReview {
                 }
             }) {
                 log::error!("failed to report stack-review state write: {update_error:#}");
+            }
+        })
+        .detach();
+    }
+
+    #[allow(dead_code)]
+    fn queue_presentation_state_write(&mut self, cx: &mut Context<Self>) {
+        let Some(presentation_state) = self.presentation_state.as_ref() else {
+            return;
+        };
+        let Some(presentation_state_path) = self.presentation_state_path.clone() else {
+            return;
+        };
+        let contents = match presentation_state.to_json() {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.presentation_state_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        self.presentation_state_error = None;
+        cx.notify();
+
+        let fs = self.fs.clone();
+        let write_lock = self.state_write_lock.clone();
+        let (latest_generation, generation) = next_state_write_generation(
+            &mut self.state_write_generations,
+            &presentation_state_path,
+        );
+        cx.spawn(async move |this, cx| {
+            let result = write_latest_state(
+                &fs,
+                &write_lock,
+                &presentation_state_path,
+                contents,
+                &latest_generation,
+                generation,
+            )
+            .await;
+            if matches!(&result, Ok(false)) {
+                return;
+            }
+            if let Err(update_error) = this.update(cx, |this, cx| {
+                if this.presentation_state_path.as_ref() == Some(&presentation_state_path) {
+                    this.presentation_state_error =
+                        result.err().map(|error| error.to_string().into());
+                    cx.notify();
+                }
+            }) {
+                log::error!(
+                    "failed to report stack-review presentation-state write: {update_error:#}"
+                );
             }
         })
         .detach();
@@ -3870,9 +4084,16 @@ impl StackReview {
             .child(scope_controls)
             .child(time_controls)
             .child(status)
-            .when_some(self.state_error.clone(), |header, error| {
-                header.child(div().w_full().child(Label::new(error).color(Color::Error)))
-            })
+            .when_some(
+                StackReviewStateErrors {
+                    transient: self.state_error.clone(),
+                    presentation: self.presentation_state_error.clone(),
+                }
+                .display(),
+                |header, error| {
+                    header.child(div().w_full().child(Label::new(error).color(Color::Error)))
+                },
+            )
             .when_some(self.render_preserved_comments(), |header, comments| {
                 header.child(comments)
             })
@@ -4934,6 +5155,330 @@ mod tests {
         assert!(summarize_test_file_comments(&records, Some("xHayden")).is_empty());
     }
 
+    #[test]
+    fn presentation_state_error_survives_unrelated_state_error_clear() {
+        let mut errors = StackReviewStateErrors {
+            transient: Some("comment refresh failed".into()),
+            presentation: Some("presentation state is corrupt".into()),
+        };
+
+        assert_eq!(
+            errors.display().as_deref(),
+            Some("comment refresh failed · presentation state is corrupt")
+        );
+        errors.transient = None;
+        assert_eq!(
+            errors.display().as_deref(),
+            Some("presentation state is corrupt")
+        );
+    }
+
+    #[test]
+    fn presentation_state_path_is_snapshot_storage_key_scoped() {
+        assert_eq!(
+            presentation_state_path(Path::new("/repo/.git/zed-stack-review"), "base-head"),
+            PathBuf::from("/repo/.git/zed-stack-review/presentation/base-head.json",)
+        );
+    }
+
+    #[gpui::test]
+    async fn presentation_state_load_defaults_a_missing_file_and_keeps_it_writable(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/repo", json!({ ".git": { "zed-stack-review": {} } }))
+            .await;
+        let path = PathBuf::from("/repo/.git/zed-stack-review/presentation/base-head.json");
+
+        let loaded = load_presentation_state(
+            &(fs.clone() as Arc<dyn Fs>),
+            &Arc::new(futures::lock::Mutex::new(())),
+            path.clone(),
+            "base",
+            "head",
+        )
+        .await
+        .expect("load missing presentation state");
+
+        assert_eq!(
+            loaded.state,
+            git::stack_review::StackReviewPresentationState::new("base", "head")
+        );
+        assert_eq!(loaded.writable_path, Some(path.clone()));
+        assert_eq!(loaded.error, None);
+        assert!(fs.is_dir(path.parent().expect("presentation parent")).await);
+        assert!(!fs.is_file(&path).await);
+    }
+
+    #[gpui::test]
+    async fn presentation_state_load_accepts_a_valid_snapshot_file(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/repo",
+            json!({ ".git": { "zed-stack-review": { "presentation": {} } } }),
+        )
+        .await;
+        let path = PathBuf::from("/repo/.git/zed-stack-review/presentation/base-head.json");
+        let mut expected = StackReviewPresentationState::new("base", "head");
+        expected
+            .bind_thread("review", "session")
+            .expect("bind review thread");
+        fs.atomic_write(
+            path.clone(),
+            expected.to_json().expect("serialize presentation state"),
+        )
+        .await
+        .expect("write presentation state");
+
+        let loaded = load_presentation_state(
+            &(fs.clone() as Arc<dyn Fs>),
+            &Arc::new(futures::lock::Mutex::new(())),
+            path.clone(),
+            "base",
+            "head",
+        )
+        .await
+        .expect("load valid presentation state");
+
+        assert_eq!(loaded.state, expected);
+        assert_eq!(loaded.writable_path, Some(path));
+        assert_eq!(loaded.error, None);
+    }
+
+    #[gpui::test]
+    async fn presentation_state_load_keeps_a_corrupt_file_unwritable(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/repo",
+            json!({
+                ".git": {
+                    "zed-stack-review": {
+                        "presentation": { "base-head.json": "not json" }
+                    }
+                }
+            }),
+        )
+        .await;
+        let path = PathBuf::from("/repo/.git/zed-stack-review/presentation/base-head.json");
+
+        let loaded = load_presentation_state(
+            &(fs.clone() as Arc<dyn Fs>),
+            &Arc::new(futures::lock::Mutex::new(())),
+            path.clone(),
+            "base",
+            "head",
+        )
+        .await
+        .expect("surface corrupt presentation state");
+
+        assert_eq!(
+            loaded.state,
+            StackReviewPresentationState::new("base", "head")
+        );
+        assert_eq!(loaded.writable_path, None);
+        assert!(
+            loaded
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Unable to load presentation state"))
+        );
+        assert_eq!(
+            fs.load(&path).await.expect("preserve corrupt state"),
+            "not json"
+        );
+    }
+
+    #[gpui::test]
+    async fn presentation_state_load_keeps_a_mismatched_file_unwritable(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/repo",
+            json!({ ".git": { "zed-stack-review": { "presentation": {} } } }),
+        )
+        .await;
+        let path = PathBuf::from("/repo/.git/zed-stack-review/presentation/base-head.json");
+        let contents = StackReviewPresentationState::new("other-base", "head")
+            .to_json()
+            .expect("serialize mismatched presentation state");
+        fs.atomic_write(path.clone(), contents.clone())
+            .await
+            .expect("write mismatched presentation state");
+
+        let loaded = load_presentation_state(
+            &(fs.clone() as Arc<dyn Fs>),
+            &Arc::new(futures::lock::Mutex::new(())),
+            path.clone(),
+            "base",
+            "head",
+        )
+        .await
+        .expect("surface mismatched presentation state");
+
+        assert_eq!(loaded.writable_path, None);
+        assert!(
+            loaded
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("does not match the selected Git snapshot"))
+        );
+        assert_eq!(
+            fs.load(&path).await.expect("preserve mismatched state"),
+            contents
+        );
+    }
+
+    #[gpui::test]
+    async fn state_writes_skip_stale_generations_and_atomically_write_the_latest(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/repo", json!({ ".git": { "zed-stack-review": {} } }))
+            .await;
+        let path = PathBuf::from("/repo/.git/zed-stack-review/presentation/base-head.json");
+        let write_lock = Arc::new(futures::lock::Mutex::new(()));
+        let mut generations = HashMap::new();
+        let (latest_generation, stale_generation) =
+            next_state_write_generation(&mut generations, &path);
+        let (_, current_generation) = next_state_write_generation(&mut generations, &path);
+
+        assert!(
+            !write_latest_state(
+                &(fs.clone() as Arc<dyn Fs>),
+                &write_lock,
+                &path,
+                "stale".into(),
+                &latest_generation,
+                stale_generation,
+            )
+            .await
+            .expect("skip stale state write")
+        );
+        assert!(!fs.is_file(&path).await);
+        assert!(
+            write_latest_state(
+                &(fs.clone() as Arc<dyn Fs>),
+                &write_lock,
+                &path,
+                "latest".into(),
+                &latest_generation,
+                current_generation,
+            )
+            .await
+            .expect("write latest state")
+        );
+        assert_eq!(fs.load(&path).await.expect("load latest state"), "latest");
+    }
+
+    #[gpui::test]
+    async fn corrupt_presentation_load_invalidates_a_pending_state_write(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/repo",
+            json!({
+                ".git": {
+                    "zed-stack-review": {
+                        "presentation": { "base-head.json": "not json" }
+                    }
+                }
+            }),
+        )
+        .await;
+        let path = PathBuf::from("/repo/.git/zed-stack-review/presentation/base-head.json");
+        let write_lock = Arc::new(futures::lock::Mutex::new(()));
+        let mut generations = HashMap::new();
+        let (latest_generation, pending_generation) =
+            next_state_write_generation(&mut generations, &path);
+        let guard = write_lock.lock().await;
+        let pending_write = cx.background_executor.spawn({
+            let fs = fs.clone() as Arc<dyn Fs>;
+            let path = path.clone();
+            let write_lock = write_lock.clone();
+            let latest_generation = latest_generation.clone();
+            async move {
+                write_latest_state(
+                    &fs,
+                    &write_lock,
+                    &path,
+                    "stale queued write".into(),
+                    &latest_generation,
+                    pending_generation,
+                )
+                .await
+            }
+        });
+        invalidate_state_write_generation(&mut generations, &path);
+        let load = cx.background_executor.spawn({
+            let fs = fs.clone() as Arc<dyn Fs>;
+            let path = path.clone();
+            let write_lock = write_lock.clone();
+            async move { load_presentation_state(&fs, &write_lock, path, "base", "head").await }
+        });
+        drop(guard);
+
+        assert!(!pending_write.await.expect("pending write result"));
+        let loaded = load.await.expect("load corrupt presentation state");
+        assert_eq!(loaded.writable_path, None);
+        assert_eq!(
+            fs.load(&path).await.expect("preserve corrupt state"),
+            "not json"
+        );
+    }
+
+    #[gpui::test]
+    async fn corrupt_review_state_load_invalidates_a_pending_state_write(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/repo",
+            json!({
+                ".git": {
+                    "zed-stack-review": {
+                        "reviews": { "base_head.json": "not json" }
+                    }
+                }
+            }),
+        )
+        .await;
+        let path = PathBuf::from("/repo/.git/zed-stack-review/reviews/base_head.json");
+        let write_lock = Arc::new(futures::lock::Mutex::new(()));
+        let mut generations = HashMap::new();
+        let (latest_generation, pending_generation) =
+            next_state_write_generation(&mut generations, &path);
+        let guard = write_lock.lock().await;
+        let pending_write = cx.background_executor.spawn({
+            let fs = fs.clone() as Arc<dyn Fs>;
+            let path = path.clone();
+            let write_lock = write_lock.clone();
+            let latest_generation = latest_generation.clone();
+            async move {
+                write_latest_state(
+                    &fs,
+                    &write_lock,
+                    &path,
+                    "stale queued write".into(),
+                    &latest_generation,
+                    pending_generation,
+                )
+                .await
+            }
+        });
+        invalidate_state_write_generation(&mut generations, &path);
+        let load = cx.background_executor.spawn({
+            let fs = fs.clone() as Arc<dyn Fs>;
+            let path = path.clone();
+            let write_lock = write_lock.clone();
+            async move { load_review_state(&fs, &write_lock, path, "base", "head").await }
+        });
+        drop(guard);
+
+        assert!(!pending_write.await.expect("pending write result"));
+        let loaded = load.await.expect("load corrupt review state");
+        assert_eq!(loaded.writable_path, None);
+        assert_eq!(
+            fs.load(&path).await.expect("preserve corrupt review state"),
+            "not json"
+        );
+    }
+
     #[gpui::test]
     async fn per_comment_store_migrates_and_detects_external_conflicts(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.background_executor.clone());
@@ -5233,6 +5778,9 @@ mod tests {
                     work_directory: PathBuf::from("/project"),
                     review_state: Some(StackReviewState::new("base", "head")),
                     review_state_path: None,
+                    presentation_state: Some(StackReviewPresentationState::new("base", "head")),
+                    presentation_state_path: None,
+                    presentation_state_error: None,
                     files: vec![
                         StackReviewFileItem {
                             path: "first.rs".into(),
