@@ -7490,6 +7490,7 @@ dependencies = [
  "gpui",
  "language",
  "log",
+ "markdown",
  "menu",
  "notifications",
  "picker",
