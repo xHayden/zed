@@ -49,6 +49,39 @@ use util::{
 };
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadExecutionPolicy {
+    #[default]
+    Standard,
+    ReadOnly,
+}
+
+pub struct AcpThreadOptions {
+    prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>,
+    execution_policy: ThreadExecutionPolicy,
+}
+
+impl AcpThreadOptions {
+    pub fn new(prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>) -> Self {
+        Self {
+            prompt_capabilities_rx,
+            execution_policy: ThreadExecutionPolicy::Standard,
+        }
+    }
+
+    pub fn execution_policy(mut self, execution_policy: ThreadExecutionPolicy) -> Self {
+        self.execution_policy = execution_policy;
+        self
+    }
+}
+
+impl From<watch::Receiver<acp::PromptCapabilities>> for AcpThreadOptions {
+    fn from(prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>) -> Self {
+        Self::new(prompt_capabilities_rx)
+    }
+}
+
 /// Returned when the model stops because it exhausted its output token budget.
 #[derive(Debug)]
 pub struct MaxOutputTokensError;
@@ -2097,7 +2130,8 @@ pub struct AcpThread {
     plan: Plan,
     project: Entity<Project>,
     action_log: Entity<ActionLog>,
-    _git_store_subscription: Subscription,
+    execution_policy: ThreadExecutionPolicy,
+    _git_store_subscription: Option<Subscription>,
     update_last_checkpoint_if_changed_task: Option<Task<Result<()>>>,
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
@@ -2270,9 +2304,13 @@ impl AcpThread {
         project: Entity<Project>,
         action_log: Entity<ActionLog>,
         session_id: acp::SessionId,
-        mut prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>,
+        options: impl Into<AcpThreadOptions>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let AcpThreadOptions {
+            mut prompt_capabilities_rx,
+            execution_policy,
+        } = options.into();
         let prompt_capabilities = prompt_capabilities_rx.borrow().clone();
         let task = cx.spawn::<_, anyhow::Result<()>>(async move |this, cx| {
             loop {
@@ -2284,25 +2322,29 @@ impl AcpThread {
             }
         });
 
-        let git_store = project.read(cx).git_store().clone();
-        let _git_store_subscription = cx.subscribe(&git_store, |this, _, event, cx| {
-            if matches!(
-                event,
-                GitStoreEvent::RepositoryUpdated(
-                    _,
-                    RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
-                    _
-                )
-            ) {
-                this.update_last_checkpoint_if_changed_task =
-                    Some(this.update_last_checkpoint_if_changed(cx));
-            }
-        });
+        let _git_store_subscription =
+            (execution_policy == ThreadExecutionPolicy::Standard).then(|| {
+                let git_store = project.read(cx).git_store().clone();
+                cx.subscribe(&git_store, |this, _, event, cx| {
+                    if matches!(
+                        event,
+                        GitStoreEvent::RepositoryUpdated(
+                            _,
+                            RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
+                            _
+                        )
+                    ) {
+                        this.update_last_checkpoint_if_changed_task =
+                            Some(this.update_last_checkpoint_if_changed(cx));
+                    }
+                })
+            });
 
         Self {
             parent_session_id,
             work_dirs,
             action_log,
+            execution_policy,
             _git_store_subscription,
             update_last_checkpoint_if_changed_task: None,
             shared_buffers: Default::default(),
@@ -2333,6 +2375,10 @@ impl AcpThread {
 
     pub fn parent_session_id(&self) -> Option<&acp::SessionId> {
         self.parent_session_id.as_ref()
+    }
+
+    pub fn execution_policy(&self) -> ThreadExecutionPolicy {
+        self.execution_policy
     }
 
     pub fn prompt_capabilities(&self) -> acp::PromptCapabilities {
@@ -3660,7 +3706,8 @@ impl AcpThread {
             cx,
         );
         let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
-        let git_store = self.project.read(cx).git_store().clone();
+        let git_store = (self.execution_policy == ThreadExecutionPolicy::Standard)
+            .then(|| self.project.read(cx).git_store().clone());
 
         let client_user_message_ids = self.connection.client_user_message_ids(cx);
         let client_id = client_user_message_ids
@@ -3685,11 +3732,15 @@ impl AcpThread {
                 })
                 .ok();
 
-                let old_checkpoint = git_store
-                    .update(cx, |git, cx| git.checkpoint(cx))
-                    .await
-                    .context("failed to get old checkpoint")
-                    .log_err();
+                let old_checkpoint = if let Some(git_store) = git_store {
+                    git_store
+                        .update(cx, |git, cx| git.checkpoint(cx))
+                        .await
+                        .context("failed to get old checkpoint")
+                        .log_err()
+                } else {
+                    None
+                };
                 this.update(cx, |this, _cx| {
                     if let Some((_ix, message)) = this.last_user_message() {
                         message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
@@ -3985,6 +4036,11 @@ impl AcpThread {
         client_id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.execution_policy == ThreadExecutionPolicy::ReadOnly {
+            return Task::ready(Err(anyhow!(
+                "checkpoint restore is unavailable for read-only threads"
+            )));
+        }
         let Some((_, message)) = self.user_message_mut(&client_id) else {
             return Task::ready(Err(anyhow!("message not found")));
         };
@@ -4060,6 +4116,9 @@ impl AcpThread {
     }
 
     fn update_last_checkpoint_if_changed(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.execution_policy == ThreadExecutionPolicy::ReadOnly {
+            return Task::ready(Ok(()));
+        }
         let Some(turn_id) = self.running_turn.as_ref().map(|turn| turn.id) else {
             return Task::ready(Ok(()));
         };
@@ -4131,6 +4190,9 @@ impl AcpThread {
     }
 
     fn update_last_checkpoint(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.execution_policy == ThreadExecutionPolicy::ReadOnly {
+            return Task::ready(Ok(()));
+        }
         let git_store = self.project.read(cx).git_store().clone();
 
         let Some((_, message)) = self.last_user_message() else {
@@ -4767,12 +4829,13 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use feature_flags::FeatureFlag as _;
+
     use futures::stream::StreamExt as _;
     use futures::{channel::mpsc, future::LocalBoxFuture, select};
     use gpui::UpdateGlobal as _;
     use gpui::{App, AsyncApp, TestAppContext, WeakEntity};
     use indoc::indoc;
-    use project::{AgentId, FakeFs, Fs, RemoveOptions};
+    use project::{AgentId, FakeFs, Fs, RealFs, RemoveOptions};
     use rand::{distr, prelude::*};
     use serde_json::json;
     use settings::SettingsStore;
@@ -6875,6 +6938,189 @@ mod tests {
             .unwrap();
 
         assert!(cx.read(|cx| !thread.read(cx).has_pending_edit_tool_calls()));
+    }
+
+    #[gpui::test(iterations = 10)]
+    async fn test_read_only_thread_suppresses_checkpoint_lifecycle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/test"),
+            json!({
+                ".git": {}
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let fs = fs.clone();
+            move |_request, _thread, _cx| {
+                let fs = fs.clone();
+                async move {
+                    fs.write(Path::new(path!("/test/file")), b"changed").await?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            }
+        }));
+        let session_id = acp::SessionId::new("read-only-session");
+        let thread = cx.update(|cx| {
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    None,
+                    Some(PathList::new(&[Path::new(path!("/test"))])),
+                    connection.clone(),
+                    project,
+                    action_log,
+                    session_id.clone(),
+                    AcpThreadOptions::new(watch::Receiver::constant(
+                        acp::PromptCapabilities::new()
+                            .image(true)
+                            .audio(true)
+                            .embedded_context(true),
+                    ))
+                    .execution_policy(ThreadExecutionPolicy::ReadOnly),
+                    cx,
+                )
+            })
+        });
+        connection
+            .sessions
+            .lock()
+            .insert(session_id, thread.downgrade());
+
+        assert!(thread.read_with(cx, |thread, _| { thread._git_store_subscription.is_none() }));
+        cx.update(|cx| thread.update(cx, |thread, cx| thread.send(vec!["Review".into()], cx)))
+            .await
+            .expect("send read-only prompt");
+
+        let (client_id, entry_count) = thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.to_markdown(cx),
+                indoc! {"
+                    ## User
+
+                    Review
+
+                "}
+            );
+            let AgentThreadEntry::UserMessage(message) = &thread.entries()[0] else {
+                panic!("expected user message");
+            };
+            (
+                message.client_id.clone().expect("client message id"),
+                thread.entries().len(),
+            )
+        });
+        let error = thread
+            .update(cx, |thread, cx| thread.restore_checkpoint(client_id, cx))
+            .await
+            .expect_err("restore is unavailable for read-only threads");
+        assert!(error.to_string().contains("read-only"));
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.entries().len()),
+            entry_count
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_only_prompt_leaves_real_git_repository_unchanged(cx: &mut TestAppContext) {
+        async fn git(repository: &Path, arguments: &[&str]) -> String {
+            let output = async_process::Command::new("git")
+                .current_dir(repository)
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Stack Review Test")
+                .env("GIT_AUTHOR_EMAIL", "stack-review@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Stack Review Test")
+                .env("GIT_COMMITTER_EMAIL", "stack-review@example.invalid")
+                .output()
+                .await
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {arguments:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).expect("git output is UTF-8")
+        }
+
+        async fn git_snapshot(repository: &Path) -> (String, String, String, String, String) {
+            (
+                git(repository, &["show-ref"]).await,
+                git(repository, &["rev-parse", "HEAD"]).await,
+                git(repository, &["hash-object", ".git/index"]).await,
+                git(
+                    repository,
+                    &["status", "--porcelain=v1", "--untracked-files=all"],
+                )
+                .await,
+                git(repository, &["count-objects", "-v"]).await,
+            )
+        }
+
+        init_test(cx);
+        cx.executor().allow_parking();
+        let repository = tempfile::tempdir().expect("create repository");
+        git(repository.path(), &["init", "-b", "main"]).await;
+        std::fs::write(repository.path().join("tracked.txt"), "tracked\n")
+            .expect("write tracked file");
+        git(repository.path(), &["add", "tracked.txt"]).await;
+        git(repository.path(), &["commit", "-m", "initial"]).await;
+        std::fs::write(repository.path().join("untracked.txt"), "untracked\n")
+            .expect("write untracked file");
+        let before = git_snapshot(repository.path()).await;
+
+        let real_fs: Arc<dyn Fs> = Arc::new(RealFs::new(None, cx.executor()));
+        let project = Project::test(real_fs, [repository.path()], cx).await;
+        assert_eq!(
+            project.read_with(cx, |project, cx| {
+                project.git_store().read(cx).repositories().len()
+            }),
+            1,
+            "the real repository must be registered before prompting"
+        );
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |_request, _thread, _cx| {
+                async move { Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)) }.boxed_local()
+            },
+        ));
+        let session_id = acp::SessionId::new("real-read-only-session");
+        let thread = cx.update(|cx| {
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    None,
+                    Some(PathList::new(&[repository.path()])),
+                    connection.clone(),
+                    project,
+                    action_log,
+                    session_id.clone(),
+                    AcpThreadOptions::new(watch::Receiver::constant(
+                        acp::PromptCapabilities::new()
+                            .image(true)
+                            .audio(true)
+                            .embedded_context(true),
+                    ))
+                    .execution_policy(ThreadExecutionPolicy::ReadOnly),
+                    cx,
+                )
+            })
+        });
+        connection
+            .sessions
+            .lock()
+            .insert(session_id, thread.downgrade());
+
+        cx.update(|cx| thread.update(cx, |thread, cx| thread.send(vec!["Review".into()], cx)))
+            .await
+            .expect("send read-only prompt");
+        cx.run_until_parked();
+
+        assert_eq!(git_snapshot(repository.path()).await, before);
     }
 
     #[gpui::test(iterations = 10)]

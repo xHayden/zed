@@ -3,9 +3,9 @@ use crate::{
     CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool,
     FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
     ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool,
-    RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates,
-    TerminalTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
-    decide_permission_from_settings,
+    RenameTool, SandboxedTerminalTool, SpawnAgentTool, StackReviewThreadOrigin,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ThreadExecutionPolicy,
+    ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -1226,6 +1226,21 @@ impl From<&ThreadModel> for Option<DbLanguageModel> {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ThreadCreationOptions {
+    execution_policy: ThreadExecutionPolicy,
+    stack_review_origin: Option<StackReviewThreadOrigin>,
+}
+
+impl ThreadCreationOptions {
+    pub fn stack_review(origin: StackReviewThreadOrigin) -> Self {
+        Self {
+            execution_policy: ThreadExecutionPolicy::ReadOnly,
+            stack_review_origin: Some(origin),
+        }
+    }
+}
+
 pub struct Thread {
     id: acp::SessionId,
     prompt_id: PromptId,
@@ -1258,6 +1273,8 @@ pub struct Thread {
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
     pub(crate) context_server_registry: Entity<ContextServerRegistry>,
     profile_id: AgentProfileId,
+    execution_policy: ThreadExecutionPolicy,
+    stack_review_origin: Option<StackReviewThreadOrigin>,
     /// Whether `profile_id` was downgraded to `minimal` at thread start because
     /// the workspace is restricted. Used purely to surface a warning in the UI.
     profile_downgraded_for_restricted_workspace: bool,
@@ -1312,6 +1329,7 @@ impl Thread {
             templates,
             model,
             action_log,
+            ThreadCreationOptions::default(),
             cx,
         );
         thread.subagent_context = Some(SubagentContext {
@@ -1334,6 +1352,26 @@ impl Thread {
         model: Option<Arc<dyn LanguageModel>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_options(
+            project,
+            project_context,
+            context_server_registry,
+            templates,
+            model,
+            ThreadCreationOptions::default(),
+            cx,
+        )
+    }
+
+    pub fn new_with_options(
+        project: Entity<Project>,
+        project_context: Entity<ProjectContext>,
+        context_server_registry: Entity<ContextServerRegistry>,
+        templates: Arc<Templates>,
+        model: Option<Arc<dyn LanguageModel>>,
+        options: ThreadCreationOptions,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self::new_internal(
             project.clone(),
             project_context,
@@ -1341,6 +1379,7 @@ impl Thread {
             templates,
             model,
             cx.new(|_cx| ActionLog::new(project)),
+            options,
             cx,
         )
     }
@@ -1352,6 +1391,7 @@ impl Thread {
         templates: Arc<Templates>,
         model: Option<Arc<dyn LanguageModel>>,
         action_log: Entity<ActionLog>,
+        options: ThreadCreationOptions,
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = AgentSettings::get_global(cx);
@@ -1403,6 +1443,8 @@ impl Thread {
             },
             context_server_registry,
             profile_id,
+            execution_policy: options.execution_policy,
+            stack_review_origin: options.stack_review_origin,
             profile_downgraded_for_restricted_workspace,
             project_context,
             templates,
@@ -1436,6 +1478,8 @@ impl Thread {
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
         self.profile_id = parent.profile_id.clone();
+        self.execution_policy = parent.execution_policy;
+        self.stack_review_origin = parent.stack_review_origin.clone();
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
     }
@@ -1722,6 +1766,7 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = AgentSettings::get_global(cx);
+        let execution_policy = db_thread.effective_execution_policy();
         let profile_id = db_thread
             .profile
             .unwrap_or_else(|| settings.default_profile.clone());
@@ -1781,6 +1826,8 @@ impl Thread {
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
             profile_id,
+            execution_policy,
+            stack_review_origin: db_thread.stack_review_origin,
             profile_downgraded_for_restricted_workspace: false,
             project_context,
             templates,
@@ -1903,6 +1950,8 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            execution_policy: self.execution_policy,
+            stack_review_origin: self.stack_review_origin.clone(),
         };
 
         cx.background_spawn(async move {
@@ -2195,6 +2244,14 @@ impl Thread {
 
     pub fn profile(&self) -> &AgentProfileId {
         &self.profile_id
+    }
+
+    pub fn execution_policy(&self) -> ThreadExecutionPolicy {
+        self.execution_policy
+    }
+
+    pub fn stack_review_origin(&self) -> Option<&StackReviewThreadOrigin> {
+        self.stack_review_origin.as_ref()
     }
 
     /// Whether this thread's profile was downgraded to `minimal` at thread start
@@ -4107,6 +4164,10 @@ impl Thread {
     }
 
     fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+        if self.execution_policy == ThreadExecutionPolicy::ReadOnly {
+            return BTreeMap::new();
+        }
+
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };

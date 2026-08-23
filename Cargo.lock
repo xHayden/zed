@@ -100,6 +100,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-channel 2.5.0",
+ "async-process",
  "base64 0.22.1",
  "buffer_diff",
  "chrono",

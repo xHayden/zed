@@ -29,8 +29,9 @@ pub use tool_permissions::*;
 pub use tools::*;
 
 use acp_thread::{
-    AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,
-    AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId, TokenUsageRatio,
+    AcpThread, AcpThreadOptions, AgentModelId, AgentModelSelector, AgentSessionInfo,
+    AgentSessionList, AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId,
+    TokenUsageRatio,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_skills::{
@@ -770,6 +771,7 @@ impl NativeAgent {
         let project = thread.project.clone();
         let action_log = thread.action_log.clone();
         let prompt_capabilities_rx = thread.prompt_capabilities_rx.clone();
+        let execution_policy = thread.execution_policy();
         let acp_thread = cx.new(|cx| {
             let mut acp_thread = acp_thread::AcpThread::new(
                 parent_session_id,
@@ -779,7 +781,7 @@ impl NativeAgent {
                 project.clone(),
                 action_log.clone(),
                 session_id.clone(),
-                prompt_capabilities_rx,
+                AcpThreadOptions::new(prompt_capabilities_rx).execution_policy(execution_policy),
                 cx,
             );
             acp_thread.set_draft_prompt(draft_prompt, cx);

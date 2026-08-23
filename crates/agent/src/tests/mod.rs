@@ -1687,6 +1687,81 @@ async fn test_profiles(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_read_only_thread_exposes_no_tools_from_customized_ask_profile(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    fs.insert_file(
+        paths::settings_file(),
+        json!({
+            "agent": {
+                "profiles": {
+                    "ask": {
+                        "name": "Ask",
+                        "tools": {
+                            EchoTool::NAME: true,
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    let read_only_thread = cx.update(|cx| {
+        let (project, project_context, context_server_registry, templates, model) = {
+            let thread = thread.read(cx);
+            (
+                thread.project.clone(),
+                thread.project_context().clone(),
+                thread.context_server_registry.clone(),
+                thread.templates.clone(),
+                thread.model().cloned(),
+            )
+        };
+        cx.new(|cx| {
+            Thread::new_with_options(
+                project,
+                project_context,
+                context_server_registry,
+                templates,
+                model,
+                ThreadCreationOptions::stack_review(StackReviewThreadOrigin {
+                    project_identity: "project-identity".into(),
+                    storage_key: "storage-key".into(),
+                    context_key: "comment:root-id".into(),
+                    base_oid: "1111111111111111111111111111111111111111".into(),
+                    head_oid: "2222222222222222222222222222222222222222".into(),
+                }),
+                cx,
+            )
+        })
+    });
+    read_only_thread.update(cx, |thread, cx| {
+        thread.add_tool(EchoTool);
+        thread.set_profile(AgentProfileId("ask".into()), cx);
+        thread
+            .send(ClientUserMessageId::new(), ["test"], cx)
+            .expect("send read-only prompt");
+    });
+    cx.run_until_parked();
+
+    let completion = fake_model
+        .pending_completions()
+        .pop()
+        .expect("read-only completion");
+    assert!(completion.tools.is_empty());
+    fake_model.end_last_completion_stream();
+}
+
+#[gpui::test]
 async fn test_mcp_tools(cx: &mut TestAppContext) {
     let ThreadTest {
         model,

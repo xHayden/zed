@@ -1,5 +1,6 @@
 use crate::{AgentMessage, AgentMessageContent, UserMessage, UserMessageContent};
 use acp_thread::ClientUserMessageId;
+pub use acp_thread::ThreadExecutionPolicy;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentProfileId;
 use anyhow::Result;
@@ -24,6 +25,15 @@ use zed_env_vars::ZED_STATELESS;
 pub type DbMessage = crate::Message;
 pub type DbSummary = crate::legacy_thread::DetailedSummaryState;
 pub type DbLanguageModel = crate::legacy_thread::SerializedLanguageModel;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackReviewThreadOrigin {
+    pub project_identity: SharedString,
+    pub storage_key: SharedString,
+    pub context_key: SharedString,
+    pub base_oid: SharedString,
+    pub head_oid: SharedString,
+}
 
 #[derive(Debug, Clone)]
 pub struct DbThreadMetadata {
@@ -86,6 +96,10 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    #[serde(default)]
+    pub execution_policy: ThreadExecutionPolicy,
+    #[serde(default)]
+    pub stack_review_origin: Option<StackReviewThreadOrigin>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -169,6 +183,8 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            execution_policy: ThreadExecutionPolicy::Standard,
+            stack_review_origin: None,
         }
     }
 
@@ -187,6 +203,14 @@ impl SharedThread {
 
 impl DbThread {
     pub const VERSION: &'static str = "0.3.0";
+
+    pub fn effective_execution_policy(&self) -> ThreadExecutionPolicy {
+        if self.stack_review_origin.is_some() {
+            ThreadExecutionPolicy::ReadOnly
+        } else {
+            self.execution_policy
+        }
+    }
 
     pub fn to_markdown(&self) -> String {
         crate::messages_to_markdown(&self.messages)
@@ -355,6 +379,8 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            execution_policy: ThreadExecutionPolicy::Standard,
+            stack_review_origin: None,
         })
     }
 }
@@ -806,7 +832,76 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            execution_policy: ThreadExecutionPolicy::Standard,
+            stack_review_origin: None,
         }
+    }
+
+    #[test]
+    fn test_thread_execution_policy_and_origin_default_for_legacy_threads() {
+        let json = r#"{
+            "title": "Old Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let db_thread: DbThread = serde_json::from_str(json).expect("deserialize legacy thread");
+
+        assert_eq!(db_thread.execution_policy, ThreadExecutionPolicy::Standard);
+        assert_eq!(db_thread.stack_review_origin, None);
+    }
+
+    #[test]
+    fn test_stack_review_origin_forces_read_only_policy() {
+        let mut thread = make_thread(
+            "Review Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.execution_policy = ThreadExecutionPolicy::Standard;
+        thread.stack_review_origin = Some(StackReviewThreadOrigin {
+            project_identity: "project-identity".into(),
+            storage_key: "storage-key".into(),
+            context_key: "comment:root-id".into(),
+            base_oid: "1111111111111111111111111111111111111111".into(),
+            head_oid: "2222222222222222222222222222222222222222".into(),
+        });
+
+        assert_eq!(
+            thread.effective_execution_policy(),
+            ThreadExecutionPolicy::ReadOnly
+        );
+    }
+
+    #[gpui::test]
+    async fn test_thread_execution_policy_and_origin_roundtrip(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).expect("create threads database");
+        let thread_id = session_id("read-only-stack-review-thread");
+        let mut thread = make_thread(
+            "Review Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        let origin = StackReviewThreadOrigin {
+            project_identity: "project-identity".into(),
+            storage_key: "storage-key".into(),
+            context_key: "comment:root-id".into(),
+            base_oid: "1111111111111111111111111111111111111111".into(),
+            head_oid: "2222222222222222222222222222222222222222".into(),
+        };
+        thread.execution_policy = ThreadExecutionPolicy::ReadOnly;
+        thread.stack_review_origin = Some(origin.clone());
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .expect("save thread");
+        let loaded = database
+            .load_thread(thread_id)
+            .await
+            .expect("load thread")
+            .expect("saved thread exists");
+
+        assert_eq!(loaded.execution_policy, ThreadExecutionPolicy::ReadOnly);
+        assert_eq!(loaded.stack_review_origin, Some(origin));
     }
 
     #[gpui::test]
