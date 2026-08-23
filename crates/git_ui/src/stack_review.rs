@@ -7,12 +7,13 @@ use futures::{StreamExt as _, channel::oneshot};
 use git::{
     repository::RevisionContent,
     stack_review::{
-        BranchRef, CommentThreadIndex, PullRequestRef, Stack, StackFile, StackReviewComment,
-        StackReviewCommentAuthor, StackReviewCommentRecord, StackReviewCommentSide,
-        StackReviewCommentSource, StackReviewContentKind, StackReviewCurrentManifest,
-        StackReviewFileProvenance, StackReviewFileStatus, StackReviewGitHubCommentIdentity,
-        StackReviewGitHubCommentKind, StackReviewPresentationState, StackReviewState,
-        StackSnapshot, parse_stack_file, stack_review_storage_key,
+        BranchRef, CommentThreadIndex, CommentThreadKey, PullRequestRef, Stack, StackFile,
+        StackReviewComment, StackReviewCommentAuthor, StackReviewCommentRecord,
+        StackReviewCommentSide, StackReviewCommentSource, StackReviewContentKind,
+        StackReviewCurrentManifest, StackReviewFileProvenance, StackReviewFileStatus,
+        StackReviewGitHubCommentIdentity, StackReviewGitHubCommentKind,
+        StackReviewPresentationState, StackReviewState, StackSnapshot, parse_stack_file,
+        stack_review_storage_key,
     },
 };
 use gpui::{
@@ -35,8 +36,8 @@ use std::{
 };
 use time::OffsetDateTime;
 use ui::{
-    Button, Checkbox, Color, ContextMenu, DiffStat, DropdownMenu, Icon, IconName, Indicator, Label,
-    LabelCommon as _, ListItem, ListItemSpacing, Toggleable as _, prelude::*,
+    Button, Checkbox, Color, ContextMenu, ContextMenuEntry, DiffStat, DropdownMenu, Icon, IconName,
+    Indicator, Label, LabelCommon as _, ListItem, ListItemSpacing, Toggleable as _, prelude::*,
 };
 use uuid::Uuid;
 use workspace::{
@@ -55,6 +56,10 @@ actions!(
         StackReviewNextFile,
         /// Selects the previous visible Stack Review file.
         StackReviewPreviousFile,
+        /// Selects the next visible Stack Review comment thread.
+        StackReviewNextCommentThread,
+        /// Selects the previous visible Stack Review comment thread.
+        StackReviewPreviousCommentThread,
         /// Shows or hides test files in Stack Review.
         StackReviewToggleTests,
         /// Shows or hides migration files in Stack Review.
@@ -925,9 +930,18 @@ async fn build_active_diff_view(
     let restored_comments = cx.update(|window, cx| {
         let right = diff_view.read(cx).editor();
         let right_comments = right.update(cx, |editor, cx| {
-            editor.restore_stack_review_comments(&comments.right, cx);
+            let stashed_record_ids = comments
+                .stashed_right_record_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            editor.replace_stack_review_comment_projection(
+                &comments.right,
+                &stashed_record_ids,
+                window,
+                cx,
+            );
             editor.ensure_next_stack_review_comment_id(next_comment_id);
-            editor.reveal_restored_stack_review_comments(window, cx);
             editor.stack_review_comments(cx)
         });
         let left_comments = diff_view
@@ -935,9 +949,18 @@ async fn build_active_diff_view(
             .left_editor(cx)
             .map(|left| {
                 left.update(cx, |editor, cx| {
-                    editor.restore_stack_review_comments(&comments.left, cx);
+                    let stashed_record_ids = comments
+                        .stashed_left_record_ids
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    editor.replace_stack_review_comment_projection(
+                        &comments.left,
+                        &stashed_record_ids,
+                        window,
+                        cx,
+                    );
                     editor.ensure_next_stack_review_comment_id(next_comment_id);
-                    editor.reveal_restored_stack_review_comments(window, cx);
                     editor.stack_review_comments(cx)
                 })
             })
@@ -945,6 +968,8 @@ async fn build_active_diff_view(
         FileCommentProjection {
             left: left_comments,
             right: right_comments,
+            stashed_left_record_ids: comments.stashed_left_record_ids.clone(),
+            stashed_right_record_ids: comments.stashed_right_record_ids.clone(),
         }
     })?;
     workspace.update_in(cx, |workspace, window, cx| {
@@ -966,12 +991,240 @@ struct LoadedCommentRecord {
 enum FileCommentStatus {
     Comments,
     AwaitingResponse,
+    Stashed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileCommentSummary {
     status: FileCommentStatus,
     comment_count: usize,
+    stashed_thread_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StashedThreadSummary {
+    key: CommentThreadKey,
+    placement_record_id: String,
+    location: String,
+    author: String,
+    preview: String,
+    reply_count: usize,
+    unresolved: bool,
+    awaiting_response: bool,
+    reveal_record_id: Option<String>,
+}
+
+impl StashedThreadSummary {
+    fn menu_label(&self) -> String {
+        let state = if self.awaiting_response {
+            "awaiting response"
+        } else if self.unresolved {
+            "unresolved"
+        } else {
+            "resolved"
+        };
+        format!(
+            "{} · {} · {} · {} replies · {state}",
+            self.location, self.author, self.preview, self.reply_count
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommentThreadNavigationTarget {
+    key: CommentThreadKey,
+    record_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingCommentReveal {
+    key: CommentThreadKey,
+    record_id: String,
+}
+
+fn comment_thread_navigation_targets(
+    files: &[StackReviewFileItem],
+    records: &HashMap<String, LoadedCommentRecord>,
+    thread_index: &CommentThreadIndex,
+    presentation_state: &StackReviewPresentationState,
+    include_resolved: bool,
+    include_stashed: bool,
+    hide_tests: bool,
+    hide_migrations: bool,
+) -> Result<Vec<CommentThreadNavigationTarget>> {
+    let stashed_keys = presentation_state
+        .stashed_roots()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let file_indexes = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| is_visible_review_path(&file.path, hide_tests, hide_migrations))
+        .map(|(index, file)| (file.path.to_string(), index))
+        .collect::<HashMap<_, _>>();
+    let mut ordered_targets = Vec::new();
+    for thread in thread_index.threads() {
+        if !include_stashed && stashed_keys.contains(&thread.key) {
+            continue;
+        }
+        let Some(record) = thread
+            .member_record_ids
+            .iter()
+            .filter_map(|record_id| records.get(record_id))
+            .map(|loaded| &loaded.record)
+            .find(|record| {
+                record.side != StackReviewCommentSide::TopLevel
+                    && !record.outdated
+                    && (include_resolved || !record.is_resolved())
+                    && record
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| file_indexes.contains_key(path))
+            })
+        else {
+            continue;
+        };
+        let Some(path) = record.path.as_ref() else {
+            continue;
+        };
+        let Some(file_index) = file_indexes.get(path).copied() else {
+            continue;
+        };
+        let side_order = match record.side {
+            StackReviewCommentSide::Left => 0,
+            StackReviewCommentSide::Right => 1,
+            StackReviewCommentSide::TopLevel => continue,
+        };
+        ordered_targets.push((
+            file_index,
+            side_order,
+            record.start_row.unwrap_or(u32::MAX),
+            comment_timestamp_nanos(record),
+            thread.key.clone(),
+            record.id.clone(),
+        ));
+    }
+    ordered_targets.sort_by(|left, right| {
+        (&left.0, &left.1, &left.2, &left.3, &left.4, &left.5)
+            .cmp(&(&right.0, &right.1, &right.2, &right.3, &right.4, &right.5))
+    });
+    Ok(ordered_targets
+        .into_iter()
+        .map(|(_, _, _, _, key, record_id)| CommentThreadNavigationTarget { key, record_id })
+        .collect())
+}
+
+fn adjacent_comment_thread_target<'a>(
+    targets: &'a [CommentThreadNavigationTarget],
+    current_key: Option<&CommentThreadKey>,
+    forward: bool,
+) -> Option<&'a CommentThreadNavigationTarget> {
+    if targets.is_empty() {
+        return None;
+    }
+    let Some(current_index) =
+        current_key.and_then(|key| targets.iter().position(|target| &target.key == key))
+    else {
+        return if forward {
+            targets.first()
+        } else {
+            targets.last()
+        };
+    };
+    let next_index = if forward {
+        (current_index + 1) % targets.len()
+    } else if current_index == 0 {
+        targets.len() - 1
+    } else {
+        current_index - 1
+    };
+    targets.get(next_index)
+}
+
+fn cleanup_deleted_thread_presentation(
+    presentation_state: &mut StackReviewPresentationState,
+    thread: &git::stack_review::CommentThread,
+    deleted_record_id: &str,
+) -> Result<bool> {
+    if thread.placement_record_id != deleted_record_id {
+        return Ok(false);
+    }
+    let restored = presentation_state.restore_root(&thread.key)?;
+    let binding_key = format!("comment:{}", thread.key.to_stable_string()?);
+    let unbound = presentation_state.unbind_thread(&binding_key)?.is_some();
+    Ok(restored || unbound)
+}
+
+fn stashed_thread_summaries(
+    records: &HashMap<String, LoadedCommentRecord>,
+    thread_index: &CommentThreadIndex,
+    presentation_state: &StackReviewPresentationState,
+    reviewer_login: Option<&str>,
+    include_resolved: bool,
+    hide_tests: bool,
+    hide_migrations: bool,
+) -> Result<Vec<StashedThreadSummary>> {
+    let stashed_keys = presentation_state
+        .stashed_roots()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut summaries = Vec::new();
+    for thread in thread_index
+        .threads()
+        .iter()
+        .filter(|thread| stashed_keys.contains(&thread.key))
+    {
+        let Some(placement) = records.get(&thread.placement_record_id) else {
+            continue;
+        };
+        let latest = thread
+            .member_record_ids
+            .iter()
+            .filter_map(|record_id| records.get(record_id))
+            .max_by(|left, right| {
+                (comment_timestamp_nanos(&left.record), &left.record.id)
+                    .cmp(&(comment_timestamp_nanos(&right.record), &right.record.id))
+            });
+        let preview = placement
+            .record
+            .body
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(80)
+            .collect::<String>();
+        let reveal_record_id = thread.member_record_ids.iter().find_map(|record_id| {
+            let record = &records.get(record_id)?.record;
+            let path = record.path.as_deref()?;
+            (record.side != StackReviewCommentSide::TopLevel
+                && !record.outdated
+                && (include_resolved || !record.is_resolved())
+                && is_visible_review_path(path, hide_tests, hide_migrations))
+            .then(|| record.id.clone())
+        });
+        summaries.push(StashedThreadSummary {
+            key: thread.key.clone(),
+            placement_record_id: thread.placement_record_id.clone(),
+            location: placement
+                .record
+                .path
+                .clone()
+                .unwrap_or_else(|| "Conversation".into()),
+            author: placement.record.author.name.clone(),
+            preview,
+            reply_count: thread.member_record_ids.len().saturating_sub(1),
+            unresolved: thread.member_record_ids.iter().any(|record_id| {
+                records
+                    .get(record_id)
+                    .is_some_and(|loaded| !loaded.record.is_resolved())
+            }),
+            awaiting_response: latest
+                .is_some_and(|loaded| !is_reviewer_comment(&loaded.record, reviewer_login)),
+            reveal_record_id,
+        });
+    }
+    Ok(summaries)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1090,8 +1343,13 @@ fn is_reviewer_comment(record: &StackReviewCommentRecord, reviewer_login: Option
 fn summarize_file_comments(
     records: &HashMap<String, LoadedCommentRecord>,
     thread_index: &CommentThreadIndex,
+    presentation_state: &StackReviewPresentationState,
     reviewer_login: Option<&str>,
-) -> HashMap<String, FileCommentSummary> {
+) -> Result<HashMap<String, FileCommentSummary>> {
+    let stashed_thread_keys = presentation_state
+        .stashed_roots()?
+        .into_iter()
+        .collect::<HashSet<_>>();
     let is_active = |loaded: &&LoadedCommentRecord| {
         loaded.record.path.is_some()
             && loaded.record.side != StackReviewCommentSide::TopLevel
@@ -1099,14 +1357,38 @@ fn summarize_file_comments(
             && !loaded.record.is_resolved()
     };
     let mut comment_counts = HashMap::<String, usize>::new();
-    for loaded in records.values().filter(is_active) {
+    for loaded in records.values().filter(is_active).filter(|loaded| {
+        thread_index
+            .thread_key_for(&loaded.record.id)
+            .is_none_or(|key| !stashed_thread_keys.contains(key))
+    }) {
         if let Some(path) = loaded.record.path.as_ref() {
             *comment_counts.entry(path.clone()).or_default() += 1;
         }
     }
 
+    let mut stashed_thread_counts = HashMap::<String, usize>::new();
+    for thread in thread_index
+        .threads()
+        .iter()
+        .filter(|thread| stashed_thread_keys.contains(&thread.key))
+    {
+        let Some(path) = records
+            .get(&thread.placement_record_id)
+            .filter(|loaded| loaded.record.side != StackReviewCommentSide::TopLevel)
+            .and_then(|loaded| loaded.record.path.as_ref())
+        else {
+            continue;
+        };
+        *stashed_thread_counts.entry(path.clone()).or_default() += 1;
+    }
+
     let mut statuses = HashMap::new();
-    for thread in thread_index.threads() {
+    for thread in thread_index
+        .threads()
+        .iter()
+        .filter(|thread| !stashed_thread_keys.contains(&thread.key))
+    {
         let latest = thread
             .member_record_ids
             .iter()
@@ -1128,6 +1410,7 @@ fn summarize_file_comments(
             FileCommentStatus::AwaitingResponse
         };
         let comment_count = comment_counts.get(path).copied().unwrap_or_default();
+        let stashed_thread_count = stashed_thread_counts.get(path).copied().unwrap_or_default();
         statuses
             .entry(path.clone())
             .and_modify(|current: &mut FileCommentSummary| {
@@ -1138,15 +1421,25 @@ fn summarize_file_comments(
             .or_insert(FileCommentSummary {
                 status,
                 comment_count,
+                stashed_thread_count,
             });
     }
-    statuses
+    for (path, stashed_thread_count) in stashed_thread_counts {
+        statuses.entry(path).or_insert(FileCommentSummary {
+            status: FileCommentStatus::Stashed,
+            comment_count: 0,
+            stashed_thread_count,
+        });
+    }
+    Ok(statuses)
 }
 
 #[derive(Clone, Default)]
 struct FileCommentProjection {
     left: Vec<StackReviewComment>,
     right: Vec<StackReviewComment>,
+    stashed_left_record_ids: HashSet<String>,
+    stashed_right_record_ids: HashSet<String>,
 }
 
 type EditorCommentRecordIds = HashMap<(StackReviewCommentSide, usize), String>;
@@ -1181,6 +1474,10 @@ struct CommentProjection {
     record_id_by_editor_id: EditorCommentRecordIds,
     next_editor_id: usize,
     thread_index: CommentThreadIndex,
+    visible_comment_count: usize,
+    #[cfg(test)]
+    stashed_comment_count: usize,
+    stashed_thread_count: usize,
 }
 
 enum CommentWrite {
@@ -1381,6 +1678,8 @@ fn project_comment_records(
     base_oid: &str,
     head_oid: &str,
     include_resolved: bool,
+    show_stashed: bool,
+    presentation_state: &StackReviewPresentationState,
     existing_record_ids: &EditorCommentRecordIds,
     next_editor_id_floor: usize,
 ) -> Result<CommentProjection> {
@@ -1392,6 +1691,23 @@ fn project_comment_records(
     }
     let thread_index =
         CommentThreadIndex::new(storage_key, records.values().map(|loaded| &loaded.record))?;
+    let stashed_thread_keys = presentation_state
+        .stashed_roots()?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let stashed_thread_count = thread_index
+        .threads()
+        .iter()
+        .filter(|thread| stashed_thread_keys.contains(&thread.key))
+        .count();
+    let stashed_record_ids = thread_index
+        .threads()
+        .iter()
+        .filter(|thread| stashed_thread_keys.contains(&thread.key))
+        .flat_map(|thread| thread.member_record_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    #[cfg(test)]
+    let stashed_comment_count = stashed_record_ids.len();
     let inline_records = thread_index
         .threads()
         .iter()
@@ -1403,8 +1719,13 @@ fn project_comment_records(
                 StackReviewCommentSide::Left | StackReviewCommentSide::Right
             ) && !loaded.record.outdated
                 && (include_resolved || !loaded.record.is_resolved())
+                && (show_stashed || !stashed_record_ids.contains(&loaded.record.id))
         })
         .collect::<Vec<_>>();
+    let visible_comment_count = inline_records
+        .iter()
+        .filter(|loaded| !stashed_record_ids.contains(&loaded.record.id))
+        .count();
     let mut record_id_by_editor_id = existing_record_ids
         .iter()
         .filter(|(_, record_id)| records.contains_key(record_id.as_str()))
@@ -1470,9 +1791,24 @@ fn project_comment_records(
     let mut comments_by_path = HashMap::<String, FileCommentProjection>::new();
     for (side, comment) in comments {
         let projection = comments_by_path.entry(comment.path.clone()).or_default();
+        let stashed_record_id = comment
+            .record_id
+            .as_ref()
+            .filter(|record_id| stashed_record_ids.contains(record_id.as_str()))
+            .cloned();
         match side {
-            StackReviewCommentSide::Left => projection.left.push(comment),
-            StackReviewCommentSide::Right => projection.right.push(comment),
+            StackReviewCommentSide::Left => {
+                if let Some(record_id) = stashed_record_id {
+                    projection.stashed_left_record_ids.insert(record_id);
+                }
+                projection.left.push(comment);
+            }
+            StackReviewCommentSide::Right => {
+                if let Some(record_id) = stashed_record_id {
+                    projection.stashed_right_record_ids.insert(record_id);
+                }
+                projection.right.push(comment);
+            }
             StackReviewCommentSide::TopLevel => {}
         }
     }
@@ -1481,6 +1817,10 @@ fn project_comment_records(
         record_id_by_editor_id,
         next_editor_id,
         thread_index,
+        visible_comment_count,
+        #[cfg(test)]
+        stashed_comment_count,
+        stashed_thread_count,
     })
 }
 
@@ -1652,6 +1992,20 @@ fn invalidate_state_write_generation(
     let _ = next_state_write_generation(generations, path);
 }
 
+fn confirm_presentation_state_if_newer(
+    confirmed_state: &mut Option<StackReviewPresentationState>,
+    confirmed_generation: &mut u64,
+    generation: u64,
+    candidate: StackReviewPresentationState,
+) -> bool {
+    if generation <= *confirmed_generation {
+        return false;
+    }
+    *confirmed_state = Some(candidate);
+    *confirmed_generation = generation;
+    true
+}
+
 async fn write_latest_state(
     fs: &Arc<dyn Fs>,
     write_lock: &Arc<futures::lock::Mutex<()>>,
@@ -1710,6 +2064,8 @@ struct LoadedStackReview {
     record_id_by_editor_id: EditorCommentRecordIds,
     next_comment_editor_id: usize,
     file_comment_statuses: HashMap<String, FileCommentSummary>,
+    visible_comment_count: usize,
+    stashed_thread_count: usize,
     commenter_cutoffs: Vec<CommenterCutoff>,
     reviewer_login: Option<String>,
     github_snapshot_key: String,
@@ -1738,6 +2094,8 @@ pub struct StackReview {
     review_state: Option<StackReviewState>,
     review_state_path: Option<PathBuf>,
     presentation_state: Option<StackReviewPresentationState>,
+    confirmed_presentation_state: Option<StackReviewPresentationState>,
+    confirmed_presentation_generation: u64,
     presentation_state_path: Option<PathBuf>,
     presentation_state_error: Option<SharedString>,
     files: Vec<StackReviewFileItem>,
@@ -1746,9 +2104,12 @@ pub struct StackReview {
     hide_tests: bool,
     hide_migrations: bool,
     show_resolved_comments: bool,
+    show_stashed_threads: bool,
     sidebar_width: Pixels,
     split_left_ratio: f32,
     review_comment_count: usize,
+    visible_comment_count: usize,
+    stashed_thread_count: usize,
     rendered_left_comment_ids: HashSet<usize>,
     rendered_right_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
@@ -1758,6 +2119,8 @@ pub struct StackReview {
     next_comment_editor_id: usize,
     file_comment_statuses: HashMap<String, FileCommentSummary>,
     commenter_cutoffs: Vec<CommenterCutoff>,
+    selected_comment_record_id: Option<String>,
+    pending_comment_reveal: Option<PendingCommentReveal>,
     selected_commenter: Option<String>,
     reviewer_login: Option<String>,
     refreshed_github_snapshots: HashSet<String>,
@@ -1985,6 +2348,8 @@ impl StackReview {
             review_state: None,
             review_state_path: None,
             presentation_state: None,
+            confirmed_presentation_state: None,
+            confirmed_presentation_generation: 0,
             presentation_state_path: None,
             presentation_state_error: None,
             files: Vec::new(),
@@ -1993,9 +2358,12 @@ impl StackReview {
             hide_tests: false,
             hide_migrations: false,
             show_resolved_comments: false,
+            show_stashed_threads: false,
             sidebar_width: STACK_REVIEW_SIDEBAR_DEFAULT_WIDTH,
             split_left_ratio: 0.5,
             review_comment_count: 0,
+            visible_comment_count: 0,
+            stashed_thread_count: 0,
             rendered_left_comment_ids: HashSet::new(),
             rendered_right_comment_ids: HashSet::new(),
             comment_records: HashMap::new(),
@@ -2005,6 +2373,8 @@ impl StackReview {
             next_comment_editor_id: 0,
             file_comment_statuses: HashMap::new(),
             commenter_cutoffs: Vec::new(),
+            selected_comment_record_id: None,
+            pending_comment_reveal: None,
             selected_commenter: None,
             reviewer_login: None,
             refreshed_github_snapshots: HashSet::new(),
@@ -2065,12 +2435,18 @@ impl StackReview {
         self.review_state = None;
         self.review_state_path = None;
         self.presentation_state = None;
+        self.confirmed_presentation_state = None;
+        self.confirmed_presentation_generation = 0;
         self.presentation_state_path = None;
         self.presentation_state_error = None;
         self.files.clear();
         self.content_entries.clear();
         self.selected_file_index = None;
         self.review_comment_count = 0;
+        self.visible_comment_count = 0;
+        self.stashed_thread_count = 0;
+        self.selected_comment_record_id = None;
+        self.pending_comment_reveal = None;
         self.rendered_left_comment_ids.clear();
         self.rendered_right_comment_ids.clear();
         self.comment_records.clear();
@@ -2125,6 +2501,7 @@ impl StackReview {
         let state_root = self.state_root.clone();
         let work_directory = self.work_directory.clone();
         let show_resolved_comments = self.show_resolved_comments;
+        let show_stashed_threads = self.show_stashed_threads;
         let hide_tests = self.hide_tests;
         let hide_migrations = self.hide_migrations;
         let split_left_ratio = self.split_left_ratio;
@@ -2251,6 +2628,8 @@ impl StackReview {
                     &diff.base_ref,
                     &diff.head_ref,
                     show_resolved_comments,
+                    show_stashed_threads,
+                    &loaded_presentation_state.state,
                     &HashMap::new(),
                     0,
                 )?;
@@ -2258,8 +2637,9 @@ impl StackReview {
                 let file_comment_statuses = summarize_file_comments(
                     &comment_records,
                     &comment_projection.thread_index,
+                    &loaded_presentation_state.state,
                     reviewer_login.as_deref(),
-                );
+                )?;
                 let commenter_cutoffs = latest_comment_cutoffs(&comment_records);
                 let files: Vec<StackReviewFileItem> = diff
                     .files
@@ -2335,6 +2715,8 @@ impl StackReview {
                     record_id_by_editor_id: comment_projection.record_id_by_editor_id,
                     next_comment_editor_id: next_comment_id,
                     file_comment_statuses,
+                    visible_comment_count: comment_projection.visible_comment_count,
+                    stashed_thread_count: comment_projection.stashed_thread_count,
                     commenter_cutoffs,
                     reviewer_login,
                     github_snapshot_key,
@@ -2375,6 +2757,8 @@ impl StackReview {
                     this.provenance_summary = Some(loaded.provenance_summary);
                     this.review_state = Some(loaded.review_state);
                     this.review_state_path = loaded.review_state_path;
+                    this.confirmed_presentation_state = Some(loaded.presentation_state.clone());
+                    this.confirmed_presentation_generation = 0;
                     this.presentation_state = Some(loaded.presentation_state);
                     this.presentation_state_path = loaded.presentation_state_path;
                     this.presentation_state_error = loaded.presentation_state_error;
@@ -2390,6 +2774,8 @@ impl StackReview {
                     this.record_id_by_editor_id = loaded.record_id_by_editor_id;
                     this.next_comment_editor_id = loaded.next_comment_editor_id;
                     this.file_comment_statuses = loaded.file_comment_statuses;
+                    this.visible_comment_count = loaded.visible_comment_count;
+                    this.stashed_thread_count = loaded.stashed_thread_count;
                     this.commenter_cutoffs = loaded.commenter_cutoffs;
                     this.reviewer_login = loaded.reviewer_login;
                     this.comments_directory = Some(loaded.comments_directory);
@@ -2452,6 +2838,8 @@ impl StackReview {
                     this.review_state = None;
                     this.review_state_path = None;
                     this.presentation_state = None;
+                    this.confirmed_presentation_state = None;
+                    this.confirmed_presentation_generation = 0;
                     this.presentation_state_path = None;
                     this.presentation_state_error = None;
                     this.files.clear();
@@ -2501,6 +2889,18 @@ impl StackReview {
                     EditorEvent::StackReviewCommentCheckpointRequested { record_id } => {
                         this.use_comment_record_as_from(record_id, window, cx);
                     }
+                    EditorEvent::ReviewCommentSelected { record_id } => {
+                        this.selected_comment_record_id = Some(record_id.clone());
+                    }
+                    EditorEvent::ReviewCommentStashRequested { record_id } => {
+                        this.set_comment_thread_stashed(record_id, true, false, window, cx);
+                    }
+                    EditorEvent::ReviewCommentRestoreRequested { record_id } => {
+                        this.set_comment_thread_stashed(record_id, false, false, window, cx);
+                    }
+                    EditorEvent::StackReviewCommentDeleted { record_id } => {
+                        this.delete_stack_review_comment_record(record_id, window, cx);
+                    }
                     _ => {}
                 }
             },
@@ -2513,6 +2913,10 @@ impl StackReview {
             self.state_error = Some("Unable to project comments without review state".into());
             return;
         };
+        let Some(presentation_state) = self.confirmed_presentation_state.as_ref() else {
+            self.state_error = Some("Unable to project comments without presentation state".into());
+            return;
+        };
         let storage_key = stack_review_storage_key(&review_state.base_oid, &review_state.head_oid);
         let projection = match project_comment_records(
             &self.comment_records,
@@ -2520,6 +2924,8 @@ impl StackReview {
             &review_state.base_oid,
             &review_state.head_oid,
             self.show_resolved_comments,
+            self.show_stashed_threads,
+            presentation_state,
             &self.record_id_by_editor_id,
             self.next_comment_editor_id,
         ) {
@@ -2530,15 +2936,95 @@ impl StackReview {
             }
         };
         self.next_comment_editor_id = projection.next_editor_id;
+        self.visible_comment_count = projection.visible_comment_count;
+        self.stashed_thread_count = projection.stashed_thread_count;
         self.comments_by_path = projection.comments_by_path;
         self.comment_thread_index = projection.thread_index;
         self.record_id_by_editor_id = projection.record_id_by_editor_id;
-        self.file_comment_statuses = summarize_file_comments(
+        self.file_comment_statuses = match summarize_file_comments(
             &self.comment_records,
             &self.comment_thread_index,
+            presentation_state,
             self.reviewer_login.as_deref(),
-        );
+        ) {
+            Ok(statuses) => statuses,
+            Err(error) => {
+                self.state_error = Some(error.to_string().into());
+                return;
+            }
+        };
         self.commenter_cutoffs = latest_comment_cutoffs(&self.comment_records);
+    }
+
+    fn refresh_active_comment_projection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_path) = self
+            .selected_file_index
+            .and_then(|index| self.content_entries.get(index))
+            .map(|entry| entry.path.to_string_lossy().into_owned())
+        else {
+            cx.notify();
+            return;
+        };
+        let Some(diff_view) = self.diff_view.clone() else {
+            cx.notify();
+            return;
+        };
+        let comments = self
+            .comments_by_path
+            .get(&active_path)
+            .cloned()
+            .unwrap_or_default();
+        let next_comment_id = self.next_comment_editor_id;
+        let right = diff_view.read(cx).editor();
+        let rendered_right = right.update(cx, |editor, cx| {
+            let stashed_record_ids = comments
+                .stashed_right_record_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            editor.replace_stack_review_comment_projection(
+                &comments.right,
+                &stashed_record_ids,
+                window,
+                cx,
+            );
+            editor.ensure_next_stack_review_comment_id(next_comment_id);
+            editor.stack_review_comments(cx)
+        });
+        let rendered_left = diff_view
+            .read(cx)
+            .left_editor(cx)
+            .map(|left| {
+                left.update(cx, |editor, cx| {
+                    let stashed_record_ids = comments
+                        .stashed_left_record_ids
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    editor.replace_stack_review_comment_projection(
+                        &comments.left,
+                        &stashed_record_ids,
+                        window,
+                        cx,
+                    );
+                    editor.ensure_next_stack_review_comment_id(next_comment_id);
+                    editor.stack_review_comments(cx)
+                })
+            })
+            .unwrap_or_default();
+        self.rendered_right_comment_ids = rendered_right
+            .into_iter()
+            .map(|comment| comment.id)
+            .collect();
+        self.rendered_left_comment_ids = rendered_left
+            .into_iter()
+            .map(|comment| comment.id)
+            .collect();
+        self.active_comment_projection_stale = false;
+        if let Some(target) = self.pending_comment_reveal.take() {
+            self.reveal_comment_target(target, window, cx);
+        }
+        cx.notify();
     }
 
     fn remember_active_split_ratio(&mut self, cx: &App) {
@@ -2628,7 +3114,11 @@ impl StackReview {
                         );
                     }
                     this.error = None;
-                    window.focus(&editor.focus_handle(cx), cx);
+                    if let Some(target) = this.pending_comment_reveal.take() {
+                        this.reveal_comment_target(target, window, cx);
+                    } else {
+                        window.focus(&editor.focus_handle(cx), cx);
+                    }
                     cx.notify();
                 }
                 Err(error) => {
@@ -2848,9 +3338,7 @@ impl StackReview {
             }
         })
         .detach();
-        if let Some(index) = self.selected_file_index {
-            self.select_file(index, window, cx);
-        }
+        self.refresh_active_comment_projection(window, cx);
     }
 
     fn reconcile_editor_comments(
@@ -3009,6 +3497,107 @@ impl StackReview {
         .detach();
     }
 
+    fn delete_stack_review_comment_record(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = self.comment_records.get(record_id).cloned() else {
+            self.refresh_active_comment_projection(window, cx);
+            return;
+        };
+        if !loaded.record.is_writable() {
+            self.refresh_active_comment_projection(window, cx);
+            return;
+        }
+        let old_thread = self
+            .comment_thread_index
+            .thread_key_for(record_id)
+            .and_then(|key| self.comment_thread_index.thread(key))
+            .cloned();
+        let record_id = record_id.to_owned();
+        let expected_path = loaded.path;
+        let expected_serialized = loaded.serialized;
+        let fs = self.fs.clone();
+        let write_lock = self.comment_write_lock.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = apply_comment_writes(
+                fs,
+                write_lock,
+                vec![CommentWrite::Delete {
+                    path: expected_path.clone(),
+                    expected: expected_serialized.clone(),
+                }],
+            )
+            .await;
+            if let Err(update_error) = this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    let current_record = this.comment_records.get(&record_id);
+                    let replaced = current_record.is_some_and(|loaded| {
+                        loaded.path != expected_path || loaded.serialized != expected_serialized
+                    });
+                    if replaced {
+                        this.state_error = Some(
+                            "Comment changed while its deletion was completing; refreshed the current records"
+                                .into(),
+                        );
+                        this.rebuild_comment_derived_state();
+                        this.refresh_active_comment_projection(window, cx);
+                        return;
+                    }
+                    if current_record.is_some() {
+                        this.comment_records.remove(&record_id);
+                    }
+                    this.record_id_by_editor_id
+                        .retain(|_, mapped_record_id| mapped_record_id != &record_id);
+                    if this.selected_comment_record_id.as_deref() == Some(record_id.as_str()) {
+                        this.selected_comment_record_id = None;
+                    }
+                    let mut presentation_changed = false;
+                    if let Some(old_thread) = old_thread.as_ref() {
+                        if this.presentation_state_path.is_some() {
+                            if let Some(mut presentation_state) = this.presentation_state.clone() {
+                                match cleanup_deleted_thread_presentation(
+                                    &mut presentation_state,
+                                    old_thread,
+                                    &record_id,
+                                ) {
+                                    Ok(changed) => {
+                                        presentation_changed = changed;
+                                        this.presentation_state = Some(presentation_state);
+                                    }
+                                    Err(error) => {
+                                        this.presentation_state_error =
+                                            Some(error.to_string().into());
+                                    }
+                                }
+                            }
+                        } else if old_thread.placement_record_id == record_id {
+                            this.presentation_state_error = Some(
+                                "Comment was deleted, but its presentation state is read-only"
+                                    .into(),
+                            );
+                        }
+                    }
+                    this.rebuild_comment_derived_state();
+                    this.refresh_active_comment_projection(window, cx);
+                    if presentation_changed {
+                        this.queue_presentation_state_write(window, cx);
+                    }
+                }
+                Err(error) => {
+                    this.state_error = Some(error.to_string().into());
+                    this.rebuild_comment_derived_state();
+                    this.refresh_active_comment_projection(window, cx);
+                }
+            }) {
+                log::error!("failed to finish Stack Review comment deletion: {update_error:#}");
+            }
+        })
+        .detach();
+    }
+
     fn add_comment_at_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(diff_view) = &self.diff_view {
             diff_view.read(cx).editor().update(cx, |editor, cx| {
@@ -3078,9 +3667,8 @@ impl StackReview {
         .detach();
     }
 
-    #[allow(dead_code)]
-    fn queue_presentation_state_write(&mut self, cx: &mut Context<Self>) {
-        let Some(presentation_state) = self.presentation_state.as_ref() else {
+    fn queue_presentation_state_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(presentation_state) = self.presentation_state.as_ref().cloned() else {
             return;
         };
         let Some(presentation_state_path) = self.presentation_state_path.clone() else {
@@ -3089,8 +3677,11 @@ impl StackReview {
         let contents = match presentation_state.to_json() {
             Ok(contents) => contents,
             Err(error) => {
+                self.presentation_state = self.confirmed_presentation_state.clone();
+                self.pending_comment_reveal = None;
                 self.presentation_state_error = Some(error.to_string().into());
-                cx.notify();
+                self.rebuild_comment_derived_state();
+                self.refresh_active_comment_projection(window, cx);
                 return;
             }
         };
@@ -3103,7 +3694,8 @@ impl StackReview {
             &mut self.state_write_generations,
             &presentation_state_path,
         );
-        cx.spawn(async move |this, cx| {
+        let completion_generation = latest_generation.clone();
+        cx.spawn_in(window, async move |this, cx| {
             let result = write_latest_state(
                 &fs,
                 &write_lock,
@@ -3116,11 +3708,34 @@ impl StackReview {
             if matches!(&result, Ok(false)) {
                 return;
             }
-            if let Err(update_error) = this.update(cx, |this, cx| {
-                if this.presentation_state_path.as_ref() == Some(&presentation_state_path) {
-                    this.presentation_state_error =
-                        result.err().map(|error| error.to_string().into());
-                    cx.notify();
+            if let Err(update_error) = this.update_in(cx, |this, window, cx| {
+                if this.presentation_state_path.as_ref() != Some(&presentation_state_path) {
+                    return;
+                }
+                let is_latest = completion_generation.load(Ordering::SeqCst) == generation;
+                match result {
+                    Ok(true) => {
+                        let advanced = confirm_presentation_state_if_newer(
+                            &mut this.confirmed_presentation_state,
+                            &mut this.confirmed_presentation_generation,
+                            generation,
+                            presentation_state,
+                        );
+                        if is_latest && advanced {
+                            this.presentation_state_error = None;
+                            this.rebuild_comment_derived_state();
+                            this.refresh_active_comment_projection(window, cx);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) if is_latest => {
+                        this.presentation_state = this.confirmed_presentation_state.clone();
+                        this.pending_comment_reveal = None;
+                        this.presentation_state_error = Some(error.to_string().into());
+                        this.rebuild_comment_derived_state();
+                        this.refresh_active_comment_projection(window, cx);
+                    }
+                    Err(_) => {}
                 }
             }) {
                 log::error!(
@@ -3419,6 +4034,68 @@ impl StackReview {
         self.select_adjacent_file(false, window, cx);
     }
 
+    fn select_adjacent_comment_thread(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(presentation_state) = self.confirmed_presentation_state.as_ref() else {
+            return;
+        };
+        let targets = match comment_thread_navigation_targets(
+            &self.files,
+            &self.comment_records,
+            &self.comment_thread_index,
+            presentation_state,
+            self.show_resolved_comments,
+            self.show_stashed_threads,
+            self.hide_tests,
+            self.hide_migrations,
+        ) {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.state_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let current_key = self
+            .selected_comment_record_id
+            .as_deref()
+            .and_then(|record_id| self.comment_thread_index.thread_key_for(record_id));
+        let Some(target) = adjacent_comment_thread_target(&targets, current_key, forward).cloned()
+        else {
+            return;
+        };
+        self.reveal_comment_target(
+            PendingCommentReveal {
+                key: target.key,
+                record_id: target.record_id,
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn next_comment_thread(
+        &mut self,
+        _: &StackReviewNextCommentThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_adjacent_comment_thread(true, window, cx);
+    }
+
+    fn previous_comment_thread(
+        &mut self,
+        _: &StackReviewPreviousCommentThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_adjacent_comment_thread(false, window, cx);
+    }
+
     fn reconcile_filtered_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible_indexes = self.visible_file_indexes();
         if self
@@ -3454,9 +4131,160 @@ impl StackReview {
     fn toggle_resolved_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_resolved_comments = !self.show_resolved_comments;
         self.rebuild_comment_derived_state();
-        if let Some(index) = self.selected_file_index {
-            self.select_file(index, window, cx);
+        self.refresh_active_comment_projection(window, cx);
+    }
+
+    fn toggle_stashed_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_stashed_threads = !self.show_stashed_threads;
+        self.rebuild_comment_derived_state();
+        self.refresh_active_comment_projection(window, cx);
+    }
+
+    fn set_comment_thread_stashed(
+        &mut self,
+        seed_record_id: &str,
+        stashed: bool,
+        reveal_after_restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.presentation_state_path.is_none() {
+            if self.presentation_state_error.is_none() {
+                self.presentation_state_error =
+                    Some("Stack Review presentation state is read-only".into());
+            }
+            cx.notify();
+            return;
+        }
+        let Some(thread_key) = self
+            .comment_thread_index
+            .thread_key_for(seed_record_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(presentation_state) = self.presentation_state.as_mut() else {
+            return;
+        };
+        let changed = if stashed {
+            presentation_state.stash_root(&thread_key)
         } else {
+            presentation_state.restore_root(&thread_key)
+        };
+        match changed {
+            Ok(true) => {
+                self.selected_comment_record_id = Some(seed_record_id.to_owned());
+                if reveal_after_restore && !stashed {
+                    self.pending_comment_reveal = Some(PendingCommentReveal {
+                        key: thread_key.clone(),
+                        record_id: seed_record_id.to_owned(),
+                    });
+                }
+                self.queue_presentation_state_write(window, cx);
+            }
+            Ok(false) => {
+                if reveal_after_restore && !stashed {
+                    self.reveal_comment_record(seed_record_id, window, cx);
+                }
+            }
+            Err(error) => {
+                self.presentation_state_error = Some(error.to_string().into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn reveal_comment_record(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.comment_thread_index.thread_key_for(record_id).cloned() else {
+            return;
+        };
+        self.reveal_comment_target(
+            PendingCommentReveal {
+                key,
+                record_id: record_id.to_owned(),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn reveal_comment_target(
+        &mut self,
+        target: PendingCommentReveal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.comment_thread_index.thread_key_for(&target.record_id) != Some(&target.key) {
+            self.pending_comment_reveal = None;
+            self.state_error =
+                Some("The selected comment thread changed before it could be revealed".into());
+            cx.notify();
+            return;
+        }
+        let Some(record) = self
+            .comment_records
+            .get(&target.record_id)
+            .map(|loaded| loaded.record.clone())
+        else {
+            self.pending_comment_reveal = None;
+            self.state_error = Some("The selected comment is no longer available".into());
+            cx.notify();
+            return;
+        };
+        if record.side == StackReviewCommentSide::TopLevel {
+            self.pending_comment_reveal = None;
+            self.state_error = Some(
+                "Conversation comments do not yet have an inline reveal surface; restore is available"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(path) = record.path.as_deref() else {
+            return;
+        };
+        let Some(file_index) = self
+            .files
+            .iter()
+            .position(|file| file.path.as_ref() == path)
+        else {
+            return;
+        };
+        self.selected_comment_record_id = Some(target.record_id.clone());
+        if self.selected_file_index != Some(file_index) || self.diff_view.is_none() {
+            self.pending_comment_reveal = Some(target);
+            self.select_file(file_index, window, cx);
+            return;
+        }
+        let Some(diff_view) = self.diff_view.as_ref() else {
+            return;
+        };
+        let revealed = match record.side {
+            StackReviewCommentSide::Left => {
+                diff_view.read(cx).left_editor(cx).is_some_and(|editor| {
+                    editor.update(cx, |editor, cx| {
+                        editor.reveal_stack_review_comment(&target.record_id, window, cx)
+                    })
+                })
+            }
+            StackReviewCommentSide::Right => {
+                diff_view.read(cx).editor().update(cx, |editor, cx| {
+                    editor.reveal_stack_review_comment(&target.record_id, window, cx)
+                })
+            }
+            StackReviewCommentSide::TopLevel => false,
+        };
+        if revealed {
+            self.pending_comment_reveal = None;
+            self.state_error = None;
+        } else {
+            self.state_error =
+                Some("The selected comment is not visible with the current filters".into());
             cx.notify();
         }
     }
@@ -3506,11 +4334,22 @@ impl StackReview {
                                 .min_w_0()
                                 .gap_1()
                                 .when_some(comment_summary, move |name, summary| {
-                                    let (selector, color) = match summary.status {
-                                        FileCommentStatus::Comments => ("comments", Color::Default),
+                                    let (selector, color, count, stashed) = match summary.status {
+                                        FileCommentStatus::Comments => (
+                                            "comments",
+                                            Color::Default,
+                                            summary.comment_count,
+                                            false,
+                                        ),
                                         FileCommentStatus::AwaitingResponse => {
-                                            ("awaiting", Color::Error)
+                                            ("awaiting", Color::Error, summary.comment_count, false)
                                         }
+                                        FileCommentStatus::Stashed => (
+                                            "stashed",
+                                            Color::Muted,
+                                            summary.stashed_thread_count,
+                                            true,
+                                        ),
                                     };
                                     name.child(
                                         h_flex()
@@ -3521,9 +4360,16 @@ impl StackReview {
                                                     "STACK_REVIEW_FILE_COMMENT-{index}-{selector}"
                                                 )
                                             })
-                                            .child(Indicator::dot().color(color))
+                                            .child(if stashed {
+                                                Icon::new(IconName::Archive)
+                                                    .size(ui::IconSize::XSmall)
+                                                    .color(color)
+                                                    .into_any_element()
+                                            } else {
+                                                Indicator::dot().color(color).into_any_element()
+                                            })
                                             .child(
-                                                Label::new(summary.comment_count.to_string())
+                                                Label::new(count.to_string())
                                                     .size(ui::LabelSize::Small)
                                                     .color(color),
                                             ),
@@ -3809,6 +4655,14 @@ impl StackReview {
                 menu.context(shortcut_focus)
                     .action("Previous file", Box::new(StackReviewPreviousFile))
                     .action("Next file", Box::new(StackReviewNextFile))
+                    .action(
+                        "Previous comment thread",
+                        Box::new(StackReviewPreviousCommentThread),
+                    )
+                    .action(
+                        "Next comment thread",
+                        Box::new(StackReviewNextCommentThread),
+                    )
                     .separator()
                     .action(
                         "Previous changed hunk",
@@ -3835,6 +4689,70 @@ impl StackReview {
             .values()
             .filter(|loaded| loaded.record.is_resolved())
             .count();
+        let stashed_thread_summaries = self
+            .confirmed_presentation_state
+            .as_ref()
+            .and_then(|presentation_state| {
+                stashed_thread_summaries(
+                    &self.comment_records,
+                    &self.comment_thread_index,
+                    presentation_state,
+                    self.reviewer_login.as_deref(),
+                    self.show_resolved_comments,
+                    self.hide_tests,
+                    self.hide_migrations,
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let stashed_thread_menu = (!stashed_thread_summaries.is_empty()).then(|| {
+            let review = cx.weak_entity();
+            DropdownMenu::new(
+                "stack-review-stashed-threads",
+                format!("Stashed threads ({})", stashed_thread_summaries.len()),
+                ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                    for summary in &stashed_thread_summaries {
+                        let label = summary.menu_label();
+                        let record_id = summary.placement_record_id.clone();
+                        let restore_review = review.clone();
+                        menu = menu.entry(format!("Restore · {label}"), None, move |window, cx| {
+                            restore_review
+                                .update(cx, |this, cx| {
+                                    this.set_comment_thread_stashed(
+                                        &record_id, false, false, window, cx,
+                                    );
+                                })
+                                .ok();
+                        });
+                        if let Some(record_id) = summary.reveal_record_id.clone() {
+                            let reveal_review = review.clone();
+                            menu = menu.entry(
+                                format!("Restore and reveal · {label}"),
+                                None,
+                                move |window, cx| {
+                                    reveal_review
+                                        .update(cx, |this, cx| {
+                                            this.set_comment_thread_stashed(
+                                                &record_id, false, true, window, cx,
+                                            );
+                                        })
+                                        .ok();
+                                },
+                            );
+                        } else {
+                            menu = menu.item(
+                                ContextMenuEntry::new(
+                                    "Restore and reveal unavailable · Conversation has no inline surface",
+                                )
+                                .disabled(true),
+                            );
+                        }
+                        menu = menu.separator();
+                    }
+                    menu
+                }),
+            )
+        });
         let status = h_flex()
             .w_full()
             .flex_wrap()
@@ -3863,8 +4781,29 @@ impl StackReview {
                 |status, summary| status.child(Label::new(summary).color(Color::Muted)),
             )
             .child(
-                Label::new(format!("{} comments", self.review_comment_count)).color(Color::Muted),
+                Label::new(format!(
+                    "{} visible comments · {} stashed threads",
+                    self.visible_comment_count, self.stashed_thread_count
+                ))
+                .color(Color::Muted),
             )
+            .when_some(stashed_thread_menu, |status, menu| status.child(menu))
+            .when(self.stashed_thread_count > 0, |status| {
+                status.child(
+                    Button::new(
+                        "stack-review-show-stashed",
+                        if self.show_stashed_threads {
+                            format!("Hide Stashed ({})", self.stashed_thread_count)
+                        } else {
+                            format!("Show Stashed ({})", self.stashed_thread_count)
+                        },
+                    )
+                    .toggle_state(self.show_stashed_threads)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_stashed_threads(window, cx);
+                    })),
+                )
+            })
             .when(self.github_refreshing, |status| {
                 status.child(Label::new("Refreshing GitHub comments…").color(Color::Muted))
             })
@@ -4202,6 +5141,8 @@ impl Render for StackReview {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::next_file))
             .on_action(cx.listener(Self::previous_file))
+            .on_action(cx.listener(Self::next_comment_thread))
+            .on_action(cx.listener(Self::previous_comment_thread))
             .on_action(cx.listener(|this, _: &StackReviewToggleTests, window, cx| {
                 this.toggle_test_filter(window, cx);
             }))
@@ -4312,6 +5253,8 @@ mod tests {
                 for action_name in [
                     "git::StackReviewPreviousFile",
                     "git::StackReviewNextFile",
+                    "git::StackReviewPreviousCommentThread",
+                    "git::StackReviewNextCommentThread",
                     "editor::ToggleActiveReviewCommentResolved",
                     "git::StackReviewToggleTests",
                     "git::StackReviewToggleMigrations",
@@ -4379,6 +5322,17 @@ mod tests {
         assert_eq!(records[2].updated_at, "2026-08-22T12:02:00Z");
     }
 
+    fn test_file_item(path: &str) -> StackReviewFileItem {
+        StackReviewFileItem {
+            path: path.into(),
+            fingerprint: format!("{path}-fingerprint").into(),
+            provenance: StackReviewFileProvenance::Direct,
+            content_kind: StackReviewContentKind::Text,
+            additions: Some(1),
+            deletions: Some(1),
+        }
+    }
+
     fn test_comment_record(
         id: &str,
         path: &str,
@@ -4419,14 +5373,38 @@ mod tests {
         existing_record_ids: &EditorCommentRecordIds,
         next_editor_id_floor: usize,
     ) -> Result<CommentProjection> {
+        let presentation_state = StackReviewPresentationState::new("base", "head");
+        let storage_key = stack_review_storage_key("base", "head");
         project_comment_records(
             records,
-            "base-head",
+            &storage_key,
             "base",
             "head",
             include_resolved,
+            false,
+            &presentation_state,
             existing_record_ids,
             next_editor_id_floor,
+        )
+    }
+
+    fn project_test_comment_records_with_presentation(
+        records: &HashMap<String, LoadedCommentRecord>,
+        include_resolved: bool,
+        show_stashed: bool,
+        presentation_state: &StackReviewPresentationState,
+    ) -> Result<CommentProjection> {
+        let storage_key = stack_review_storage_key("base", "head");
+        project_comment_records(
+            records,
+            &storage_key,
+            "base",
+            "head",
+            include_resolved,
+            show_stashed,
+            presentation_state,
+            &HashMap::new(),
+            0,
         )
     }
 
@@ -4437,7 +5415,22 @@ mod tests {
         let thread_index =
             CommentThreadIndex::new("base-head", records.values().map(|loaded| &loaded.record))
                 .expect("build test comment thread index");
-        summarize_file_comments(records, &thread_index, reviewer_login)
+        let presentation_state = StackReviewPresentationState::new("base", "head");
+        summarize_file_comments(records, &thread_index, &presentation_state, reviewer_login)
+            .expect("summarize test comments")
+    }
+
+    fn summarize_test_file_comments_with_presentation(
+        records: &HashMap<String, LoadedCommentRecord>,
+        presentation_state: &StackReviewPresentationState,
+        reviewer_login: Option<&str>,
+    ) -> HashMap<String, FileCommentSummary> {
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(&storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("build test comment thread index");
+        summarize_file_comments(records, &thread_index, presentation_state, reviewer_login)
+            .expect("summarize test comments with presentation")
     }
 
     #[test]
@@ -4540,6 +5533,83 @@ mod tests {
             FileCommentStatus::AwaitingResponse
         );
         assert_eq!(summary["src/awaiting.rs"].comment_count, 2);
+    }
+
+    #[test]
+    fn file_badges_exclude_stashed_status_and_count_canonical_threads() {
+        let visible = test_comment_record(
+            "visible",
+            "src/mixed.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let stashed_root = test_comment_record(
+            "stashed-root",
+            "src/mixed.rs",
+            StackReviewCommentSource::Github,
+            Some("other"),
+            None,
+            "2026-08-21T12:01:00Z",
+        );
+        let stashed_child = test_comment_record(
+            "stashed-child",
+            "src/mixed.rs",
+            StackReviewCommentSource::Github,
+            Some("other"),
+            Some("stashed-root"),
+            "2026-08-21T12:02:00Z",
+        );
+        let only_stashed_root = test_comment_record(
+            "only-stashed-root",
+            "src/stashed.rs",
+            StackReviewCommentSource::Github,
+            Some("other"),
+            None,
+            "2026-08-21T12:03:00Z",
+        );
+        let only_stashed_child = test_comment_record(
+            "only-stashed-child",
+            "src/stashed.rs",
+            StackReviewCommentSource::Github,
+            Some("other"),
+            Some("only-stashed-root"),
+            "2026-08-21T12:04:00Z",
+        );
+        let records = HashMap::from([
+            ("visible".into(), visible),
+            ("stashed-root".into(), stashed_root),
+            ("stashed-child".into(), stashed_child),
+            ("only-stashed-root".into(), only_stashed_root),
+            ("only-stashed-child".into(), only_stashed_child),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let index =
+            CommentThreadIndex::new(&storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("complete badge index");
+        let mut presentation_state = StackReviewPresentationState::new("base", "head");
+        for record_id in ["stashed-root", "only-stashed-root"] {
+            presentation_state
+                .stash_root(
+                    index
+                        .thread_key_for(record_id)
+                        .expect("stashed badge thread key"),
+                )
+                .expect("stash badge thread");
+        }
+
+        let summary = summarize_test_file_comments_with_presentation(
+            &records,
+            &presentation_state,
+            Some("xHayden"),
+        );
+        assert_eq!(summary["src/mixed.rs"].status, FileCommentStatus::Comments);
+        assert_eq!(summary["src/mixed.rs"].comment_count, 1);
+        assert_eq!(summary["src/mixed.rs"].stashed_thread_count, 1);
+        assert_eq!(summary["src/stashed.rs"].status, FileCommentStatus::Stashed);
+        assert_eq!(summary["src/stashed.rs"].comment_count, 0);
+        assert_eq!(summary["src/stashed.rs"].stashed_thread_count, 1);
     }
 
     #[test]
@@ -4710,6 +5780,565 @@ mod tests {
                 .to_string()
                 .contains("comment does not match the selected Git snapshot")
         );
+    }
+
+    #[test]
+    fn stash_editor_events_carry_stable_record_identity() {
+        assert_eq!(
+            EditorEvent::ReviewCommentStashRequested {
+                record_id: "stable-root".into(),
+            },
+            EditorEvent::ReviewCommentStashRequested {
+                record_id: "stable-root".into(),
+            }
+        );
+        assert_ne!(
+            EditorEvent::ReviewCommentStashRequested {
+                record_id: "stable-root".into(),
+            },
+            EditorEvent::ReviewCommentRestoreRequested {
+                record_id: "stable-root".into(),
+            }
+        );
+        assert_eq!(
+            EditorEvent::ReviewCommentSelected {
+                record_id: "stable-reply".into(),
+            },
+            EditorEvent::ReviewCommentSelected {
+                record_id: "stable-reply".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn stashed_summary_uses_a_projectable_member_for_reveal() {
+        let mut root = test_comment_record(
+            "root",
+            "tests/reveal.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        root.record.outdated = true;
+        let child = test_comment_record(
+            "child",
+            "tests/reveal.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            Some("root"),
+            "2026-08-21T12:01:00Z",
+        );
+        let records = HashMap::from([
+            (root.record.id.clone(), root),
+            (child.record.id.clone(), child),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let index =
+            CommentThreadIndex::new(storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("build index");
+        let key = index.thread_key_for("root").expect("thread key");
+        let mut presentation = StackReviewPresentationState::new("base", "head");
+        presentation.stash_root(key).expect("stash root");
+
+        let summaries = stashed_thread_summaries(
+            &records,
+            &index,
+            &presentation,
+            Some("xHayden"),
+            false,
+            false,
+            false,
+        )
+        .expect("summaries");
+        assert_eq!(summaries[0].placement_record_id, "root");
+        assert_eq!(summaries[0].reveal_record_id.as_deref(), Some("child"));
+
+        let hidden = stashed_thread_summaries(
+            &records,
+            &index,
+            &presentation,
+            Some("xHayden"),
+            false,
+            true,
+            false,
+        )
+        .expect("hidden summaries");
+        assert_eq!(hidden[0].reveal_record_id, None);
+    }
+
+    #[test]
+    fn confirmed_root_deletion_cleans_only_its_exact_presentation_key() {
+        let root = test_comment_record(
+            "root",
+            "src/delete.rs",
+            StackReviewCommentSource::LocalHuman,
+            Some("xHayden"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let child = test_comment_record(
+            "child",
+            "src/delete.rs",
+            StackReviewCommentSource::LocalHuman,
+            Some("xHayden"),
+            Some("root"),
+            "2026-08-21T12:01:00Z",
+        );
+        let records = HashMap::from([
+            (root.record.id.clone(), root),
+            (child.record.id.clone(), child),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let index =
+            CommentThreadIndex::new(storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("build index");
+        let thread = index
+            .thread(index.thread_key_for("root").expect("root thread key"))
+            .expect("root thread");
+        let binding_key = format!(
+            "comment:{}",
+            thread.key.to_stable_string().expect("serialize key")
+        );
+        let mut presentation = StackReviewPresentationState::new("base", "head");
+        presentation.stash_root(&thread.key).expect("stash root");
+        presentation
+            .bind_thread(binding_key.clone(), "session-1")
+            .expect("bind thread");
+
+        assert!(
+            !cleanup_deleted_thread_presentation(&mut presentation, thread, "child")
+                .expect("clean child deletion")
+        );
+        assert!(presentation.is_stashed(&thread.key).expect("stashed"));
+        assert_eq!(
+            presentation.binding(&binding_key).expect("binding"),
+            Some("session-1")
+        );
+
+        assert!(
+            cleanup_deleted_thread_presentation(&mut presentation, thread, "root")
+                .expect("clean root deletion")
+        );
+        assert!(!presentation.is_stashed(&thread.key).expect("restored"));
+        assert_eq!(presentation.binding(&binding_key).expect("binding"), None);
+    }
+
+    #[test]
+    fn comment_thread_navigation_uses_canonical_visible_threads() {
+        let mut first_left = test_comment_record(
+            "first-left",
+            "src/first.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        first_left.record.side = StackReviewCommentSide::Left;
+        first_left.record.start_row = Some(20);
+        let mut first_left_reply = test_comment_record(
+            "first-left-reply",
+            "src/first.rs",
+            StackReviewCommentSource::LocalHuman,
+            Some("xHayden"),
+            Some("first-left"),
+            "2026-08-21T12:01:00Z",
+        );
+        first_left_reply.record.side = StackReviewCommentSide::Left;
+        first_left_reply.record.start_row = Some(21);
+        let mut first_right = test_comment_record(
+            "first-right",
+            "src/first.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:02:00Z",
+        );
+        first_right.record.side = StackReviewCommentSide::Right;
+        first_right.record.start_row = Some(2);
+        first_right.record.resolved = true;
+        let mut second = test_comment_record(
+            "second",
+            "src/second.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:03:00Z",
+        );
+        second.record.start_row = Some(1);
+        let hidden_test = test_comment_record(
+            "hidden-test",
+            "tests/hidden.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:04:00Z",
+        );
+        let mut outdated = test_comment_record(
+            "outdated",
+            "src/second.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:05:00Z",
+        );
+        outdated.record.outdated = true;
+        let records = HashMap::from([
+            (first_left.record.id.clone(), first_left),
+            (first_left_reply.record.id.clone(), first_left_reply),
+            (first_right.record.id.clone(), first_right),
+            (second.record.id.clone(), second),
+            (hidden_test.record.id.clone(), hidden_test),
+            (outdated.record.id.clone(), outdated),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let index =
+            CommentThreadIndex::new(storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("build index");
+        let mut presentation = StackReviewPresentationState::new("base", "head");
+        presentation
+            .stash_root(
+                index
+                    .thread_key_for("first-left")
+                    .expect("first LEFT thread key"),
+            )
+            .expect("stash first LEFT thread");
+        let files = vec![
+            test_file_item("src/first.rs"),
+            test_file_item("src/second.rs"),
+            test_file_item("tests/hidden.rs"),
+        ];
+
+        let default_targets = comment_thread_navigation_targets(
+            &files,
+            &records,
+            &index,
+            &presentation,
+            false,
+            false,
+            true,
+            false,
+        )
+        .expect("default navigation targets");
+        assert_eq!(
+            default_targets
+                .iter()
+                .map(|target| target.record_id.as_str())
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+
+        let shown_targets = comment_thread_navigation_targets(
+            &files,
+            &records,
+            &index,
+            &presentation,
+            true,
+            true,
+            true,
+            false,
+        )
+        .expect("shown navigation targets");
+        assert_eq!(
+            shown_targets
+                .iter()
+                .map(|target| target.record_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first-left", "first-right", "second"]
+        );
+        assert_eq!(
+            shown_targets
+                .iter()
+                .filter(|target| target.key == shown_targets[0].key)
+                .count(),
+            1,
+            "a reply must not create a second navigation candidate"
+        );
+        assert_eq!(
+            adjacent_comment_thread_target(&shown_targets, None, true)
+                .map(|target| target.record_id.as_str()),
+            Some("first-left")
+        );
+        assert_eq!(
+            adjacent_comment_thread_target(&shown_targets, None, false)
+                .map(|target| target.record_id.as_str()),
+            Some("second")
+        );
+        assert_eq!(
+            adjacent_comment_thread_target(&shown_targets, Some(&shown_targets[0].key), false)
+                .map(|target| target.record_id.as_str()),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn stashed_canonical_thread_hides_existing_and_future_descendants() {
+        let mut records = HashMap::from([
+            (
+                "root".into(),
+                test_comment_record(
+                    "root",
+                    "src/lib.rs",
+                    StackReviewCommentSource::Github,
+                    Some("reviewer"),
+                    None,
+                    "2026-08-21T12:00:00Z",
+                ),
+            ),
+            (
+                "child".into(),
+                test_comment_record(
+                    "child",
+                    "src/lib.rs",
+                    StackReviewCommentSource::LocalHuman,
+                    None,
+                    Some("root"),
+                    "2026-08-21T12:01:00Z",
+                ),
+            ),
+            (
+                "visible-root".into(),
+                test_comment_record(
+                    "visible-root",
+                    "src/lib.rs",
+                    StackReviewCommentSource::Github,
+                    Some("other"),
+                    None,
+                    "2026-08-21T12:02:00Z",
+                ),
+            ),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let complete_index =
+            CommentThreadIndex::new(&storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("complete thread index");
+        let stashed_key = complete_index
+            .thread_key_for("child")
+            .expect("child canonical key")
+            .clone();
+        let mut presentation_state = StackReviewPresentationState::new("base", "head");
+        presentation_state
+            .stash_root(&stashed_key)
+            .expect("stash canonical thread");
+
+        let projection = project_test_comment_records_with_presentation(
+            &records,
+            false,
+            false,
+            &presentation_state,
+        )
+        .expect("project hidden stash");
+        let visible_ids = projection.comments_by_path["src/lib.rs"]
+            .right
+            .iter()
+            .filter_map(|comment| comment.record_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(visible_ids, ["visible-root"]);
+        assert_eq!(projection.visible_comment_count, 1);
+        assert_eq!(projection.stashed_comment_count, 2);
+
+        records.insert(
+            "future-reply".into(),
+            test_comment_record(
+                "future-reply",
+                "src/lib.rs",
+                StackReviewCommentSource::LocalAgent,
+                None,
+                Some("child"),
+                "2026-08-21T12:03:00Z",
+            ),
+        );
+        let reprojection = project_test_comment_records_with_presentation(
+            &records,
+            false,
+            false,
+            &presentation_state,
+        )
+        .expect("project future reply under stash");
+        let visible_ids = reprojection.comments_by_path["src/lib.rs"]
+            .right
+            .iter()
+            .filter_map(|comment| comment.record_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(visible_ids, ["visible-root"]);
+        assert_eq!(reprojection.stashed_comment_count, 3);
+        assert_eq!(
+            reprojection
+                .thread_index
+                .thread(&stashed_key)
+                .expect("complete stashed thread")
+                .member_record_ids,
+            ["root", "child", "future-reply"]
+        );
+    }
+
+    #[test]
+    fn stashed_thread_keys_do_not_cross_side_or_top_level_partitions() {
+        let mut left_root = test_comment_record(
+            "left-root",
+            "src/sides.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        left_root.record.side = StackReviewCommentSide::Left;
+        let right_root = test_comment_record(
+            "right-root",
+            "src/sides.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:01:00Z",
+        );
+        let right_child = test_comment_record(
+            "right-child",
+            "src/sides.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            Some("right-root"),
+            "2026-08-21T12:02:00Z",
+        );
+        let boundary_child = test_comment_record(
+            "boundary-child",
+            "src/sides.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            Some("left-root"),
+            "2026-08-21T12:03:00Z",
+        );
+        let mut conversation = test_comment_record(
+            "conversation",
+            "unused",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:04:00Z",
+        );
+        conversation.record.path = None;
+        conversation.record.side = StackReviewCommentSide::TopLevel;
+        let records = HashMap::from([
+            ("left-root".into(), left_root),
+            ("right-root".into(), right_root),
+            ("right-child".into(), right_child),
+            ("boundary-child".into(), boundary_child),
+            ("conversation".into(), conversation),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let index =
+            CommentThreadIndex::new(&storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("partitioned thread index");
+        let right_key = index
+            .thread_key_for("right-child")
+            .expect("right thread key")
+            .clone();
+        let mut presentation_state = StackReviewPresentationState::new("base", "head");
+        presentation_state
+            .stash_root(&right_key)
+            .expect("stash right thread");
+
+        let projection = project_test_comment_records_with_presentation(
+            &records,
+            false,
+            false,
+            &presentation_state,
+        )
+        .expect("project partitioned stash");
+        let file = &projection.comments_by_path["src/sides.rs"];
+        assert_eq!(
+            file.left
+                .iter()
+                .filter_map(|comment| comment.record_id.as_deref())
+                .collect::<Vec<_>>(),
+            ["left-root"]
+        );
+        assert_eq!(
+            file.right
+                .iter()
+                .filter_map(|comment| comment.record_id.as_deref())
+                .collect::<Vec<_>>(),
+            ["boundary-child"]
+        );
+        assert_eq!(projection.visible_comment_count, 2);
+        assert_eq!(projection.stashed_comment_count, 2);
+        assert_eq!(projection.stashed_thread_count, 1);
+        assert_ne!(
+            projection.thread_index.thread_key_for("left-root"),
+            projection.thread_index.thread_key_for("boundary-child")
+        );
+        assert_ne!(
+            projection.thread_index.thread_key_for("conversation"),
+            Some(&right_key)
+        );
+    }
+
+    #[test]
+    fn show_stashed_is_orthogonal_to_show_resolved_and_marks_dimmed_projection() {
+        let mut root = test_comment_record(
+            "resolved-root",
+            "src/resolved.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        root.record.resolved = true;
+        let mut child = test_comment_record(
+            "resolved-child",
+            "src/resolved.rs",
+            StackReviewCommentSource::Github,
+            Some("other"),
+            Some("resolved-root"),
+            "2026-08-21T12:01:00Z",
+        );
+        child.record.resolved = true;
+        let records = HashMap::from([
+            ("resolved-root".into(), root),
+            ("resolved-child".into(), child),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let index =
+            CommentThreadIndex::new(&storage_key, records.values().map(|loaded| &loaded.record))
+                .expect("complete thread index");
+        let key = index
+            .thread_key_for("resolved-root")
+            .expect("resolved root key")
+            .clone();
+        let mut presentation_state = StackReviewPresentationState::new("base", "head");
+        presentation_state
+            .stash_root(&key)
+            .expect("stash resolved thread");
+
+        let resolved_hidden = project_test_comment_records_with_presentation(
+            &records,
+            false,
+            true,
+            &presentation_state,
+        )
+        .expect("show stashed while resolved stays hidden");
+        assert!(
+            !resolved_hidden
+                .comments_by_path
+                .contains_key("src/resolved.rs")
+        );
+        assert_eq!(resolved_hidden.visible_comment_count, 0);
+        assert_eq!(resolved_hidden.stashed_comment_count, 2);
+
+        let resolved_shown = project_test_comment_records_with_presentation(
+            &records,
+            true,
+            true,
+            &presentation_state,
+        )
+        .expect("show stashed and resolved");
+        let file_projection = &resolved_shown.comments_by_path["src/resolved.rs"];
+        assert_eq!(file_projection.right.len(), 2);
+        assert_eq!(
+            file_projection.stashed_right_record_ids,
+            HashSet::from(["resolved-root".to_owned(), "resolved-child".to_owned()])
+        );
+        assert_eq!(resolved_shown.visible_comment_count, 0);
+        assert_eq!(resolved_shown.stashed_comment_count, 2);
     }
 
     #[test]
@@ -5327,6 +6956,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn presentation_confirmation_advances_monotonically_across_pending_writes() {
+        let mut confirmed_state = None;
+        let mut confirmed_generation = 0;
+        let mut first = StackReviewPresentationState::new("base", "head");
+        first
+            .bind_thread(
+                git::stack_review::STACK_REVIEW_REVIEW_BINDING_KEY,
+                "session-first",
+            )
+            .expect("bind first");
+        let mut second = StackReviewPresentationState::new("base", "head");
+        second
+            .bind_thread(
+                git::stack_review::STACK_REVIEW_REVIEW_BINDING_KEY,
+                "session-second",
+            )
+            .expect("bind second");
+
+        assert!(confirm_presentation_state_if_newer(
+            &mut confirmed_state,
+            &mut confirmed_generation,
+            1,
+            first.clone(),
+        ));
+        assert_eq!(confirmed_generation, 1);
+        assert_eq!(
+            confirmed_state
+                .as_ref()
+                .expect("first confirmed")
+                .binding(git::stack_review::STACK_REVIEW_REVIEW_BINDING_KEY)
+                .expect("first binding"),
+            Some("session-first")
+        );
+        assert!(confirm_presentation_state_if_newer(
+            &mut confirmed_state,
+            &mut confirmed_generation,
+            2,
+            second,
+        ));
+        assert!(!confirm_presentation_state_if_newer(
+            &mut confirmed_state,
+            &mut confirmed_generation,
+            1,
+            first,
+        ));
+        assert_eq!(confirmed_generation, 2);
+        assert_eq!(
+            confirmed_state
+                .as_ref()
+                .expect("second confirmed")
+                .binding(git::stack_review::STACK_REVIEW_REVIEW_BINDING_KEY)
+                .expect("second binding"),
+            Some("session-second")
+        );
+    }
+
     #[gpui::test]
     async fn state_writes_skip_stale_generations_and_atomically_write_the_latest(
         cx: &mut TestAppContext,
@@ -5779,6 +7465,10 @@ mod tests {
                     review_state: Some(StackReviewState::new("base", "head")),
                     review_state_path: None,
                     presentation_state: Some(StackReviewPresentationState::new("base", "head")),
+                    confirmed_presentation_state: Some(StackReviewPresentationState::new(
+                        "base", "head",
+                    )),
+                    confirmed_presentation_generation: 0,
                     presentation_state_path: None,
                     presentation_state_error: None,
                     files: vec![
@@ -5834,9 +7524,12 @@ mod tests {
                     hide_tests: false,
                     hide_migrations: false,
                     show_resolved_comments: false,
+                    show_stashed_threads: false,
                     sidebar_width: STACK_REVIEW_SIDEBAR_DEFAULT_WIDTH,
                     split_left_ratio: 0.5,
                     review_comment_count: 0,
+                    visible_comment_count: 0,
+                    stashed_thread_count: 0,
                     rendered_left_comment_ids: HashSet::new(),
                     rendered_right_comment_ids: HashSet::new(),
                     comment_records: HashMap::new(),
@@ -5846,6 +7539,8 @@ mod tests {
                     next_comment_editor_id: 0,
                     file_comment_statuses: HashMap::new(),
                     commenter_cutoffs: Vec::new(),
+                    selected_comment_record_id: None,
+                    pending_comment_reveal: None,
                     selected_commenter: None,
                     reviewer_login: Some("xHayden".into()),
                     refreshed_github_snapshots: HashSet::new(),
@@ -5885,6 +7580,7 @@ mod tests {
                     FileCommentSummary {
                         status: FileCommentStatus::Comments,
                         comment_count: 2,
+                        stashed_thread_count: 0,
                     },
                 ),
                 (
@@ -5892,6 +7588,7 @@ mod tests {
                     FileCommentSummary {
                         status: FileCommentStatus::AwaitingResponse,
                         comment_count: 3,
+                        stashed_thread_count: 0,
                     },
                 ),
             ]);

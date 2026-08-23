@@ -40997,7 +40997,20 @@ fn test_stack_review_mutations_route_by_stable_record_when_numeric_ids_collide(
     cx: &mut TestAppContext,
 ) {
     init_test(cx, |_| {});
-    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    let deleted_record_ids = Rc::new(RefCell::new(Vec::new()));
+    let editor = cx.add_window({
+        let deleted_record_ids = deleted_record_ids.clone();
+        move |window, cx| {
+            let entity = cx.entity();
+            cx.subscribe_in(&entity, window, move |_, _, event: &EditorEvent, _, _| {
+                if let EditorEvent::StackReviewCommentDeleted { record_id } = event {
+                    deleted_record_ids.borrow_mut().push(record_id.clone());
+                }
+            })
+            .detach();
+            Editor::single_line(window, cx)
+        }
+    });
 
     editor
         .update(cx, |editor, window, cx| {
@@ -41037,6 +41050,10 @@ fn test_stack_review_mutations_route_by_stable_record_when_numeric_ids_collide(
             );
         })
         .expect("update editor");
+    assert_eq!(
+        mem::take(&mut *deleted_record_ids.borrow_mut()),
+        ["stable-second"]
+    );
 }
 
 #[gpui::test]
@@ -41210,6 +41227,32 @@ fn test_stack_review_overlay_remeasures_wrapped_content_and_visibility_at_actual
     });
     cx.run_until_parked();
     let wide_height = editor.update(cx, first_custom_block_height);
+
+    editor.update(cx, |editor, cx| {
+        editor.stored_review_comments[0].1[0].stashed = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let stashed_height = editor.update(cx, first_custom_block_height);
+    assert!(stashed_height >= wide_height);
+    assert!(cx.debug_bounds("STACK_REVIEW_STASHED_LABEL").is_some());
+    editor.update(cx, |editor, cx| {
+        let mut second = editor.stored_review_comments[0].1[0].clone();
+        second.id = second.id.saturating_add(1);
+        second.record_id = Some("second-projected-row".into());
+        editor.stored_review_comments[0].1.push(second);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let two_row_height = editor.update(cx, first_custom_block_height);
+    assert!(two_row_height > stashed_height);
+    editor.update(cx, |editor, cx| {
+        editor.stored_review_comments[0].1.truncate(1);
+        editor.stored_review_comments[0].1[0].stashed = false;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(editor.update(cx, first_custom_block_height), wide_height);
 
     cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(800.)));
     cx.run_until_parked();

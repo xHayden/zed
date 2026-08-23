@@ -362,6 +362,7 @@ pub(super) struct StoredReviewComment {
     pub(super) created_at: String,
     pub(super) created_at_display: SharedString,
     pub(super) resolved: bool,
+    pub(super) stashed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -476,6 +477,7 @@ impl StoredReviewComment {
             created_at,
             created_at_display,
             resolved: false,
+            stashed: false,
         }
     }
 }
@@ -1128,6 +1130,16 @@ impl Editor {
         comments: &[StackReviewComment],
         cx: &mut Context<Self>,
     ) {
+        self.restore_stack_review_comments_with_stashed(comments, &[], true, cx);
+    }
+
+    fn restore_stack_review_comments_with_stashed(
+        &mut self,
+        comments: &[StackReviewComment],
+        stashed_record_ids: &[String],
+        emit_source_changed: bool,
+        cx: &mut Context<Self>,
+    ) {
         let multibuffer = self.buffer.read(cx);
         let snapshot = multibuffer.snapshot(cx);
         let mut restored: Vec<(DiffHunkKey, Vec<StoredReviewComment>)> = Vec::new();
@@ -1178,6 +1190,11 @@ impl Editor {
                 created_at_display: format_stack_review_comment_timestamp(&comment.created_at)
                     .into(),
                 resolved: comment.resolved,
+                stashed: comment.record_id.as_ref().is_some_and(|record_id| {
+                    stashed_record_ids
+                        .iter()
+                        .any(|stashed| stashed == record_id)
+                }),
             };
             if let Some((_, existing_comments)) = restored.iter_mut().find(|(existing, _)| {
                 existing.file_path == hunk_key.file_path
@@ -1192,10 +1209,62 @@ impl Editor {
 
         self.stored_review_comments = restored;
         self.next_review_comment_id = next_id;
-        cx.emit(EditorEvent::ReviewCommentsChanged {
-            total_count: self.total_review_comment_count(),
-        });
+        if emit_source_changed {
+            cx.emit(EditorEvent::ReviewCommentsChanged {
+                total_count: self.total_review_comment_count(),
+            });
+        }
         cx.notify();
+    }
+
+    pub fn replace_stack_review_comment_projection(
+        &mut self,
+        comments: &[StackReviewComment],
+        stashed_record_ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_stack_review {
+            return;
+        }
+        self.restore_stack_review_comments_with_stashed(comments, stashed_record_ids, false, cx);
+        self.dismiss_empty_stack_review_projection_overlays(cx);
+        self.reveal_restored_stack_review_comments(window, cx);
+        cx.notify();
+    }
+
+    pub fn reveal_stack_review_comment(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut matches = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| comment.record_id.as_deref() == Some(record_id));
+        let Some(comment) = matches.next() else {
+            return false;
+        };
+        let point = comment
+            .range
+            .start
+            .to_point(&self.buffer.read(cx).snapshot(cx));
+        if matches.next().is_some() {
+            return false;
+        }
+        self.change_selections(
+            SelectionEffects::scroll(Autoscroll::fit()),
+            window,
+            cx,
+            |selections| selections.select_ranges([point..point]),
+        );
+        window.focus(&self.focus_handle(cx), cx);
+        cx.emit(EditorEvent::ReviewCommentSelected {
+            record_id: record_id.to_owned(),
+        });
+        true
     }
 
     pub fn ensure_next_stack_review_comment_id(&mut self, next_id: usize) {
@@ -2378,6 +2447,47 @@ impl Editor {
         cx.notify();
     }
 
+    pub(super) fn request_stack_review_comment_selection(
+        &mut self,
+        record_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_exact_stack_review_comment(record_id) {
+            cx.emit(EditorEvent::ReviewCommentSelected {
+                record_id: record_id.to_owned(),
+            });
+        }
+    }
+
+    pub(super) fn request_stack_review_comment_stash(
+        &mut self,
+        record_id: &str,
+        restore: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_exact_stack_review_comment(record_id) {
+            return;
+        }
+        if restore {
+            cx.emit(EditorEvent::ReviewCommentRestoreRequested {
+                record_id: record_id.to_owned(),
+            });
+        } else {
+            cx.emit(EditorEvent::ReviewCommentStashRequested {
+                record_id: record_id.to_owned(),
+            });
+        }
+    }
+
+    fn has_exact_stack_review_comment(&self, record_id: &str) -> bool {
+        let mut matches = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| comment.record_id.as_deref() == Some(record_id));
+        matches.next().is_some() && matches.next().is_none()
+    }
+
     pub(super) fn request_stack_review_comment_checkpoint(
         &mut self,
         record_id: Option<&str>,
@@ -2743,6 +2853,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let deleted_record_id = match &key {
+            ReviewCommentKey::Stable(record_id) => Some(record_id.clone()),
+            ReviewCommentKey::Legacy(_) => None,
+        };
         let mut matches = self
             .stored_review_comments
             .iter()
@@ -2771,9 +2885,13 @@ impl Editor {
             return;
         }
         comments.remove(comment_index);
-        cx.emit(EditorEvent::ReviewCommentsChanged {
-            total_count: self.total_review_comment_count(),
-        });
+        if let Some(record_id) = deleted_record_id {
+            cx.emit(EditorEvent::StackReviewCommentDeleted { record_id });
+        } else {
+            cx.emit(EditorEvent::ReviewCommentsChanged {
+                total_count: self.total_review_comment_count(),
+            });
+        }
         if self.hunk_comment_count(&hunk_key, &snapshot) == 0 {
             if let Some(index) = self
                 .diff_review_overlays
@@ -3538,6 +3656,25 @@ impl Editor {
         }
     }
 
+    fn dismiss_empty_stack_review_projection_overlays(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let overlays_to_remove = self
+            .diff_review_overlays
+            .iter()
+            .filter(|overlay| {
+                !overlay.composer_visible
+                    && self.hunk_comment_count(&overlay.hunk_key, &snapshot) == 0
+            })
+            .map(|overlay| overlay.block_id)
+            .collect::<HashSet<_>>();
+        if overlays_to_remove.is_empty() {
+            return;
+        }
+        self.diff_review_overlays
+            .retain(|overlay| !overlays_to_remove.contains(&overlay.block_id));
+        self.remove_blocks(overlays_to_remove, None, cx);
+    }
+
     /// Dismisses overlays that have no comments stored for their hunks.
     /// Keeps overlays that have at least one comment.
     fn dismiss_overlays_without_comments(&mut self, cx: &mut Context<Self>) {
@@ -4135,8 +4272,11 @@ impl Editor {
         let edit_editor = editor_handle.clone();
         let delete_editor = editor_handle.clone();
         let checkpoint_editor = editor_handle.clone();
+        let selection_editor = editor_handle.clone();
+        let stash_editor = editor_handle.clone();
         let resolution_editor = editor_handle;
         let resolved = comment.resolved;
+        let stashed = comment.stashed;
         let comment_text = comment.comment.clone();
         let reply_record_id = comment.record_id.clone();
         let comment_identity = comment.debug_identity();
@@ -4155,6 +4295,8 @@ impl Editor {
         let resolution_record_id = comment.record_id.clone();
         let edit_record_id = comment.record_id.clone();
         let delete_record_id = comment.record_id.clone();
+        let selection_record_id = comment.record_id.clone();
+        let stash_record_id = comment.record_id.clone();
         let content_selector = if is_stack_review {
             stack_review_comment_instance_debug_selector(
                 "STACK_REVIEW_COMMENT_CONTENT",
@@ -4216,7 +4358,18 @@ impl Editor {
             .py_1p5()
             .rounded_md()
             .bg(colors.surface_background)
+            .opacity(if stashed { 0.6 } else { 1.0 })
+            .id(row_selector.clone())
             .debug_selector(move || row_selector)
+            .when_some(selection_record_id, move |row, record_id| {
+                row.on_click(move |_, _, cx| {
+                    if let Some(editor) = selection_editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.request_stack_review_comment_selection(&record_id, cx);
+                        });
+                    }
+                })
+            })
             .child(
                 div()
                     .size(avatar_size)
@@ -4260,6 +4413,17 @@ impl Editor {
                             .color(Color::Muted)
                             .truncate(),
                     )
+                    .when(stashed, |content| {
+                        content.child(
+                            div()
+                                .debug_selector(|| "STACK_REVIEW_STASHED_LABEL".into())
+                                .child(
+                                    Label::new("Stashed locally")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .child(comment_content)
                     .into_any_element()
             } else {
@@ -4321,6 +4485,37 @@ impl Editor {
                                     } else {
                                         editor.confirm_edit_review_comment(comment_id, window, cx);
                                     }
+                                });
+                            }
+                        }),
+                    )
+                    .into_any_element()
+            } else if is_stack_review && stashed {
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(
+                        CopyButton::new(
+                            format!("diff-review-copy-{action_identity}"),
+                            comment_text,
+                        )
+                        .icon_size(action_icon_size)
+                        .tooltip_label("Copy comment"),
+                    )
+                    .child(
+                        IconButton::new(
+                            format!("diff-review-restore-{action_identity}"),
+                            IconName::Undo,
+                        )
+                        .icon_color(ui::Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Restore thread"))
+                        .on_click(move |_, _, cx| {
+                            if let Some(editor) = stash_editor.upgrade()
+                                && let Some(record_id) = stash_record_id.as_deref()
+                            {
+                                editor.update(cx, |editor, cx| {
+                                    editor.request_stack_review_comment_stash(record_id, true, cx);
                                 });
                             }
                         }),
@@ -4429,6 +4624,24 @@ impl Editor {
                                             cx,
                                         );
                                     }
+                                });
+                            }
+                        }),
+                    )
+                    .child(
+                        IconButton::new(
+                            format!("diff-review-stash-{action_identity}"),
+                            IconName::Archive,
+                        )
+                        .icon_color(ui::Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Stash thread"))
+                        .on_click(move |_, _, cx| {
+                            if let Some(editor) = stash_editor.upgrade()
+                                && let Some(record_id) = stash_record_id.as_deref()
+                            {
+                                editor.update(cx, |editor, cx| {
+                                    editor.request_stack_review_comment_stash(record_id, false, cx);
                                 });
                             }
                         }),

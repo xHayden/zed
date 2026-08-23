@@ -540,6 +540,8 @@
     "bindings": {
       "ctrl-alt-up": "git::StackReviewPreviousFile",
       "ctrl-alt-down": "git::StackReviewNextFile",
+      "ctrl-alt-shift-up": "git::StackReviewPreviousCommentThread",
+      "ctrl-alt-shift-down": "git::StackReviewNextCommentThread",
       "ctrl-alt-k": "editor::GoToPreviousChange",
       "ctrl-alt-j": "editor::GoToNextChange",
       "ctrl-alt-r": "editor::ToggleActiveReviewCommentResolved",

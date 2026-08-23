@@ -11871,6 +11871,18 @@ pub enum EditorEvent {
     StackReviewCommentCheckpointRequested {
         record_id: String,
     },
+    ReviewCommentSelected {
+        record_id: String,
+    },
+    ReviewCommentStashRequested {
+        record_id: String,
+    },
+    ReviewCommentRestoreRequested {
+        record_id: String,
+    },
+    StackReviewCommentDeleted {
+        record_id: String,
+    },
     InputIgnored {
         text: Arc<str>,
     },
