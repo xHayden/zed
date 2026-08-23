@@ -727,6 +727,15 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
+        self.new_session_with_options(project, ThreadCreationOptions::default(), cx)
+    }
+
+    fn new_session_with_options(
+        &mut self,
+        project: Entity<Project>,
+        options: ThreadCreationOptions,
+        cx: &mut Context<Self>,
+    ) -> Entity<AcpThread> {
         let project_id = self.get_or_create_project_state(&project, cx);
         let project_state = &self.projects[&project_id];
 
@@ -739,12 +748,13 @@ impl NativeAgent {
                 .model_from_id(&LanguageModels::model_id(&default_model.model))
         });
         let thread = cx.new(|cx| {
-            Thread::new(
+            Thread::new_with_options(
                 project,
                 project_state.project_context.clone(),
                 project_state.context_server_registry.clone(),
                 self.templates.clone(),
                 default_model,
+                options,
                 cx,
             )
         });
@@ -2082,6 +2092,17 @@ impl NativeAgentConnection {
             .sessions
             .get(session_id)
             .map(|session| session.thread.clone())
+    }
+
+    pub fn new_session_with_options(
+        &self,
+        project: Entity<Project>,
+        options: ThreadCreationOptions,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Ok(self.0.update(cx, |agent, cx| {
+            agent.new_session_with_options(project, options, cx)
+        })))
     }
 
     /// Forwards to [`NativeAgent::ensure_skills_scan_started`]. The

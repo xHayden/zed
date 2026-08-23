@@ -1807,6 +1807,49 @@ async fn test_read_only_thread_exposes_no_tools_from_customized_ask_profile(
 }
 
 #[gpui::test]
+async fn test_native_connection_creates_stack_review_session_with_read_only_origin(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest { thread, fs, .. } = setup(cx, TestModel::Fake).await;
+    let project = thread.read_with(cx, |thread, _cx| thread.project.clone());
+    let origin = StackReviewThreadOrigin {
+        project_identity: "project-identity".into(),
+        storage_key: "storage-key".into(),
+        context_key: "comment:root-id".into(),
+        base_oid: "1111111111111111111111111111111111111111".into(),
+        head_oid: "2222222222222222222222222222222222222222".into(),
+    };
+    let connection = cx.update(|cx| {
+        language_model::LanguageModelRegistry::test(cx);
+        let thread_store = cx.new(ThreadStore::new);
+        Rc::new(NativeAgentConnection(NativeAgent::new(
+            thread_store,
+            Templates::new(),
+            fs,
+            cx,
+        )))
+    });
+    let session = cx
+        .update(|cx| {
+            connection.clone().new_session_with_options(
+                project,
+                ThreadCreationOptions::stack_review(origin.clone()),
+                cx,
+            )
+        })
+        .await
+        .expect("create Stack Review session");
+    let session_id = session.read_with(cx, |thread, _cx| thread.session_id().clone());
+    let native_thread = cx
+        .read(|cx| connection.thread(&session_id, cx))
+        .expect("registered native Stack Review thread");
+    native_thread.read_with(cx, |thread, _cx| {
+        assert_eq!(thread.execution_policy(), ThreadExecutionPolicy::ReadOnly);
+        assert_eq!(thread.stack_review_origin(), Some(&origin));
+    });
+}
+
+#[gpui::test]
 async fn test_mcp_tools(cx: &mut TestAppContext) {
     let ThreadTest {
         model,
