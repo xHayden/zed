@@ -755,6 +755,48 @@ impl StackReviewScope {
     }
 }
 
+fn stack_review_layer_pull_requests(
+    snapshot: &StackSnapshot,
+    scope: StackReviewScope,
+) -> Vec<(u32, String)> {
+    match scope {
+        StackReviewScope::Layer(index) => snapshot
+            .layers
+            .get(index)
+            .and_then(|layer| {
+                layer
+                    .head
+                    .pull_request_number
+                    .map(|number| (number, layer.head.oid.clone()))
+            })
+            .into_iter()
+            .collect(),
+        StackReviewScope::AggregateThrough(index) => snapshot
+            .layers
+            .iter()
+            .take(index.saturating_add(1))
+            .filter_map(|layer| {
+                layer
+                    .head
+                    .pull_request_number
+                    .map(|number| (number, layer.head.oid.clone()))
+            })
+            .collect(),
+        StackReviewScope::Range { from, to } => snapshot
+            .layers
+            .iter()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .filter_map(|layer| {
+                layer
+                    .head
+                    .pull_request_number
+                    .map(|number| (number, layer.head.oid.clone()))
+            })
+            .collect(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StackReviewTimeFilter {
     All,
@@ -788,8 +830,24 @@ struct StackReviewFileItem {
     fingerprint: SharedString,
     provenance: StackReviewFileProvenance,
     content_kind: StackReviewContentKind,
+    status: StackReviewFileStatus,
     additions: Option<u32>,
     deletions: Option<u32>,
+}
+
+fn stack_review_file_side_exists(
+    status: StackReviewFileStatus,
+    side: StackReviewCommentSide,
+) -> bool {
+    matches!(
+        (status, side),
+        (StackReviewFileStatus::Added, StackReviewCommentSide::Right)
+            | (StackReviewFileStatus::Deleted, StackReviewCommentSide::Left)
+            | (
+                StackReviewFileStatus::Modified,
+                StackReviewCommentSide::Left | StackReviewCommentSide::Right
+            )
+    )
 }
 
 fn is_test_path(path: &str) -> bool {
@@ -2027,6 +2085,781 @@ async fn write_latest_state(
     Ok(true)
 }
 
+const STACK_REVIEW_AI_MAX_CODE_LINES: u32 = 200;
+const STACK_REVIEW_AI_MAX_RESOURCE_BYTES: usize = 63 * 1024;
+const STACK_REVIEW_AI_MAX_FINAL_RESOURCE_BYTES: usize = 64 * 1024;
+const STACK_REVIEW_AI_MAX_COMMENT_CHAIN_BYTES: usize = 60 * 1024;
+const STACK_REVIEW_AI_MAX_TOTAL_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackReviewAiContextSelection {
+    Code {
+        file_index: usize,
+        side: StackReviewCommentSide,
+        line_range: Option<std::ops::Range<u32>>,
+    },
+    Comment {
+        selected_record_id: String,
+    },
+}
+
+fn bounded_stack_review_code(
+    text: &str,
+    selected: std::ops::Range<u32>,
+) -> Result<(std::ops::Range<u32>, String)> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let line_count = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+    anyhow::ensure!(
+        selected.start < selected.end && selected.end <= line_count,
+        "Stack Review AI selection is outside the endpoint text"
+    );
+    anyhow::ensure!(
+        selected.end - selected.start <= STACK_REVIEW_AI_MAX_CODE_LINES,
+        "Stack Review AI selection exceeds the line limit"
+    );
+    let mut start = selected.start as usize;
+    let mut end = selected.end as usize;
+    let mut bytes = lines[start..end]
+        .iter()
+        .map(|line| line.len())
+        .sum::<usize>()
+        + end.saturating_sub(start + 1);
+    anyhow::ensure!(
+        bytes <= STACK_REVIEW_AI_MAX_RESOURCE_BYTES,
+        "Stack Review AI selected lines exceed the per-resource byte limit"
+    );
+    let mut prefer_before = true;
+    while end - start < STACK_REVIEW_AI_MAX_CODE_LINES as usize {
+        let mut added = false;
+        for before in [prefer_before, !prefer_before] {
+            let candidate = if before {
+                start.checked_sub(1).map(|index| (index, true))
+            } else {
+                (end < lines.len()).then_some((end, false))
+            };
+            let Some((index, before)) = candidate else {
+                continue;
+            };
+            let additional = lines[index].len() + 1;
+            if bytes + additional > STACK_REVIEW_AI_MAX_RESOURCE_BYTES {
+                continue;
+            }
+            if before {
+                start = index;
+            } else {
+                end += 1;
+            }
+            bytes += additional;
+            prefer_before = !before;
+            added = true;
+            break;
+        }
+        if !added {
+            break;
+        }
+    }
+    let snippet = lines[start..end].join("\n");
+    Ok((start as u32..end as u32, snippet))
+}
+
+fn ensure_stack_review_ai_resource_bounds(
+    resources: &[git_ui_core::stack_review_ai::StackReviewAiResource],
+) -> Result<()> {
+    anyhow::ensure!(
+        resources
+            .iter()
+            .all(|resource| resource.text().len() <= STACK_REVIEW_AI_MAX_FINAL_RESOURCE_BYTES),
+        "Stack Review AI resource exceeds the final byte limit"
+    );
+    anyhow::ensure!(
+        resources
+            .iter()
+            .map(|resource| resource.text().len())
+            .sum::<usize>()
+            <= STACK_REVIEW_AI_MAX_TOTAL_BYTES,
+        "Stack Review AI resources exceed the total byte limit"
+    );
+    Ok(())
+}
+
+fn attach_stack_review_ai_scope_label(
+    context: &mut git_ui_core::stack_review_ai::StackReviewAiContext,
+    layer_pull_requests: &[(u32, String)],
+) -> Result<()> {
+    if layer_pull_requests.is_empty() {
+        return Ok(());
+    }
+    let scope_label = layer_pull_requests
+        .iter()
+        .map(|(number, _)| format!("#{number}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let citation = context
+        .resources
+        .first()
+        .context("Stack Review AI context has no citable resource")?
+        .citation()
+        .clone();
+    let mut resources = context.resources.to_vec();
+    resources.push(git_ui_core::stack_review_ai::StackReviewAiResource::new(
+        "Review scope",
+        citation,
+        format!("Pull requests: {scope_label}"),
+    ));
+    ensure_stack_review_ai_resource_bounds(&resources)?;
+    let scope_revision = layer_pull_requests
+        .iter()
+        .map(|(number, oid)| format!("{number}:{oid}"))
+        .collect::<Vec<_>>()
+        .join("\0");
+    context.context_revision = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("{}\0{scope_revision}", context.context_revision).as_bytes(),
+    )
+    .to_string()
+    .into();
+    context.resources = resources.into();
+    Ok(())
+}
+
+fn build_stack_review_ai_context(
+    project_identity: &str,
+    review_state: &StackReviewState,
+    files: &[StackReviewFileItem],
+    content_entries: &[ContentDiffEntry],
+    comment_records: &HashMap<String, LoadedCommentRecord>,
+    comment_thread_index: &CommentThreadIndex,
+    selection: StackReviewAiContextSelection,
+) -> Result<git_ui_core::stack_review_ai::StackReviewAiContext> {
+    match selection {
+        StackReviewAiContextSelection::Code {
+            file_index,
+            side,
+            line_range,
+        } => build_stack_review_ai_code_context(
+            project_identity,
+            review_state,
+            files,
+            content_entries,
+            file_index,
+            side,
+            line_range,
+        ),
+        StackReviewAiContextSelection::Comment { selected_record_id } => {
+            build_stack_review_ai_comment_context(
+                project_identity,
+                review_state,
+                files,
+                content_entries,
+                comment_records,
+                comment_thread_index,
+                &selected_record_id,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stack_review_ai_code_context(
+    project_identity: &str,
+    review_state: &StackReviewState,
+    files: &[StackReviewFileItem],
+    content_entries: &[ContentDiffEntry],
+    file_index: usize,
+    side: StackReviewCommentSide,
+    line_range: Option<std::ops::Range<u32>>,
+) -> Result<git_ui_core::stack_review_ai::StackReviewAiContext> {
+    anyhow::ensure!(
+        side != StackReviewCommentSide::TopLevel,
+        "Top-level Stack Review context has no code side"
+    );
+    let file = files
+        .get(file_index)
+        .context("Stack Review AI file is unavailable")?;
+    anyhow::ensure!(
+        stack_review_file_side_exists(file.status, side),
+        "Stack Review AI selected endpoint side is unavailable"
+    );
+    let entry = content_entries
+        .get(file_index)
+        .context("Stack Review AI endpoint content is unavailable")?;
+    anyhow::ensure!(
+        entry.path.to_string_lossy().as_ref() == file.path.as_ref(),
+        "Stack Review AI file inventory and content disagree"
+    );
+    let storage_key = stack_review_storage_key(&review_state.base_oid, &review_state.head_oid);
+    let path = entry.path.to_string_lossy().into_owned();
+    if file.content_kind != StackReviewContentKind::Text {
+        let side_label = match side {
+            StackReviewCommentSide::Left => "LEFT",
+            StackReviewCommentSide::Right => "RIGHT",
+            StackReviewCommentSide::TopLevel => {
+                anyhow::bail!("Top-level Stack Review context has no code side")
+            }
+        };
+        let citation = git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+            storage_key.clone(),
+            project_identity,
+            review_state.base_oid.clone(),
+            review_state.head_oid.clone(),
+            Some(path.clone().into()),
+            side,
+            None,
+            None,
+            None,
+        )?;
+        let context_revision = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!(
+                "{project_identity}\0{storage_key}\0{path}\0{side:?}\0{:?}\0{:?}",
+                file.status, file.content_kind
+            )
+            .as_bytes(),
+        )
+        .to_string();
+        let resources = vec![git_ui_core::stack_review_ai::StackReviewAiResource::new(
+            format!("{path} ({side_label})"),
+            citation,
+            format!(
+                "Path: {path}\nSide: {side_label}\nStatus: {:?}\nContent: {:?}\nAdditions: {:?}\nDeletions: {:?}",
+                file.status, file.content_kind, file.additions, file.deletions
+            ),
+        )];
+        ensure_stack_review_ai_resource_bounds(&resources)?;
+        return Ok(git_ui_core::stack_review_ai::StackReviewAiContext {
+            key: git_ui_core::stack_review_ai::StackReviewAiContextKey::review(storage_key),
+            context_revision: context_revision.into(),
+            title: format!("Review · {path}").into(),
+            base_oid: review_state.base_oid.clone().into(),
+            head_oid: review_state.head_oid.clone().into(),
+            path: Some(path.into()),
+            side: Some(side),
+            line_range: None,
+            selected_record_id: None,
+            resources: resources.into(),
+        });
+    }
+    let line_range = line_range.context("Stack Review AI text context requires a line range")?;
+    let side_text = |side| match side {
+        StackReviewCommentSide::Left => entry.old_text.as_ref(),
+        StackReviewCommentSide::Right => entry.new_text.as_ref(),
+        StackReviewCommentSide::TopLevel => "",
+    };
+    let counterpart_side = match side {
+        StackReviewCommentSide::Left => StackReviewCommentSide::Right,
+        StackReviewCommentSide::Right => StackReviewCommentSide::Left,
+        StackReviewCommentSide::TopLevel => {
+            anyhow::bail!("Top-level Stack Review context has no counterpart side")
+        }
+    };
+    let mut resources = Vec::with_capacity(2);
+    for resource_side in [side, counterpart_side] {
+        let text = side_text(resource_side);
+        if text.is_empty() {
+            continue;
+        }
+        let line_count = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
+        let requested = if resource_side == side {
+            line_range.clone()
+        } else {
+            0..1.min(line_count)
+        };
+        if requested.start >= requested.end {
+            continue;
+        }
+        let (resource_range, snippet) = bounded_stack_review_code(text, requested)?;
+        let citation = git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+            storage_key.clone(),
+            project_identity,
+            review_state.base_oid.clone(),
+            review_state.head_oid.clone(),
+            Some(path.clone().into()),
+            resource_side,
+            Some(resource_range.start + 1..=resource_range.end),
+            None,
+            None,
+        )?;
+        let side_label = match resource_side {
+            StackReviewCommentSide::Left => "LEFT",
+            StackReviewCommentSide::Right => "RIGHT",
+            StackReviewCommentSide::TopLevel => {
+                anyhow::bail!("Top-level Stack Review context has no code side")
+            }
+        };
+        let counterpart_note = if resource_side == side {
+            ""
+        } else {
+            "Counterpart mapping: unavailable; showing endpoint excerpt\n"
+        };
+        resources.push(git_ui_core::stack_review_ai::StackReviewAiResource::new(
+            format!(
+                "{path} ({side_label} {}-{})",
+                resource_range.start + 1,
+                resource_range.end
+            ),
+            citation,
+            format!(
+                "Path: {path}\nSide: {side_label}\nStatus: {:?}\nAdditions: {:?}\nDeletions: {:?}\n{counterpart_note}Lines: {}-{}\n\n{snippet}",
+                file.status,
+                file.additions,
+                file.deletions,
+                resource_range.start + 1,
+                resource_range.end
+            ),
+        ));
+    }
+    anyhow::ensure!(
+        resources
+            .iter()
+            .any(|resource| resource.citation().side() == side),
+        "Stack Review AI selected endpoint side is unavailable"
+    );
+    ensure_stack_review_ai_resource_bounds(&resources)?;
+    let revision_material = format!(
+        "{project_identity}\0{storage_key}\0{path}\0{side:?}\0{}\0{}\0{:?}\0{:?}\0{:?}",
+        line_range.start, line_range.end, file.status, file.additions, file.deletions
+    );
+    let context_revision =
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, revision_material.as_bytes()).to_string();
+
+    Ok(git_ui_core::stack_review_ai::StackReviewAiContext {
+        key: git_ui_core::stack_review_ai::StackReviewAiContextKey::review(storage_key),
+        context_revision: context_revision.into(),
+        title: format!("Review · {path}").into(),
+        base_oid: review_state.base_oid.clone().into(),
+        head_oid: review_state.head_oid.clone().into(),
+        path: Some(path.into()),
+        side: Some(side),
+        line_range: Some(line_range),
+        selected_record_id: None,
+        resources: resources.into(),
+    })
+}
+
+fn canonical_comment_thread_root_record_id<'a>(
+    key: &'a CommentThreadKey,
+    thread: &'a git::stack_review::CommentThread,
+) -> &'a str {
+    match key {
+        CommentThreadKey::Normal { root_record_id, .. } => root_record_id,
+        CommentThreadKey::Cycle {
+            canonical_member_id,
+            ..
+        } => canonical_member_id,
+        CommentThreadKey::MissingParent { .. } | CommentThreadKey::BoundaryViolation { .. } => {
+            &thread.placement_record_id
+        }
+    }
+}
+
+fn utf8_prefix_at_most(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+const STACK_REVIEW_AI_TRUNCATED_COMMENT_BODY: &str = "\n[comment body truncated]\n";
+
+fn render_stack_review_comment_metadata(record: &StackReviewCommentRecord) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    writeln!(&mut output, "Record: {}", record.id)?;
+    writeln!(
+        &mut output,
+        "Parent: {}",
+        record.reply_to.as_deref().unwrap_or("none")
+    )?;
+    writeln!(&mut output, "Author: {}", record.author.name)?;
+    writeln!(&mut output, "Source: {:?}", record.source)?;
+    writeln!(&mut output, "Created: {}", record.created_at)?;
+    writeln!(&mut output, "Updated: {}", record.updated_at)?;
+    writeln!(&mut output, "Resolved: {}", record.resolved)?;
+    writeln!(&mut output, "Outdated: {}", record.outdated)?;
+    writeln!(
+        &mut output,
+        "Path: {}",
+        record.path.as_deref().unwrap_or("none")
+    )?;
+    writeln!(&mut output, "Side: {:?}", record.side)?;
+    if let Some(github) = &record.github {
+        writeln!(&mut output, "URL: {}", github.url)?;
+    }
+    output.push('\n');
+    Ok(output)
+}
+
+fn stack_review_comment_render_sizes(record: &StackReviewCommentRecord) -> Result<(usize, usize)> {
+    let metadata_bytes = render_stack_review_comment_metadata(record)?.len();
+    let complete_body_bytes = record
+        .body
+        .len()
+        .checked_add(1)
+        .context("Stack Review AI comment body size overflow")?;
+    let complete_bytes = metadata_bytes
+        .checked_add(complete_body_bytes)
+        .context("Stack Review AI comment size overflow")?;
+    let minimum_bytes = metadata_bytes
+        .checked_add(complete_body_bytes.min(STACK_REVIEW_AI_TRUNCATED_COMMENT_BODY.len()))
+        .context("Stack Review AI minimum comment size overflow")?;
+    Ok((complete_bytes, minimum_bytes))
+}
+
+fn render_stack_review_comment_for_context(
+    record: &StackReviewCommentRecord,
+    max_bytes: usize,
+) -> Result<String> {
+    let mut output = render_stack_review_comment_metadata(record)?;
+    let complete_body_bytes = record
+        .body
+        .len()
+        .checked_add(1)
+        .context("Stack Review AI comment body size overflow")?;
+    if complete_body_bytes <= max_bytes.saturating_sub(output.len()) {
+        output.push_str(&record.body);
+        output.push('\n');
+        return Ok(output);
+    }
+
+    anyhow::ensure!(
+        STACK_REVIEW_AI_TRUNCATED_COMMENT_BODY.len() <= max_bytes.saturating_sub(output.len()),
+        "Stack Review AI comment metadata exceeds its byte budget"
+    );
+    let body_budget = max_bytes - output.len() - STACK_REVIEW_AI_TRUNCATED_COMMENT_BODY.len();
+    output.push_str(utf8_prefix_at_most(&record.body, body_budget));
+    output.push_str(STACK_REVIEW_AI_TRUNCATED_COMMENT_BODY);
+    Ok(output)
+}
+
+fn bounded_stack_review_comment_chain(
+    thread: &git::stack_review::CommentThread,
+    root_record_id: &str,
+    selected_record_id: &str,
+    comment_records: &HashMap<String, LoadedCommentRecord>,
+    max_bytes: usize,
+) -> Result<String> {
+    let member_ids = thread
+        .member_record_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut required = HashSet::from([root_record_id.to_owned(), selected_record_id.to_owned()]);
+    let mut ancestor_id = comment_records
+        .get(selected_record_id)
+        .and_then(|record| record.record.reply_to.clone());
+    while let Some(id) = ancestor_id {
+        if !member_ids.contains(id.as_str()) || !required.insert(id.clone()) {
+            break;
+        }
+        ancestor_id = comment_records
+            .get(&id)
+            .and_then(|record| record.record.reply_to.clone());
+    }
+
+    let required_member_ids = thread
+        .member_record_ids
+        .iter()
+        .filter(|id| required.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let required_count = required_member_ids.len();
+    anyhow::ensure!(
+        required_count > 0,
+        "Stack Review AI comment thread has no required member"
+    );
+    let marker_reserve = if required_count < thread.member_record_ids.len() {
+        64
+    } else {
+        0
+    };
+    let required_budget = max_bytes.saturating_sub(marker_reserve);
+    let mut required_sizes = Vec::with_capacity(required_count);
+    let mut complete_required_bytes = 0usize;
+    let mut minimum_required_bytes = 0usize;
+    for member_id in &required_member_ids {
+        let record = &comment_records
+            .get(member_id)
+            .context("Stack Review AI required comment thread member is unavailable")?
+            .record;
+        let (complete_bytes, minimum_bytes) = stack_review_comment_render_sizes(record)?;
+        complete_required_bytes = complete_required_bytes
+            .checked_add(complete_bytes)
+            .context("Stack Review AI complete required chain size overflow")?;
+        minimum_required_bytes = minimum_required_bytes
+            .checked_add(minimum_bytes)
+            .context("Stack Review AI minimum required chain size overflow")?;
+        required_sizes.push((member_id.clone(), complete_bytes, minimum_bytes));
+    }
+    anyhow::ensure!(
+        minimum_required_bytes <= required_budget,
+        "Stack Review AI required comment metadata exceeds the chain byte limit"
+    );
+    let mut required_budgets = required_sizes
+        .iter()
+        .map(|(_, complete_bytes, minimum_bytes)| {
+            if complete_required_bytes <= required_budget {
+                *complete_bytes
+            } else {
+                *minimum_bytes
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut remaining_body_bytes = if complete_required_bytes <= required_budget {
+        0
+    } else {
+        required_budget - minimum_required_bytes
+    };
+    while remaining_body_bytes > 0 {
+        let active_count = required_sizes
+            .iter()
+            .zip(&required_budgets)
+            .filter(|((_, complete_bytes, _), budget)| **budget < *complete_bytes)
+            .count();
+        if active_count == 0 {
+            break;
+        }
+        let shared_bytes = remaining_body_bytes.div_ceil(active_count);
+        for ((_, complete_bytes, _), budget) in required_sizes.iter().zip(&mut required_budgets) {
+            if *budget >= *complete_bytes {
+                continue;
+            }
+            let granted = (*complete_bytes - *budget)
+                .min(shared_bytes)
+                .min(remaining_body_bytes);
+            *budget += granted;
+            remaining_body_bytes -= granted;
+            if remaining_body_bytes == 0 {
+                break;
+            }
+        }
+    }
+
+    let mut rendered = HashMap::new();
+    for ((member_id, _, _), budget) in required_sizes.into_iter().zip(required_budgets) {
+        let record = &comment_records
+            .get(&member_id)
+            .context("Stack Review AI required comment thread member is unavailable")?
+            .record;
+        rendered.insert(
+            member_id,
+            render_stack_review_comment_for_context(record, budget)?,
+        );
+    }
+    let mut chosen = required_member_ids.into_iter().collect::<HashSet<_>>();
+    let mut chosen_bytes = rendered.values().map(String::len).sum::<usize>();
+    anyhow::ensure!(
+        chosen_bytes <= max_bytes,
+        "Stack Review AI required comments exceed the chain byte limit"
+    );
+
+    for member_id in thread.member_record_ids.iter().rev() {
+        if chosen.contains(member_id) {
+            continue;
+        }
+        let remaining = max_bytes.saturating_sub(chosen_bytes + 64);
+        if remaining == 0 {
+            continue;
+        }
+        let record = &comment_records
+            .get(member_id)
+            .context("Stack Review AI optional comment thread member is unavailable")?
+            .record;
+        let segment = match render_stack_review_comment_for_context(record, remaining) {
+            Ok(segment) => segment,
+            Err(error) => {
+                log::debug!("Omitting optional Stack Review AI comment context: {error}");
+                continue;
+            }
+        };
+        if chosen_bytes + segment.len() + 64 <= max_bytes {
+            chosen.insert(member_id.clone());
+            chosen_bytes += segment.len();
+            rendered.insert(member_id.clone(), segment);
+        }
+    }
+    let omitted = thread
+        .member_record_ids
+        .iter()
+        .filter(|id| !chosen.contains(*id))
+        .count();
+    let marker = (omitted > 0).then(|| format!("\n[{omitted} comments omitted]\n"));
+    if let Some(marker) = &marker {
+        anyhow::ensure!(
+            chosen_bytes + marker.len() <= max_bytes,
+            "Stack Review AI omission marker exceeds the chain byte limit"
+        );
+    }
+
+    let mut output = String::with_capacity(chosen_bytes + marker.as_ref().map_or(0, String::len));
+    for member_id in &thread.member_record_ids {
+        if chosen.contains(member_id) {
+            output.push_str(
+                rendered
+                    .get(member_id)
+                    .context("Stack Review AI chosen comment was not rendered")?,
+            );
+        }
+    }
+    if let Some(marker) = marker {
+        output.push_str(&marker);
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stack_review_ai_comment_context(
+    project_identity: &str,
+    review_state: &StackReviewState,
+    files: &[StackReviewFileItem],
+    content_entries: &[ContentDiffEntry],
+    comment_records: &HashMap<String, LoadedCommentRecord>,
+    comment_thread_index: &CommentThreadIndex,
+    selected_record_id: &str,
+) -> Result<git_ui_core::stack_review_ai::StackReviewAiContext> {
+    let selected = comment_records
+        .get(selected_record_id)
+        .context("Stack Review AI selected comment is unavailable")?;
+    let key = comment_thread_index
+        .thread_key_for(selected_record_id)
+        .context("Stack Review AI comment thread is unavailable")?;
+    let thread = comment_thread_index
+        .thread(key)
+        .context("Stack Review AI comment thread is unavailable")?;
+    let root_record_id = canonical_comment_thread_root_record_id(key, thread);
+    let storage_key = stack_review_storage_key(&review_state.base_oid, &review_state.head_oid);
+    let selected_record = &selected.record;
+
+    let selected_line_range = match (
+        selected_record.start_row,
+        selected_record.end_row,
+        selected_record.outdated,
+    ) {
+        (Some(start), Some(end), false) => Some(start..end.saturating_add(1)),
+        _ => None,
+    };
+    let file_index = selected_record.path.as_ref().and_then(|path| {
+        content_entries
+            .iter()
+            .position(|entry| entry.path.to_string_lossy().as_ref() == path)
+    });
+    let endpoint_anchor = file_index.zip(selected_line_range);
+    let mut context = if let Some((file_index, line_range)) = endpoint_anchor {
+        build_stack_review_ai_code_context(
+            project_identity,
+            review_state,
+            files,
+            content_entries,
+            file_index,
+            selected_record.side,
+            Some(line_range),
+        )?
+    } else {
+        git_ui_core::stack_review_ai::StackReviewAiContext {
+            key: git_ui_core::stack_review_ai::StackReviewAiContextKey::review(storage_key.clone()),
+            context_revision: SharedString::default(),
+            title: "Review · top-level discussion".into(),
+            base_oid: review_state.base_oid.clone().into(),
+            head_oid: review_state.head_oid.clone().into(),
+            path: None,
+            side: Some(selected_record.side),
+            line_range: None,
+            selected_record_id: Some(selected_record_id.to_owned().into()),
+            resources: Vec::new().into(),
+        }
+    };
+
+    const ANCHOR_UNAVAILABLE: &str = "Anchor: unavailable\n\n";
+    let chain_prefix = context.line_range.is_none().then_some(ANCHOR_UNAVAILABLE);
+    let mut chain = bounded_stack_review_comment_chain(
+        thread,
+        root_record_id,
+        selected_record_id,
+        comment_records,
+        STACK_REVIEW_AI_MAX_COMMENT_CHAIN_BYTES - chain_prefix.map_or(0, str::len),
+    )?;
+    if let Some(prefix) = chain_prefix {
+        chain.insert_str(0, prefix);
+    }
+
+    let citation_range = if let Some(range) = context.line_range.as_ref() {
+        Some(
+            range
+                .start
+                .checked_add(1)
+                .context("Stack Review AI citation line range overflow")?..=range.end,
+        )
+    } else {
+        None
+    };
+    let citation_path = context.path.clone();
+    let citation = git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+        storage_key.clone(),
+        project_identity,
+        review_state.base_oid.clone(),
+        review_state.head_oid.clone(),
+        citation_path,
+        selected_record.side,
+        citation_range,
+        Some(selected_record_id.to_owned().into()),
+        Some(root_record_id.to_owned().into()),
+    )?;
+    let mut resources = context.resources.to_vec();
+    if resources
+        .iter()
+        .map(|resource| resource.text().len())
+        .sum::<usize>()
+        + chain.len()
+        > STACK_REVIEW_AI_MAX_TOTAL_BYTES
+    {
+        resources.retain(|resource| resource.citation().side() == selected_record.side);
+    }
+    anyhow::ensure!(
+        resources
+            .iter()
+            .map(|resource| resource.text().len())
+            .sum::<usize>()
+            + chain.len()
+            <= STACK_REVIEW_AI_MAX_TOTAL_BYTES,
+        "Stack Review AI required context exceeds the total byte limit"
+    );
+    resources.push(git_ui_core::stack_review_ai::StackReviewAiResource::new(
+        "Comment thread",
+        citation,
+        chain,
+    ));
+    let mut revision_material = format!(
+        "{project_identity}\0{storage_key}\0{}\0{selected_record_id}",
+        key.to_stable_string()?
+    );
+    for member_id in &thread.member_record_ids {
+        let record = &comment_records
+            .get(member_id)
+            .context("Stack Review AI revision member is unavailable")?
+            .record;
+        let serialized = serde_json::to_vec(record)?;
+        let record_revision = Uuid::new_v5(&Uuid::NAMESPACE_OID, &serialized);
+        revision_material.push('\0');
+        revision_material.push_str(&record_revision.to_string());
+    }
+    context.context_revision = Uuid::new_v5(&Uuid::NAMESPACE_URL, revision_material.as_bytes())
+        .to_string()
+        .into();
+    context.key = git_ui_core::stack_review_ai::StackReviewAiContextKey::comment(
+        storage_key,
+        key.to_stable_string()?,
+    );
+    context.title = selected_record.path.as_ref().map_or_else(
+        || "Review · top-level discussion".into(),
+        |path| format!("Review · {path} · {}", selected_record.author.name).into(),
+    );
+    context.selected_record_id = Some(selected_record_id.to_owned().into());
+    context.resources = resources.into();
+    ensure_stack_review_ai_resource_bounds(&context.resources)?;
+    Ok(context)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StackReviewCitationTarget {
     project_identity: String,
@@ -2088,6 +2921,15 @@ fn validate_stack_review_citation(
     } else {
         None
     };
+    if let Some(file_index) = file_index {
+        let file = files
+            .get(file_index)
+            .context("Stack Review citation file is unavailable")?;
+        anyhow::ensure!(
+            stack_review_file_side_exists(file.status, request.side()),
+            "Stack Review citation endpoint side is unavailable"
+        );
+    }
     if let (Some(file_index), Some(line_range)) = (file_index, request.line_range()) {
         anyhow::ensure!(
             files
@@ -2122,13 +2964,55 @@ fn validate_stack_review_citation(
                     && record.head_oid == review_state.head_oid,
                 "Stack Review citation comment belongs to another snapshot"
             );
+            let request_path = request.path().map(SharedString::as_ref);
+            let record_path_is_absent = record.path.as_ref().is_some_and(|path| {
+                !content_entries
+                    .iter()
+                    .any(|entry| entry.path.to_string_lossy().as_ref() == path)
+            });
+            let anchor_is_honestly_unavailable = request_path.is_none()
+                && request.line_range().is_none()
+                && (record.outdated || record_path_is_absent);
             anyhow::ensure!(
-                record.path.as_deref() == request.path().map(SharedString::as_ref),
+                record.path.as_deref() == request_path || anchor_is_honestly_unavailable,
                 "Stack Review citation comment path does not match"
             );
             anyhow::ensure!(
                 record.side == request.side(),
                 "Stack Review citation comment side does not match"
+            );
+            let canonical_line_range = if !record.outdated
+                && record.path.as_deref() == request_path
+                && file_index.is_some_and(|index| {
+                    files
+                        .get(index)
+                        .is_some_and(|file| file.content_kind == StackReviewContentKind::Text)
+                }) {
+                let index =
+                    file_index.context("Stack Review citation file index is unavailable")?;
+                let entry = content_entries
+                    .get(index)
+                    .context("Stack Review citation endpoint content is unavailable")?;
+                let line_count = match record.side {
+                    StackReviewCommentSide::Left => entry.old_text.lines().count(),
+                    StackReviewCommentSide::Right => entry.new_text.lines().count(),
+                    StackReviewCommentSide::TopLevel => 0,
+                };
+                let line_count = u32::try_from(line_count).unwrap_or(u32::MAX);
+                record
+                    .start_row
+                    .zip(record.end_row)
+                    .and_then(|(start, end)| {
+                        let start = start.checked_add(1)?;
+                        let end = end.checked_add(1)?;
+                        (start <= end && end <= line_count).then_some(start..=end)
+                    })
+            } else {
+                None
+            };
+            anyhow::ensure!(
+                request.line_range() == canonical_line_range.as_ref(),
+                "Stack Review citation comment range does not match"
             );
             let key = comment_thread_index
                 .thread_key_for(selected_record_id.as_ref())
@@ -2362,6 +3246,29 @@ pub struct StackReview {
 impl StackReview {
     pub(crate) fn register(workspace: &mut Workspace, _cx: &mut Context<Workspace>) {
         workspace.register_action(Self::deploy);
+    }
+
+    pub fn build_ai_context(
+        &self,
+        selection: StackReviewAiContextSelection,
+    ) -> Result<git_ui_core::stack_review_ai::StackReviewAiContext> {
+        let review_state = self
+            .review_state
+            .as_ref()
+            .context("Stack Review AI context is unavailable while the review is loading")?;
+        let mut context = build_stack_review_ai_context(
+            &stack_review_project_identity(&self.work_directory),
+            review_state,
+            &self.files,
+            &self.content_entries,
+            &self.comment_records,
+            &self.comment_thread_index,
+            selection,
+        )?;
+        let layer_pull_requests =
+            stack_review_layer_pull_requests(&self.snapshot, self.selected_scope);
+        attach_stack_review_ai_scope_label(&mut context, &layer_pull_requests)?;
+        Ok(context)
     }
 
     fn deploy(
@@ -2720,45 +3627,7 @@ impl StackReview {
         let hide_tests = self.hide_tests;
         let hide_migrations = self.hide_migrations;
         let split_left_ratio = self.split_left_ratio;
-        let layer_pull_requests: Vec<(u32, String)> = match scope {
-            StackReviewScope::Layer(index) => self
-                .snapshot
-                .layers
-                .get(index)
-                .and_then(|layer| {
-                    layer
-                        .head
-                        .pull_request_number
-                        .map(|number| (number, layer.head.oid.clone()))
-                })
-                .into_iter()
-                .collect(),
-            StackReviewScope::AggregateThrough(index) => self
-                .snapshot
-                .layers
-                .iter()
-                .take(index.saturating_add(1))
-                .filter_map(|layer| {
-                    layer
-                        .head
-                        .pull_request_number
-                        .map(|number| (number, layer.head.oid.clone()))
-                })
-                .collect(),
-            StackReviewScope::Range { from, to } => self
-                .snapshot
-                .layers
-                .iter()
-                .skip(from)
-                .take(to.saturating_sub(from))
-                .filter_map(|layer| {
-                    layer
-                        .head
-                        .pull_request_number
-                        .map(|number| (number, layer.head.oid.clone()))
-                })
-                .collect(),
-        };
+        let layer_pull_requests = stack_review_layer_pull_requests(&self.snapshot, scope);
         self.load_task = cx.spawn_in(window, async move |this, cx| {
             let result: Result<LoadedStackReview> = async {
                 let diff = receiver.await??;
@@ -2864,6 +3733,7 @@ impl StackReview {
                         fingerprint: stack_review_file_fingerprint(file),
                         provenance: file.provenance,
                         content_kind: file.content_kind,
+                        status: file.status,
                         additions: file.additions,
                         deletions: file.deletions,
                     })
@@ -5641,6 +6511,1032 @@ mod tests {
     }
 
     #[test]
+    fn stack_review_ai_non_text_metadata_rejects_missing_endpoint_sides() {
+        for (status, missing_side) in [
+            (StackReviewFileStatus::Added, StackReviewCommentSide::Left),
+            (
+                StackReviewFileStatus::Deleted,
+                StackReviewCommentSide::Right,
+            ),
+        ] {
+            let mut file = test_file_item("assets/image.bin");
+            file.status = status;
+            file.content_kind = StackReviewContentKind::Binary;
+            let files = [file];
+            let entries = [ContentDiffEntry {
+                path: PathBuf::from("assets/image.bin"),
+                source_path: None,
+                was_deleted: status == StackReviewFileStatus::Deleted,
+                old_text: Arc::from("Binary content unavailable"),
+                new_text: Arc::from("Binary content unavailable"),
+            }];
+            assert!(
+                build_stack_review_ai_context(
+                    "project-a",
+                    &StackReviewState::new("base", "head"),
+                    &files,
+                    &entries,
+                    &HashMap::new(),
+                    &CommentThreadIndex::default(),
+                    StackReviewAiContextSelection::Code {
+                        file_index: 0,
+                        side: missing_side,
+                        line_range: None,
+                    },
+                )
+                .is_err()
+            );
+
+            let request =
+                git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+                    stack_review_storage_key("base", "head"),
+                    "project-a",
+                    "base",
+                    "head",
+                    Some("assets/image.bin".into()),
+                    missing_side,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("well-shaped missing-side metadata citation");
+            assert!(
+                validate_stack_review_citation(
+                    "project-a",
+                    &StackReviewState::new("base", "head"),
+                    &files,
+                    &entries,
+                    &HashMap::new(),
+                    &CommentThreadIndex::default(),
+                    &request,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn stack_review_ai_binary_comment_retains_file_identity_without_line_anchor() {
+        let selected = test_comment_record(
+            "selected",
+            "assets/image.bin",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let records = HashMap::from([(selected.record.id.clone(), selected)]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(storage_key, records.values().map(|record| &record.record))
+                .expect("binary comment thread");
+        let mut file = test_file_item("assets/image.bin");
+        file.content_kind = StackReviewContentKind::Binary;
+        let files = [file];
+        let entries = [ContentDiffEntry {
+            path: PathBuf::from("assets/image.bin"),
+            source_path: None,
+            was_deleted: false,
+            old_text: Arc::from("Binary content unavailable"),
+            new_text: Arc::from("Binary content unavailable"),
+        }];
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &files,
+            &entries,
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "selected".to_string(),
+            },
+        )
+        .expect("binary comment metadata context");
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("binary comment resource");
+        assert_eq!(
+            chain.citation().path().map(SharedString::as_ref),
+            Some("assets/image.bin")
+        );
+        assert_eq!(chain.citation().line_range(), None);
+        assert!(
+            validate_stack_review_citation(
+                "project-a",
+                &StackReviewState::new("base", "head"),
+                &files,
+                &entries,
+                &records,
+                &thread_index,
+                chain.citation(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stack_review_ai_absent_endpoint_comment_has_valid_metadata_only_citation() {
+        let mut selected = test_comment_record(
+            "selected",
+            "historical/removed.rs",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        selected.record.start_row = Some(u32::MAX);
+        selected.record.end_row = Some(u32::MAX);
+        let records = HashMap::from([(selected.record.id.clone(), selected)]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(storage_key, records.values().map(|record| &record.record))
+                .expect("historical comment thread");
+        let files = [test_file_item("src/current.rs")];
+        let entries = [ContentDiffEntry {
+            path: PathBuf::from("src/current.rs"),
+            source_path: None,
+            was_deleted: false,
+            old_text: Arc::from("left\n"),
+            new_text: Arc::from("right\n"),
+        }];
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &files,
+            &entries,
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "selected".to_string(),
+            },
+        )
+        .expect("metadata-only historical comment context");
+        assert_eq!(context.path, None);
+        assert_eq!(context.line_range, None);
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("comment resource");
+        assert!(chain.text().contains("Anchor: unavailable"));
+        assert!(chain.text().contains("Path: historical/removed.rs"));
+        assert_eq!(chain.citation().path(), None);
+        assert_eq!(chain.citation().line_range(), None);
+        assert!(
+            validate_stack_review_citation(
+                "project-a",
+                &StackReviewState::new("base", "head"),
+                &files,
+                &entries,
+                &records,
+                &thread_index,
+                chain.citation(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stack_review_ai_scope_pr_labels_are_attached_and_revisioned() {
+        let mut context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left\n"),
+                new_text: Arc::from("right\n"),
+            }],
+            &HashMap::new(),
+            &CommentThreadIndex::default(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Right,
+                line_range: Some(0..1),
+            },
+        )
+        .expect("base context");
+        let original_revision = context.context_revision.clone();
+        let original_resources = context.resources.clone();
+        let mut changed_oid_context = context.clone();
+
+        attach_stack_review_ai_scope_label(
+            &mut context,
+            &[(12, "oid-12".to_string()), (34, "oid-34".to_string())],
+        )
+        .expect("attach PR labels");
+        attach_stack_review_ai_scope_label(
+            &mut changed_oid_context,
+            &[(12, "changed-oid".to_string()), (34, "oid-34".to_string())],
+        )
+        .expect("attach changed PR OID");
+
+        assert_eq!(context.resources.len(), original_resources.len() + 1);
+        assert_eq!(
+            &context.resources[..original_resources.len()],
+            original_resources.as_ref()
+        );
+        let scope = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Review scope")
+            .expect("scope metadata resource");
+        assert_eq!(scope.text().as_ref(), "Pull requests: #12, #34");
+        assert_ne!(context.context_revision, original_revision);
+        assert_ne!(
+            context.context_revision,
+            changed_oid_context.context_revision
+        );
+    }
+
+    #[test]
+    fn stack_review_ai_added_and_deleted_files_expose_only_existing_sides() {
+        for (status, old_text, new_text, existing_side, missing_side) in [
+            (
+                StackReviewFileStatus::Added,
+                "",
+                "added\n",
+                StackReviewCommentSide::Right,
+                StackReviewCommentSide::Left,
+            ),
+            (
+                StackReviewFileStatus::Deleted,
+                "deleted\n",
+                "",
+                StackReviewCommentSide::Left,
+                StackReviewCommentSide::Right,
+            ),
+        ] {
+            let mut file = test_file_item("src/review.rs");
+            file.status = status;
+            let entries = [ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: status == StackReviewFileStatus::Deleted,
+                old_text: Arc::from(old_text),
+                new_text: Arc::from(new_text),
+            }];
+            let context = build_stack_review_ai_context(
+                "project-a",
+                &StackReviewState::new("base", "head"),
+                std::slice::from_ref(&file),
+                &entries,
+                &HashMap::new(),
+                &CommentThreadIndex::default(),
+                StackReviewAiContextSelection::Code {
+                    file_index: 0,
+                    side: existing_side,
+                    line_range: Some(0..1),
+                },
+            )
+            .expect("existing endpoint side context");
+            assert_eq!(context.resources.len(), 1);
+            assert_eq!(context.resources[0].citation().side(), existing_side);
+
+            assert!(
+                build_stack_review_ai_context(
+                    "project-a",
+                    &StackReviewState::new("base", "head"),
+                    &[file],
+                    &entries,
+                    &HashMap::new(),
+                    &CommentThreadIndex::default(),
+                    StackReviewAiContextSelection::Code {
+                        file_index: 0,
+                        side: missing_side,
+                        line_range: Some(0..1),
+                    },
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn stack_review_ai_context_revision_is_deterministic_and_tracks_comment_updates() {
+        let record = test_comment_record(
+            "selected",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let build = |updated_at: &str, body: &str| {
+            let mut record = record.clone();
+            record.record.updated_at = updated_at.to_string();
+            record.record.body = body.to_string();
+            let records = HashMap::from([(record.record.id.clone(), record)]);
+            let thread_index = CommentThreadIndex::new(
+                stack_review_storage_key("base", "head"),
+                records.values().map(|record| &record.record),
+            )
+            .expect("revision thread index");
+            build_stack_review_ai_context(
+                "project-a",
+                &StackReviewState::new("base", "head"),
+                &[test_file_item("src/review.rs")],
+                &[ContentDiffEntry {
+                    path: PathBuf::from("src/review.rs"),
+                    source_path: None,
+                    was_deleted: false,
+                    old_text: Arc::from("left one\nleft two\n"),
+                    new_text: Arc::from("right one\nright two\n"),
+                }],
+                &records,
+                &thread_index,
+                StackReviewAiContextSelection::Comment {
+                    selected_record_id: "selected".to_string(),
+                },
+            )
+            .expect("deterministic context")
+        };
+
+        let first = build("2026-08-21T12:00:00Z", "body-a");
+        let repeated = build("2026-08-21T12:00:00Z", "body-a");
+        let body_changed = build("2026-08-21T12:00:00Z", "body-b");
+        let updated = build("2026-08-21T12:01:00Z", "body-a");
+        assert_eq!(first.context_revision, repeated.context_revision);
+        assert_ne!(first.context_revision, body_changed.context_revision);
+        assert_ne!(first.context_revision, updated.context_revision);
+    }
+
+    #[test]
+    fn stack_review_ai_code_rejects_oversized_and_out_of_bounds_selections() {
+        let text = (0..250)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bounded_stack_review_code(&text, 0..201).is_err());
+        assert!(bounded_stack_review_code(&text, 249..251).is_err());
+
+        let error = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left\n"),
+                new_text: Arc::from("right\n"),
+            }],
+            &HashMap::new(),
+            &CommentThreadIndex::default(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Right,
+                line_range: Some(0..2),
+            },
+        )
+        .expect_err("selected endpoint range must not be silently clamped");
+        assert!(error.to_string().contains("outside the endpoint text"));
+    }
+
+    #[test]
+    fn stack_review_ai_counterpart_uses_unmapped_endpoint_excerpt() {
+        let right = (0..20)
+            .map(|index| format!("right-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left-zero\nleft-one\nleft-two\n"),
+                new_text: Arc::from(right),
+            }],
+            &HashMap::new(),
+            &CommentThreadIndex::default(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Right,
+                line_range: Some(15..16),
+            },
+        )
+        .expect("counterpart context");
+
+        let left = context
+            .resources
+            .iter()
+            .find(|resource| resource.citation().side() == StackReviewCommentSide::Left)
+            .expect("available LEFT counterpart");
+        assert!(left.text().contains("left-zero"));
+        assert!(left.text().contains("left-two"));
+        assert!(left.text().contains("Counterpart mapping: unavailable"));
+        assert_eq!(left.citation().line_range(), Some(&(1..=3)));
+    }
+
+    #[test]
+    fn stack_review_ai_missing_parent_omission_count_matches_canonical_members() {
+        let mut records = HashMap::new();
+        for index in 0..20 {
+            let id = format!("reply-{index:02}");
+            let mut reply = test_comment_record(
+                &id,
+                "src/review.rs",
+                StackReviewCommentSource::Github,
+                None,
+                Some("missing-parent"),
+                &format!("2026-08-21T12:{index:02}:00Z"),
+            );
+            reply.record.body = format!("{id} {}", "x".repeat(5_000));
+            records.insert(id, reply);
+        }
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(storage_key, records.values().map(|record| &record.record))
+                .expect("missing-parent thread index");
+        let selected_id = "reply-10";
+        let key = thread_index
+            .thread_key_for(selected_id)
+            .expect("selected degraded thread");
+        let member_count = thread_index
+            .thread(key)
+            .expect("selected degraded thread")
+            .member_record_ids
+            .len();
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: selected_id.to_string(),
+            },
+        )
+        .expect("bounded missing-parent chain");
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("comment chain");
+        let included = chain.text().matches("Record: ").count();
+        let omitted = chain
+            .text()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix('[')
+                    .and_then(|line| line.strip_suffix(" comments omitted]"))
+                    .and_then(|count| count.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        assert_eq!(included + omitted, member_count);
+    }
+
+    #[test]
+    fn stack_review_ai_required_budget_redistributes_unused_bytes() {
+        let root = test_comment_record(
+            "root",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let mut selected = test_comment_record(
+            "selected",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            Some("root"),
+            "2026-08-21T12:01:00Z",
+        );
+        selected.record.body = "x".repeat(100_000);
+        let records = HashMap::from([
+            (root.record.id.clone(), root),
+            (selected.record.id.clone(), selected),
+        ]);
+        let thread_index = CommentThreadIndex::new(
+            stack_review_storage_key("base", "head"),
+            records.values().map(|record| &record.record),
+        )
+        .expect("required redistribution thread");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "selected".to_string(),
+            },
+        )
+        .expect("redistributed required budget context");
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("comment chain");
+        assert!(chain.text().matches('x').count() > 50 * 1024);
+        assert!(chain.text().len() <= STACK_REVIEW_AI_MAX_COMMENT_CHAIN_BYTES);
+    }
+
+    #[test]
+    fn stack_review_ai_required_comments_use_dynamic_metadata_budgets() {
+        let mut root = test_comment_record(
+            "root",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        root.record.author.name = "r".repeat(40 * 1024);
+        root.record.body = "root body".to_string();
+        let selected = test_comment_record(
+            "selected",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            Some("root"),
+            "2026-08-21T12:01:00Z",
+        );
+        let records = HashMap::from([
+            (root.record.id.clone(), root),
+            (selected.record.id.clone(), selected),
+        ]);
+        let thread_index = CommentThreadIndex::new(
+            stack_review_storage_key("base", "head"),
+            records.values().map(|record| &record.record),
+        )
+        .expect("required comment thread");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "selected".to_string(),
+            },
+        )
+        .expect("required metadata fits the aggregate chain budget");
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("comment chain");
+        assert!(chain.text().contains("Record: root"));
+        assert!(chain.text().contains("root body"));
+        assert!(chain.text().contains("Record: selected"));
+        assert!(chain.text().len() <= STACK_REVIEW_AI_MAX_COMMENT_CHAIN_BYTES);
+    }
+
+    #[test]
+    fn stack_review_ai_oversized_optional_comment_is_omitted_without_failing() {
+        let root = test_comment_record(
+            "root",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let mut optional = test_comment_record(
+            "optional",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            Some("root"),
+            "2026-08-21T12:01:00Z",
+        );
+        optional.record.author.name = "x".repeat(100_000);
+        let records = HashMap::from([
+            (root.record.id.clone(), root),
+            (optional.record.id.clone(), optional),
+        ]);
+        let thread_index = CommentThreadIndex::new(
+            stack_review_storage_key("base", "head"),
+            records.values().map(|record| &record.record),
+        )
+        .expect("optional comment thread");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "root".to_string(),
+            },
+        )
+        .expect("oversized optional metadata is omitted");
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("comment chain");
+        assert!(chain.text().contains("Record: root"));
+        assert!(!chain.text().contains("Record: optional"));
+        assert!(chain.text().contains("[1 comments omitted]"));
+    }
+
+    #[test]
+    fn stack_review_ai_oversized_selected_comment_retains_record_with_body_marker() {
+        let mut selected = test_comment_record(
+            "selected",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        selected.record.body = format!("start-🙂-{}-end", "x".repeat(100_000));
+        let records = HashMap::from([(selected.record.id.clone(), selected)]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(storage_key, records.values().map(|record| &record.record))
+                .expect("oversized selected thread");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "selected".to_string(),
+            },
+        )
+        .expect("oversized selected body is reduced safely");
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("comment chain");
+        assert!(chain.text().len() <= STACK_REVIEW_AI_MAX_COMMENT_CHAIN_BYTES);
+        assert!(chain.text().contains("Record: selected"));
+        assert!(chain.text().contains("comment body truncated"));
+        assert!(chain.text().contains("start-🙂-"));
+    }
+
+    #[test]
+    fn stack_review_ai_code_bounds_retain_selection_and_cap_total_packet() {
+        let lines = (0..400)
+            .map(|index| format!("line-{index:03}-{}", "x".repeat(380)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (range, snippet) =
+            bounded_stack_review_code(&lines, 250..251).expect("bounded selected code");
+        assert!(range.end - range.start <= STACK_REVIEW_AI_MAX_CODE_LINES);
+        assert!(range.contains(&250));
+        assert!(snippet.contains("line-250-"));
+        assert!(snippet.len() <= STACK_REVIEW_AI_MAX_RESOURCE_BYTES);
+
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/large.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/large.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from(lines.clone()),
+                new_text: Arc::from(lines),
+            }],
+            &HashMap::new(),
+            &CommentThreadIndex::default(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Right,
+                line_range: Some(250..251),
+            },
+        )
+        .expect("bounded total context");
+        let total_bytes = context
+            .resources
+            .iter()
+            .map(|resource| resource.text().len())
+            .sum::<usize>();
+        assert!(
+            context
+                .resources
+                .iter()
+                .all(|resource| resource.text().len() <= 64 * 1024)
+        );
+        assert!(total_bytes <= 128 * 1024, "packet was {total_bytes} bytes");
+    }
+
+    #[test]
+    fn stack_review_ai_binary_context_is_metadata_only() {
+        let mut file = test_file_item("assets/image.bin");
+        file.content_kind = StackReviewContentKind::Binary;
+        file.additions = None;
+        file.deletions = None;
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[file],
+            &[ContentDiffEntry {
+                path: PathBuf::from("assets/image.bin"),
+                source_path: Some(PathBuf::from("/live/worktree/assets/image.bin")),
+                was_deleted: false,
+                old_text: Arc::from("Binary content unavailable"),
+                new_text: Arc::from("Binary content unavailable"),
+            }],
+            &HashMap::new(),
+            &CommentThreadIndex::default(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Right,
+                line_range: None,
+            },
+        )
+        .expect("build binary metadata context");
+
+        assert_eq!(context.line_range, None);
+        assert_eq!(context.resources.len(), 1);
+        assert!(context.resources[0].text().contains("Content: Binary"));
+        assert!(
+            !context.resources[0]
+                .text()
+                .contains("Binary content unavailable")
+        );
+        assert!(!context.resources[0].text().contains("/live/worktree"));
+        assert_eq!(context.resources[0].citation().line_range(), None);
+    }
+
+    #[test]
+    fn stack_review_ai_top_level_comment_context_has_no_false_code_anchor() {
+        let mut top_level = test_comment_record(
+            "discussion",
+            "unused.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        top_level.record.path = None;
+        top_level.record.side = StackReviewCommentSide::TopLevel;
+        top_level.record.start_row = None;
+        top_level.record.end_row = None;
+        top_level.record.outdated = true;
+        let records = HashMap::from([(top_level.record.id.clone(), top_level)]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(storage_key, records.values().map(|record| &record.record))
+                .expect("top-level thread index");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[],
+            &[],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "discussion".to_string(),
+            },
+        )
+        .expect("top-level metadata context");
+
+        assert_eq!(context.path, None);
+        assert_eq!(context.side, Some(StackReviewCommentSide::TopLevel));
+        assert_eq!(context.line_range, None);
+        assert_eq!(context.resources.len(), 1);
+        assert_eq!(context.resources[0].citation().path(), None);
+        assert_eq!(context.resources[0].citation().line_range(), None);
+        assert!(context.resources[0].text().contains("Anchor: unavailable"));
+    }
+
+    #[test]
+    fn stack_review_ai_comment_chain_bounds_retain_root_and_selected() {
+        let mut root = test_comment_record(
+            "root",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            None,
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        root.record.body = "root body".to_string();
+        let mut records = HashMap::from([(root.record.id.clone(), root)]);
+        for index in 0..20 {
+            let id = format!("reply-{index:02}");
+            let mut reply = test_comment_record(
+                &id,
+                "src/review.rs",
+                StackReviewCommentSource::Github,
+                None,
+                Some("root"),
+                &format!("2026-08-21T12:{:02}:00Z", index + 1),
+            );
+            reply.record.body = format!("{id} {}", "x".repeat(5_000));
+            records.insert(id, reply);
+        }
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(storage_key, records.values().map(|record| &record.record))
+                .expect("long canonical comment thread");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "reply-10".to_string(),
+            },
+        )
+        .expect("bounded long comment context");
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("bounded comment chain");
+
+        assert!(chain.text().len() <= STACK_REVIEW_AI_MAX_COMMENT_CHAIN_BYTES);
+        assert!(chain.text().contains("root body"));
+        assert!(chain.text().contains("Record: reply-10"));
+        assert!(chain.text().contains("comments omitted"));
+    }
+
+    #[test]
+    fn stack_review_ai_comment_context_preserves_canonical_chain_and_parent_ids() {
+        let root = test_comment_record(
+            "root",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let reply = test_comment_record(
+            "reply",
+            "src/review.rs",
+            StackReviewCommentSource::LocalHuman,
+            Some("author"),
+            Some("root"),
+            "2026-08-21T12:01:00Z",
+        );
+        let records = HashMap::from([
+            (root.record.id.clone(), root),
+            (reply.record.id.clone(), reply),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index = CommentThreadIndex::new(
+            storage_key.clone(),
+            records.values().map(|record| &record.record),
+        )
+        .expect("canonical comment thread");
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "reply".to_string(),
+            },
+        )
+        .expect("build immutable comment context");
+
+        let key = thread_index
+            .thread_key_for("reply")
+            .expect("reply thread key")
+            .to_stable_string()
+            .expect("stable thread key");
+        assert_eq!(
+            context.key,
+            git_ui_core::stack_review_ai::StackReviewAiContextKey::comment(storage_key, key)
+        );
+        assert_eq!(context.selected_record_id.as_deref(), Some("reply"));
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("comment chain resource");
+        assert!(chain.text().contains("Record: root"));
+        assert!(chain.text().contains("Record: reply"));
+        assert!(chain.text().contains("Parent: root"));
+        assert_eq!(
+            chain
+                .citation()
+                .selected_record_id()
+                .map(SharedString::as_ref),
+            Some("reply")
+        );
+        assert_eq!(
+            chain.citation().root_record_id().map(SharedString::as_ref),
+            Some("root")
+        );
+    }
+
+    #[test]
+    fn stack_review_ai_code_context_uses_both_immutable_endpoint_sides() {
+        let review_state = StackReviewState::new("base", "head");
+        let files = vec![test_file_item("src/review.rs")];
+        let entries = vec![ContentDiffEntry {
+            path: PathBuf::from("src/review.rs"),
+            source_path: Some(PathBuf::from("/live/worktree/src/review.rs")),
+            was_deleted: false,
+            old_text: Arc::from("left endpoint\nshared\n"),
+            new_text: Arc::from("right endpoint\nshared\n"),
+        }];
+
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &review_state,
+            &files,
+            &entries,
+            &HashMap::new(),
+            &CommentThreadIndex::default(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Right,
+                line_range: Some(0..1),
+            },
+        )
+        .expect("build immutable code context");
+
+        assert_eq!(
+            context.key,
+            git_ui_core::stack_review_ai::StackReviewAiContextKey::review(
+                stack_review_storage_key("base", "head")
+            )
+        );
+        assert_eq!(context.base_oid.as_ref(), "base");
+        assert_eq!(context.head_oid.as_ref(), "head");
+        assert_eq!(context.path.as_deref(), Some("src/review.rs"));
+        assert_eq!(context.side, Some(StackReviewCommentSide::Right));
+        assert_eq!(context.line_range, Some(0..1));
+        assert_eq!(context.resources.len(), 2);
+        assert!(context.resources[0].text().contains("right endpoint"));
+        assert!(context.resources[1].text().contains("left endpoint"));
+        assert_eq!(
+            context.resources[0].citation().side(),
+            StackReviewCommentSide::Right
+        );
+        assert_eq!(
+            context.resources[1].citation().side(),
+            StackReviewCommentSide::Left
+        );
+        assert!(
+            context
+                .resources
+                .iter()
+                .all(|resource| !resource.text().contains("/live/worktree"))
+        );
+    }
+
+    #[test]
     fn stack_review_citation_validation_rejects_lines_outside_endpoint_text() {
         let storage_key = stack_review_storage_key("base", "head");
         for (text, line, content_kind) in [
@@ -5793,6 +7689,32 @@ mod tests {
         assert_eq!(target.side, StackReviewCommentSide::Right);
         assert_eq!(target.line_range, Some(2..=2));
         assert_eq!(target.selected_record_id.as_deref(), Some("reply"));
+
+        let wrong_range =
+            git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+                stack_review_storage_key("base", "head"),
+                "project-a",
+                "base",
+                "head",
+                Some("src/review.rs".into()),
+                StackReviewCommentSide::Right,
+                Some(1..=1),
+                Some("reply".into()),
+                Some("root".into()),
+            )
+            .expect("well-shaped but noncanonical comment range");
+        assert!(
+            validate_stack_review_citation(
+                "project-a",
+                &StackReviewState::new("base", "head"),
+                &[test_file_item("src/review.rs")],
+                &entries,
+                &records,
+                &thread_index,
+                &wrong_range,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5879,6 +7801,7 @@ mod tests {
             fingerprint: format!("{path}-fingerprint").into(),
             provenance: StackReviewFileProvenance::Direct,
             content_kind: StackReviewContentKind::Text,
+            status: StackReviewFileStatus::Modified,
             additions: Some(1),
             deletions: Some(1),
         }
@@ -8028,6 +9951,7 @@ mod tests {
                             fingerprint: "first-fingerprint".into(),
                             provenance: StackReviewFileProvenance::Direct,
                             content_kind: StackReviewContentKind::Text,
+                            status: StackReviewFileStatus::Modified,
                             additions: Some(2),
                             deletions: Some(1),
                         },
@@ -8036,6 +9960,7 @@ mod tests {
                             fingerprint: "second-fingerprint".into(),
                             provenance: StackReviewFileProvenance::Direct,
                             content_kind: StackReviewContentKind::Binary,
+                            status: StackReviewFileStatus::Modified,
                             additions: None,
                             deletions: None,
                         },
@@ -8044,6 +9969,7 @@ mod tests {
                             fingerprint: "third-fingerprint".into(),
                             provenance: StackReviewFileProvenance::Direct,
                             content_kind: StackReviewContentKind::Text,
+                            status: StackReviewFileStatus::Modified,
                             additions: Some(1),
                             deletions: Some(1),
                         },
