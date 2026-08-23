@@ -7509,6 +7509,7 @@ dependencies = [
  "theme_settings",
  "ui",
  "unindent",
+ "url",
  "util",
  "watch",
  "workspace",

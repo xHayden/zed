@@ -1,6 +1,6 @@
 use crate::multi_diff_view::{ContentDiffEntry, MultiDiffView};
 use anyhow::{Context as _, Result, anyhow};
-use editor::{Editor, EditorEvent};
+use editor::{Editor, EditorEvent, scroll::Autoscroll};
 use feature_flags::{FeatureFlagAppExt as _, StackReviewFeatureFlag};
 use fs::{Fs, RemoveOptions};
 use futures::{StreamExt as _, channel::oneshot};
@@ -22,6 +22,7 @@ use gpui::{
     Render, SharedString, Subscription, Task, Window, actions, deferred, prelude::*, px,
     uniform_list,
 };
+use language::Point;
 use project::{Project, git_store::Repository};
 use std::{
     any::Any,
@@ -2026,6 +2027,217 @@ async fn write_latest_state(
     Ok(true)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StackReviewCitationTarget {
+    project_identity: String,
+    storage_key: String,
+    base_oid: String,
+    head_oid: String,
+    path: Option<String>,
+    file_index: Option<usize>,
+    side: StackReviewCommentSide,
+    line_range: Option<std::ops::RangeInclusive<u32>>,
+    selected_record_id: Option<String>,
+}
+
+pub(crate) fn stack_review_project_identity(identity_path: &Path) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        identity_path.to_string_lossy().as_bytes(),
+    )
+    .to_string()
+}
+
+fn stack_review_citation_point_range(
+    range: &std::ops::RangeInclusive<u32>,
+) -> std::ops::Range<Point> {
+    Point::new(range.start().saturating_sub(1), 0)..Point::new(*range.end(), 0)
+}
+
+fn validate_stack_review_citation(
+    project_identity: &str,
+    review_state: &StackReviewState,
+    files: &[StackReviewFileItem],
+    content_entries: &[ContentDiffEntry],
+    comment_records: &HashMap<String, LoadedCommentRecord>,
+    comment_thread_index: &CommentThreadIndex,
+    request: &git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest,
+) -> Result<StackReviewCitationTarget> {
+    anyhow::ensure!(
+        request.project_identity().as_ref() == project_identity,
+        "Stack Review citation belongs to another project"
+    );
+    let expected_storage_key =
+        stack_review_storage_key(&review_state.base_oid, &review_state.head_oid);
+    anyhow::ensure!(
+        request.storage_key().as_ref() == expected_storage_key,
+        "Stack Review citation snapshot is unavailable"
+    );
+    anyhow::ensure!(
+        request.base_oid().as_ref() == review_state.base_oid
+            && request.head_oid().as_ref() == review_state.head_oid,
+        "Stack Review citation snapshot is unavailable"
+    );
+
+    let file_index = if let Some(path) = request.path() {
+        content_entries
+            .iter()
+            .position(|entry| entry.path.to_string_lossy() == path.as_ref())
+            .context("Stack Review citation path is not in the endpoint diff")?
+            .into()
+    } else {
+        None
+    };
+    if let (Some(file_index), Some(line_range)) = (file_index, request.line_range()) {
+        anyhow::ensure!(
+            files
+                .get(file_index)
+                .is_some_and(|file| { file.content_kind == StackReviewContentKind::Text }),
+            "Stack Review citation side has no text content"
+        );
+        let entry = &content_entries[file_index];
+        let text = match request.side() {
+            StackReviewCommentSide::Left => &entry.old_text,
+            StackReviewCommentSide::Right => &entry.new_text,
+            StackReviewCommentSide::TopLevel => {
+                anyhow::bail!("Top-level Stack Review citation cannot have a line range")
+            }
+        };
+        let line_count = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
+        anyhow::ensure!(
+            *line_range.end() <= line_count,
+            "Stack Review citation line range is outside the endpoint text"
+        );
+    }
+
+    match (request.selected_record_id(), request.root_record_id()) {
+        (None, None) => {}
+        (Some(selected_record_id), Some(root_record_id)) => {
+            let loaded = comment_records
+                .get(selected_record_id.as_ref())
+                .context("Stack Review citation comment is unavailable")?;
+            let record = &loaded.record;
+            anyhow::ensure!(
+                record.base_oid == review_state.base_oid
+                    && record.head_oid == review_state.head_oid,
+                "Stack Review citation comment belongs to another snapshot"
+            );
+            anyhow::ensure!(
+                record.path.as_deref() == request.path().map(SharedString::as_ref),
+                "Stack Review citation comment path does not match"
+            );
+            anyhow::ensure!(
+                record.side == request.side(),
+                "Stack Review citation comment side does not match"
+            );
+            let key = comment_thread_index
+                .thread_key_for(selected_record_id.as_ref())
+                .context("Stack Review citation thread is unavailable")?;
+            let thread = comment_thread_index
+                .thread(key)
+                .context("Stack Review citation thread is unavailable")?;
+            let canonical_root_record_id = match key {
+                CommentThreadKey::Normal { root_record_id, .. } => root_record_id,
+                CommentThreadKey::Cycle {
+                    canonical_member_id,
+                    ..
+                } => canonical_member_id,
+                CommentThreadKey::MissingParent { .. }
+                | CommentThreadKey::BoundaryViolation { .. } => &thread.placement_record_id,
+            };
+            anyhow::ensure!(
+                canonical_root_record_id == root_record_id.as_ref(),
+                "Stack Review citation root does not match the canonical thread"
+            );
+        }
+        _ => anyhow::bail!("Stack Review citation must provide selected and root IDs together"),
+    }
+
+    Ok(StackReviewCitationTarget {
+        project_identity: project_identity.to_owned(),
+        storage_key: request.storage_key().to_string(),
+        base_oid: request.base_oid().to_string(),
+        head_oid: request.head_oid().to_string(),
+        path: request.path().map(ToString::to_string),
+        file_index,
+        side: request.side(),
+        line_range: request.line_range().cloned(),
+        selected_record_id: request.selected_record_id().map(ToString::to_string),
+    })
+}
+
+pub(crate) struct StackReviewCitationNavigationHandler;
+
+impl git_ui_core::stack_review_ai::StackReviewCitationNavigationHost
+    for StackReviewCitationNavigationHandler
+{
+    fn navigate(
+        &self,
+        request: git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest,
+        workspace: gpui::WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        let workspace = workspace
+            .upgrade()
+            .context("Stack Review citation workspace is unavailable")?;
+        workspace.update(cx, |workspace, cx| {
+            let active_item = workspace.active_item_as::<StackReview>(cx);
+            let mut candidates = workspace
+                .items_of_type::<StackReview>(cx)
+                .filter(|item| {
+                    let item = item.read(cx);
+                    item.review_state.as_ref().is_some_and(|state| {
+                        stack_review_project_identity(&item.work_directory)
+                            == request.project_identity().as_ref()
+                            && state.base_oid == request.base_oid().as_ref()
+                            && state.head_oid == request.head_oid().as_ref()
+                            && stack_review_storage_key(&state.base_oid, &state.head_oid)
+                                == request.storage_key().as_ref()
+                    })
+                })
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                !candidates.is_empty(),
+                "Stack Review citation snapshot is unavailable"
+            );
+            candidates.sort_by_key(|item| (Some(item) != active_item.as_ref()) as u8);
+
+            let mut last_error = None;
+            let mut validated = None;
+            for item in candidates {
+                match item.update(cx, |item, _cx| {
+                    let project_identity = stack_review_project_identity(&item.work_directory);
+                    let state = item
+                        .review_state
+                        .as_ref()
+                        .context("Stack Review citation snapshot is still loading")?;
+                    validate_stack_review_citation(
+                        &project_identity,
+                        state,
+                        &item.files,
+                        &item.content_entries,
+                        &item.comment_records,
+                        &item.comment_thread_index,
+                        &request,
+                    )
+                }) {
+                    Ok(target) => {
+                        validated = Some((item, target));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            let (item, target) = validated.ok_or_else(|| {
+                last_error.unwrap_or_else(|| anyhow!("Stack Review citation is unavailable"))
+            })?;
+            workspace.activate_item(&item, true, true, window, cx);
+            item.update(cx, |item, cx| item.navigate_to_citation(target, window, cx))
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct StackReviewStateErrors {
     transient: Option<SharedString>,
@@ -2121,6 +2333,7 @@ pub struct StackReview {
     commenter_cutoffs: Vec<CommenterCutoff>,
     selected_comment_record_id: Option<String>,
     pending_comment_reveal: Option<PendingCommentReveal>,
+    pending_citation_reveal: Option<StackReviewCitationTarget>,
     selected_commenter: Option<String>,
     reviewer_login: Option<String>,
     refreshed_github_snapshots: HashSet<String>,
@@ -2375,6 +2588,7 @@ impl StackReview {
             commenter_cutoffs: Vec::new(),
             selected_comment_record_id: None,
             pending_comment_reveal: None,
+            pending_citation_reveal: None,
             selected_commenter: None,
             reviewer_login: None,
             refreshed_github_snapshots: HashSet::new(),
@@ -2403,6 +2617,7 @@ impl StackReview {
 
     fn load_scope(&mut self, scope: StackReviewScope, window: &mut Window, cx: &mut Context<Self>) {
         self.remember_active_split_ratio(cx);
+        self.pending_citation_reveal = None;
         self.checkpoint_boundary_requests.invalidate();
         let scope_changed = scope.boundaries() != self.selected_scope.boundaries();
         if scope_changed {
@@ -3034,6 +3249,13 @@ impl StackReview {
     }
 
     fn select_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .pending_citation_reveal
+            .as_ref()
+            .is_some_and(|target| target.file_index != Some(index))
+        {
+            self.pending_citation_reveal = None;
+        }
         if self.selected_file_index == Some(index)
             && self.diff_view.is_some()
             && !self.active_comment_projection_stale
@@ -3114,7 +3336,11 @@ impl StackReview {
                         );
                     }
                     this.error = None;
-                    if let Some(target) = this.pending_comment_reveal.take() {
+                    if let Some(target) = this.pending_citation_reveal.take() {
+                        if let Err(error) = this.reveal_citation_range(&target, window, cx) {
+                            this.error = Some(error.to_string().into());
+                        }
+                    } else if let Some(target) = this.pending_comment_reveal.take() {
                         this.reveal_comment_target(target, window, cx);
                     } else {
                         window.focus(&editor.focus_handle(cx), cx);
@@ -3122,6 +3348,7 @@ impl StackReview {
                     cx.notify();
                 }
                 Err(error) => {
+                    this.pending_citation_reveal = None;
                     this.diff_view = None;
                     this.error = Some(error.to_string().into());
                     cx.notify();
@@ -4192,6 +4419,97 @@ impl StackReview {
                 cx.notify();
             }
         }
+    }
+
+    fn navigate_to_citation(
+        &mut self,
+        target: StackReviewCitationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.pending_citation_reveal = None;
+        if let Some(record_id) = target.selected_record_id.clone() {
+            self.selected_comment_record_id = Some(record_id.clone());
+            if target.side == StackReviewCommentSide::TopLevel {
+                self.focus_handle.focus(window, cx);
+                cx.notify();
+                return Ok(());
+            }
+            self.reveal_comment_record(&record_id, window, cx);
+            return Ok(());
+        }
+
+        let Some(file_index) = target.file_index else {
+            self.focus_handle.focus(window, cx);
+            return Ok(());
+        };
+        if self.selected_file_index == Some(file_index) && self.diff_view.is_some() {
+            return self.reveal_citation_range(&target, window, cx);
+        }
+        self.pending_citation_reveal = Some(target);
+        self.select_file(file_index, window, cx);
+        Ok(())
+    }
+
+    fn reveal_citation_range(
+        &mut self,
+        target: &StackReviewCitationTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let review_state = self
+            .review_state
+            .as_ref()
+            .context("Stack Review citation snapshot is unavailable")?;
+        anyhow::ensure!(
+            target.project_identity == stack_review_project_identity(&self.work_directory)
+                && target.storage_key
+                    == stack_review_storage_key(&review_state.base_oid, &review_state.head_oid)
+                && target.base_oid == review_state.base_oid
+                && target.head_oid == review_state.head_oid,
+            "Stack Review citation target belongs to a stale snapshot"
+        );
+        anyhow::ensure!(
+            target.file_index == self.selected_file_index,
+            "Stack Review citation target is no longer the selected file"
+        );
+        if let Some(file_index) = target.file_index {
+            anyhow::ensure!(
+                self.content_entries.get(file_index).is_some_and(|entry| {
+                    target.path.as_deref() == Some(entry.path.to_string_lossy().as_ref())
+                }),
+                "Stack Review citation target path is stale"
+            );
+        }
+        let diff_view = self
+            .diff_view
+            .as_ref()
+            .context("Stack Review citation file is still loading")?;
+        let editor = match target.side {
+            StackReviewCommentSide::Left => diff_view
+                .read(cx)
+                .left_editor(cx)
+                .context("Stack Review citation LEFT side is unavailable")?,
+            StackReviewCommentSide::Right => diff_view.read(cx).editor(),
+            StackReviewCommentSide::TopLevel => {
+                anyhow::bail!("Top-level Stack Review citation has no code range")
+            }
+        };
+        editor.update(cx, |editor, cx| {
+            if let Some(range) = &target.line_range {
+                let range = stack_review_citation_point_range(range);
+                editor.change_selections(
+                    Some(Autoscroll::center()).into(),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.select_ranges([range]);
+                    },
+                );
+            }
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        Ok(())
     }
 
     fn reveal_comment_record(
@@ -5320,6 +5638,239 @@ mod tests {
         assert_eq!(records[2].side, StackReviewCommentSide::TopLevel);
         assert_eq!(records[2].created_at, "2026-08-21T12:02:00Z");
         assert_eq!(records[2].updated_at, "2026-08-22T12:02:00Z");
+    }
+
+    #[test]
+    fn stack_review_citation_validation_rejects_lines_outside_endpoint_text() {
+        let storage_key = stack_review_storage_key("base", "head");
+        for (text, line, content_kind) in [
+            ("", 1, StackReviewContentKind::Text),
+            ("new\n", 2, StackReviewContentKind::Text),
+            ("new\n", 3, StackReviewContentKind::Text),
+            (
+                "Binary content unavailable",
+                1,
+                StackReviewContentKind::Binary,
+            ),
+        ] {
+            let entries = vec![ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("old\n"),
+                new_text: Arc::from(text),
+            }];
+            let request =
+                git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+                    storage_key.clone(),
+                    "project-a",
+                    "base",
+                    "head",
+                    Some("src/review.rs".into()),
+                    StackReviewCommentSide::Right,
+                    Some(line..=line),
+                    None,
+                    None,
+                )
+                .expect("well-shaped but out-of-bounds citation");
+
+            let mut file = test_file_item("src/review.rs");
+            file.content_kind = content_kind;
+            assert!(
+                validate_stack_review_citation(
+                    "project-a",
+                    &StackReviewState::new("base", "head"),
+                    &[file],
+                    &entries,
+                    &HashMap::new(),
+                    &CommentThreadIndex::default(),
+                    &request,
+                )
+                .is_err(),
+                "accepted line {line} for endpoint text {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stack_review_citation_line_range_converts_to_editor_points() {
+        assert_eq!(
+            stack_review_citation_point_range(&(4..=6)),
+            Point::new(3, 0)..Point::new(6, 0)
+        );
+    }
+
+    #[gpui::test]
+    fn stack_review_citation_host_refuses_missing_workspace(cx: &mut gpui::TestAppContext) {
+        let request = git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+            stack_review_storage_key("base", "head"),
+            "project-a",
+            "base",
+            "head",
+            Some("src/review.rs".into()),
+            StackReviewCommentSide::Right,
+            Some(2..=2),
+            None,
+            None,
+        )
+        .expect("valid citation request");
+        let visual_context = cx.add_empty_window();
+
+        let error = visual_context.update(|window, cx| {
+            git_ui_core::stack_review_ai::StackReviewCitationNavigationHost::navigate(
+                &StackReviewCitationNavigationHandler,
+                request,
+                gpui::WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+            .unwrap_err()
+        });
+
+        assert!(error.to_string().contains("workspace is unavailable"));
+    }
+
+    #[test]
+    fn stack_review_citation_validation_uses_snapshot_and_canonical_thread_authority() {
+        let root = test_comment_record(
+            "root",
+            "src/review.rs",
+            StackReviewCommentSource::LocalHuman,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        let reply = test_comment_record(
+            "reply",
+            "src/review.rs",
+            StackReviewCommentSource::LocalHuman,
+            Some("author"),
+            Some("root"),
+            "2026-08-21T12:01:00Z",
+        );
+        let records = HashMap::from([
+            (root.record.id.clone(), root),
+            (reply.record.id.clone(), reply),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index = CommentThreadIndex::new(
+            storage_key.clone(),
+            records.values().map(|record| &record.record),
+        )
+        .expect("canonical thread index");
+        let entries = vec![ContentDiffEntry {
+            path: PathBuf::from("src/review.rs"),
+            source_path: None,
+            was_deleted: false,
+            old_text: Arc::from("old one\nold two\n"),
+            new_text: Arc::from("new one\nnew two\n"),
+        }];
+        let request = git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+            storage_key,
+            "project-a",
+            "base",
+            "head",
+            Some("src/review.rs".into()),
+            StackReviewCommentSide::Right,
+            Some(2..=2),
+            Some("reply".into()),
+            Some("root".into()),
+        )
+        .expect("valid citation request");
+
+        let target = validate_stack_review_citation(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &entries,
+            &records,
+            &thread_index,
+            &request,
+        )
+        .expect("citation matches authoritative review state");
+
+        assert_eq!(target.file_index, Some(0));
+        assert_eq!(target.side, StackReviewCommentSide::Right);
+        assert_eq!(target.line_range, Some(2..=2));
+        assert_eq!(target.selected_record_id.as_deref(), Some("reply"));
+    }
+
+    #[test]
+    fn stack_review_cycle_citation_requires_canonical_member_root() {
+        let mut member_a = test_comment_record(
+            "a",
+            "src/review.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            Some("b"),
+            "2026-08-21T12:01:00Z",
+        );
+        let mut member_b = test_comment_record(
+            "b",
+            "src/review.rs",
+            StackReviewCommentSource::LocalHuman,
+            None,
+            Some("a"),
+            "2026-08-21T12:00:00Z",
+        );
+        member_a.record.reply_to = Some("b".to_string());
+        member_b.record.reply_to = Some("a".to_string());
+        let records = HashMap::from([
+            (member_a.record.id.clone(), member_a),
+            (member_b.record.id.clone(), member_b),
+        ]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index = CommentThreadIndex::new(
+            storage_key.clone(),
+            records.values().map(|record| &record.record),
+        )
+        .expect("cycle thread index");
+        let entries = vec![ContentDiffEntry {
+            path: PathBuf::from("src/review.rs"),
+            source_path: None,
+            was_deleted: false,
+            old_text: Arc::from("old\n"),
+            new_text: Arc::from("new\n"),
+        }];
+        let request = |root: &str| {
+            git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+                storage_key.clone(),
+                "project-a",
+                "base",
+                "head",
+                Some("src/review.rs".into()),
+                StackReviewCommentSide::Right,
+                None,
+                Some("b".into()),
+                Some(root.to_string().into()),
+            )
+            .expect("well-shaped cycle citation")
+        };
+
+        assert!(
+            validate_stack_review_citation(
+                "project-a",
+                &StackReviewState::new("base", "head"),
+                &[test_file_item("src/review.rs")],
+                &entries,
+                &records,
+                &thread_index,
+                &request("a"),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_stack_review_citation(
+                "project-a",
+                &StackReviewState::new("base", "head"),
+                &[test_file_item("src/review.rs")],
+                &entries,
+                &records,
+                &thread_index,
+                &request("b"),
+            )
+            .is_err()
+        );
     }
 
     fn test_file_item(path: &str) -> StackReviewFileItem {
@@ -7541,6 +8092,7 @@ mod tests {
                     commenter_cutoffs: Vec::new(),
                     selected_comment_record_id: None,
                     pending_comment_reveal: None,
+                    pending_citation_reveal: None,
                     selected_commenter: None,
                     reviewer_login: Some("xHayden".into()),
                     refreshed_github_snapshots: HashSet::new(),
@@ -7595,6 +8147,7 @@ mod tests {
             cx.notify();
         });
         visual_context.run_until_parked();
+
         assert_eq!(
             review.read_with(&visual_context, |review, _| {
                 review.selected_boundary_label(true, 0)
@@ -7746,5 +8299,57 @@ mod tests {
             })
         });
         assert_eq!(selected_path.as_deref(), Some("second.rs"));
+
+        let citation = git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
+            stack_review_storage_key("base", "head"),
+            stack_review_project_identity(Path::new("/project")),
+            "base",
+            "head",
+            Some("third.rs".into()),
+            StackReviewCommentSide::Right,
+            Some(1..=1),
+            None,
+            None,
+        )
+        .expect("valid third-file citation");
+        let workspace_weak = workspace
+            .update(&mut visual_context, |_workspace, _window, cx| {
+                cx.entity().downgrade()
+            })
+            .expect("workspace weak entity");
+        let navigation_completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        workspace
+            .update(&mut visual_context, |_workspace, window, cx| {
+                let navigation_completed = navigation_completed.clone();
+                window.defer(cx, move |window, cx| {
+                    git_ui_core::stack_review_ai::StackReviewCitationNavigationHost::navigate(
+                        &StackReviewCitationNavigationHandler,
+                        citation,
+                        workspace_weak,
+                        window,
+                        cx,
+                    )
+                    .expect("navigate citation through existing Stack Review item");
+                    navigation_completed.set(true);
+                });
+            })
+            .expect("defer citation navigation");
+        visual_context.run_until_parked();
+        assert!(navigation_completed.get());
+        assert_eq!(
+            review.read_with(&visual_context, |review, _| review.selected_file_index),
+            Some(2)
+        );
+        assert!(review.read_with(&visual_context, |review, _| {
+            review.pending_citation_reveal.is_none() && review.diff_view.is_some()
+        }));
+        assert_eq!(
+            workspace
+                .read_with(&visual_context, |workspace, cx| {
+                    workspace.active_item_as::<StackReview>(cx)
+                })
+                .expect("read active workspace item"),
+            Some(review.clone())
+        );
     }
 }

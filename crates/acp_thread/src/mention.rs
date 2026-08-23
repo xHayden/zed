@@ -16,6 +16,39 @@ use util::{
     paths::{PathStyle, PathWithPosition, is_absolute},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StackReviewMentionSide {
+    Left,
+    Right,
+    TopLevel,
+}
+
+impl StackReviewMentionSide {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "LEFT" => Ok(Self::Left),
+            "RIGHT" => Ok(Self::Right),
+            "TOP_LEVEL" => Ok(Self::TopLevel),
+            _ => bail!("invalid Stack Review side"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+            Self::TopLevel => "TOP_LEVEL",
+        }
+    }
+}
+
+impl fmt::Display for StackReviewMentionSide {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum MentionUri {
     File {
@@ -73,6 +106,17 @@ pub enum MentionUri {
         name: String,
         source: String,
         skill_file_path: PathBuf,
+    },
+    StackReview {
+        storage_key: String,
+        project_identity: String,
+        base_oid: String,
+        head_oid: String,
+        path: Option<String>,
+        side: StackReviewMentionSide,
+        line_range: Option<RangeInclusive<u32>>,
+        selected_record_id: Option<String>,
+        root_record_id: Option<String>,
     },
 }
 
@@ -273,6 +317,13 @@ impl MentionUri {
                         source: source.context("missing skill source")?,
                         skill_file_path: skill_file_path.context("missing skill file path")?,
                     })
+                } else if path == "/agent/stack-review" {
+                    let mention = parse_stack_review_uri(&url)?;
+                    anyhow::ensure!(
+                        mention.to_uri().as_str() == input,
+                        "Stack Review mention URI is not canonical"
+                    );
+                    Ok(mention)
                 } else {
                     bail!("invalid zed url: {:?}", input);
                 }
@@ -328,7 +379,8 @@ impl MentionUri {
             | MentionUri::Fetch { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::GitDiff { .. }
-            | MentionUri::MergeConflict { .. } => None,
+            | MentionUri::MergeConflict { .. }
+            | MentionUri::StackReview { .. } => None,
         }
     }
 
@@ -366,6 +418,28 @@ impl MentionUri {
             } => selection_name(path.as_deref(), line_range),
             MentionUri::Fetch { url } => url.to_string(),
             MentionUri::Skill { name, .. } => name.clone(),
+            MentionUri::StackReview {
+                path,
+                side,
+                line_range,
+                ..
+            } => {
+                let label = path
+                    .as_deref()
+                    .and_then(|path| Path::new(path).file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Stack Review".to_string());
+                if let Some(line_range) = line_range {
+                    format!(
+                        "{label} ({} {}-{})",
+                        side.as_str(),
+                        line_range.start(),
+                        line_range.end()
+                    )
+                } else {
+                    format!("{label} ({})", side.as_str())
+                }
+            }
         }
     }
 
@@ -429,6 +503,31 @@ impl MentionUri {
             MentionUri::Skill {
                 skill_file_path, ..
             } => Some(skill_file_path.to_string_lossy().into_owned().into()),
+            MentionUri::StackReview {
+                base_oid,
+                head_oid,
+                path,
+                side,
+                line_range,
+                ..
+            } => {
+                let mut label = format!(
+                    "Immutable Stack Review {base_oid}…{head_oid} · {}",
+                    side.as_str()
+                );
+                if let Some(path) = path {
+                    label.push_str(" · ");
+                    label.push_str(path);
+                }
+                if let Some(line_range) = line_range {
+                    label.push_str(&format!(
+                        " · lines {}-{}",
+                        line_range.start(),
+                        line_range.end()
+                    ));
+                }
+                Some(label.into())
+            }
             _ => None,
         }
     }
@@ -451,6 +550,7 @@ impl MentionUri {
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
             MentionUri::Skill { .. } => IconName::Sparkle.path().into(),
+            MentionUri::StackReview { .. } => IconName::GitBranch.path().into(),
         }
     }
 
@@ -582,8 +682,154 @@ impl MentionUri {
                     .append_pair("path", &skill_file_path.to_string_lossy());
                 url
             }
+            MentionUri::StackReview {
+                storage_key,
+                project_identity,
+                base_oid,
+                head_oid,
+                path,
+                side,
+                line_range,
+                selected_record_id,
+                root_record_id,
+            } => {
+                let mut url = Url::parse("zed:///agent/stack-review").unwrap();
+                let mut query = url.query_pairs_mut();
+                query
+                    .append_pair("storage_key", storage_key)
+                    .append_pair("project", project_identity)
+                    .append_pair("base", base_oid)
+                    .append_pair("head", head_oid)
+                    .append_pair("side", side.as_str());
+                if let Some(path) = path {
+                    query.append_pair("path", path);
+                }
+                if let Some(line_range) = line_range {
+                    query
+                        .append_pair("line_start", &line_range.start().to_string())
+                        .append_pair("line_end", &line_range.end().to_string());
+                }
+                if let Some(selected_record_id) = selected_record_id {
+                    query.append_pair("selected", selected_record_id);
+                }
+                if let Some(root_record_id) = root_record_id {
+                    query.append_pair("root", root_record_id);
+                }
+                drop(query);
+                url
+            }
         }
     }
+}
+
+fn parse_stack_review_uri(url: &Url) -> Result<MentionUri> {
+    fn set_once(target: &mut Option<String>, value: String, name: &str) -> Result<()> {
+        if target.replace(value).is_some() {
+            bail!("duplicate Stack Review {name} query parameter");
+        }
+        Ok(())
+    }
+
+    if url.fragment().is_some() {
+        bail!("Stack Review mention URI must not have a fragment");
+    }
+
+    let mut storage_key = None;
+    let mut project_identity = None;
+    let mut base_oid = None;
+    let mut head_oid = None;
+    let mut path = None;
+    let mut side = None;
+    let mut line_start = None;
+    let mut line_end = None;
+    let mut selected_record_id = None;
+    let mut root_record_id = None;
+    for (key, value) in url.query_pairs() {
+        let value = value.into_owned();
+        match key.as_ref() {
+            "storage_key" => set_once(&mut storage_key, value, "storage_key")?,
+            "project" => set_once(&mut project_identity, value, "project")?,
+            "base" => set_once(&mut base_oid, value, "base")?,
+            "head" => set_once(&mut head_oid, value, "head")?,
+            "path" => set_once(&mut path, value, "path")?,
+            "side" => set_once(&mut side, value, "side")?,
+            "line_start" => set_once(&mut line_start, value, "line_start")?,
+            "line_end" => set_once(&mut line_end, value, "line_end")?,
+            "selected" => set_once(&mut selected_record_id, value, "selected")?,
+            "root" => set_once(&mut root_record_id, value, "root")?,
+            _ => bail!("unknown Stack Review query parameter {key:?}"),
+        }
+    }
+
+    if let Some(path) = path.as_deref() {
+        let has_only_normal_components = !path.is_empty()
+            && !path.contains('\\')
+            && path
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..")
+            && Path::new(path)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !has_only_normal_components || path.as_bytes().get(1) == Some(&b':') {
+            bail!("Stack Review path must be relative and slash-normalized");
+        }
+    }
+    if selected_record_id.as_ref().is_some_and(String::is_empty) {
+        bail!("Stack Review selected record ID must not be empty");
+    }
+    if root_record_id.as_ref().is_some_and(String::is_empty) {
+        bail!("Stack Review root record ID must not be empty");
+    }
+    if selected_record_id.is_some() != root_record_id.is_some() {
+        bail!("Stack Review selected and root record IDs must be provided together");
+    }
+
+    let line_range = match (line_start, line_end) {
+        (Some(start), Some(end)) => {
+            let start = start.parse::<u32>()?;
+            let end = end.parse::<u32>()?;
+            if start == 0 || end == 0 {
+                bail!("Stack Review line range must be 1-based");
+            }
+            if start > end {
+                bail!("Stack Review line range start must not exceed its end");
+            }
+            Some(start..=end)
+        }
+        (None, None) => None,
+        _ => bail!("Stack Review line range requires both line_start and line_end"),
+    };
+    let side = StackReviewMentionSide::parse(
+        &side
+            .filter(|value| !value.is_empty())
+            .context("missing Stack Review side")?,
+    )?;
+    if line_range.is_some() && path.is_none() {
+        bail!("Stack Review line range requires a path");
+    }
+    if side == StackReviewMentionSide::TopLevel && (path.is_some() || line_range.is_some()) {
+        bail!("top-level Stack Review mention cannot have a file anchor");
+    }
+
+    Ok(MentionUri::StackReview {
+        storage_key: storage_key
+            .filter(|value| !value.is_empty())
+            .context("missing Stack Review storage_key")?,
+        project_identity: project_identity
+            .filter(|value| !value.is_empty())
+            .context("missing Stack Review project identity")?,
+        base_oid: base_oid
+            .filter(|value| !value.is_empty())
+            .context("missing Stack Review base")?,
+        head_oid: head_oid
+            .filter(|value| !value.is_empty())
+            .context("missing Stack Review head")?,
+        path,
+        side,
+        line_range,
+        selected_record_id,
+        root_record_id,
+    })
 }
 
 pub struct MentionLink<'a>(&'a MentionUri);
@@ -1370,6 +1616,236 @@ mod tests {
         let parsed: MentionUri = serde_json::from_str(json).unwrap();
         let reserialized = serde_json::to_value(&parsed).unwrap();
         assert!(reserialized["Rule"]["id"]["User"]["uuid"].is_string());
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_rejects_noncanonical_authority_and_unpaired_ids() {
+        for uri in [
+            "zed:/agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL",
+            "zed://attacker/agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL",
+            "zed:///agent/stack-review/?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL",
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL&selected=selected",
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL&root=root",
+        ] {
+            assert!(
+                MentionUri::parse(uri, PathStyle::local()).is_err(),
+                "accepted noncanonical Stack Review citation {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_round_trips_right_range() {
+        let mention = MentionUri::StackReview {
+            storage_key: "base-head".to_string(),
+            project_identity: "project-a".to_string(),
+            base_oid: "base".to_string(),
+            head_oid: "head".to_string(),
+            path: Some("src/review.rs".to_string()),
+            side: StackReviewMentionSide::Right,
+            line_range: Some(12..=18),
+            selected_record_id: Some("selected-record".to_string()),
+            root_record_id: Some("root-record".to_string()),
+        };
+
+        let serialized = mention.to_uri().to_string();
+        assert_eq!(
+            serialized,
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&path=src%2Freview.rs&line_start=12&line_end=18&selected=selected-record&root=root-record"
+        );
+        assert_eq!(
+            MentionUri::parse(&serialized, PathStyle::local()).unwrap(),
+            mention
+        );
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_round_trips_left_escaped_non_ascii_path() {
+        let mention = MentionUri::StackReview {
+            storage_key: "base-head".to_string(),
+            project_identity: "project-a".to_string(),
+            base_oid: "base".to_string(),
+            head_oid: "head".to_string(),
+            path: Some("src/a b/μ.rs".to_string()),
+            side: StackReviewMentionSide::Left,
+            line_range: Some(3..=5),
+            selected_record_id: None,
+            root_record_id: None,
+        };
+
+        let serialized = mention.to_uri().to_string();
+        assert_eq!(
+            serialized,
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=LEFT&path=src%2Fa+b%2F%CE%BC.rs&line_start=3&line_end=5"
+        );
+        assert_eq!(
+            MentionUri::parse(&serialized, PathStyle::local()).unwrap(),
+            mention
+        );
+        assert_eq!(mention.name(), "μ.rs (LEFT 3-5)");
+        assert_eq!(mention.abs_path(), None);
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_round_trips_top_level_resource() {
+        let mention = MentionUri::StackReview {
+            storage_key: "base-head".to_string(),
+            project_identity: "project-a".to_string(),
+            base_oid: "base".to_string(),
+            head_oid: "head".to_string(),
+            path: None,
+            side: StackReviewMentionSide::TopLevel,
+            line_range: None,
+            selected_record_id: Some("conversation-comment".to_string()),
+            root_record_id: Some("conversation-root".to_string()),
+        };
+
+        let serialized = mention.to_uri().to_string();
+        assert_eq!(
+            serialized,
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL&selected=conversation-comment&root=conversation-root"
+        );
+        assert_eq!(
+            MentionUri::parse(&serialized, PathStyle::local()).unwrap(),
+            mention
+        );
+        assert_eq!(mention.name(), "Stack Review (TOP_LEVEL)");
+        assert_eq!(
+            mention.tooltip_text().as_deref(),
+            Some("Immutable Stack Review base…head · TOP_LEVEL")
+        );
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_rejects_duplicate_query_parameters() {
+        let uri = "zed:///agent/stack-review?storage_key=base-head&storage_key=foreign&base=base&head=head&side=RIGHT";
+
+        let error = MentionUri::parse(uri, PathStyle::local()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate Stack Review storage_key")
+        );
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_rejects_empty_required_value() {
+        let uri = "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=&head=head&side=RIGHT";
+
+        let error = MentionUri::parse(uri, PathStyle::local()).unwrap_err();
+        assert!(error.to_string().contains("missing Stack Review base"));
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_rejects_invalid_one_based_line_ranges() {
+        for suffix in ["line_start=0&line_end=1", "line_start=8&line_end=7"] {
+            let uri = format!(
+                "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&path=src%2Freview.rs&{suffix}"
+            );
+
+            assert!(MentionUri::parse(&uri, PathStyle::local()).is_err());
+        }
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_rejects_absolute_path() {
+        let uri = "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&path=%2Ftmp%2Flive.rs";
+
+        let error = MentionUri::parse(uri, PathStyle::local()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Stack Review path must be relative")
+        );
+    }
+
+    #[test]
+    fn test_stack_review_mention_side_displays_canonical_value() {
+        assert_eq!(StackReviewMentionSide::Left.to_string(), "LEFT");
+        assert_eq!(StackReviewMentionSide::Right.to_string(), "RIGHT");
+        assert_eq!(StackReviewMentionSide::TopLevel.to_string(), "TOP_LEVEL");
+    }
+
+    #[test]
+    fn test_stack_review_top_level_mention_rejects_file_anchor() {
+        let uri = "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL&path=src%2Freview.rs&line_start=1&line_end=2";
+
+        let error = MentionUri::parse(uri, PathStyle::local()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("top-level Stack Review mention cannot have a file anchor")
+        );
+    }
+
+    #[test]
+    fn test_stack_review_mention_rejects_range_without_path() {
+        let uri = "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&line_start=1&line_end=2";
+
+        let error = MentionUri::parse(uri, PathStyle::local()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Stack Review line range requires a path")
+        );
+    }
+
+    #[test]
+    fn test_stack_review_mention_rejects_non_canonical_relative_paths() {
+        for path in [
+            "",
+            "src%2F.%2Freview.rs",
+            "src%2F..%2Freview.rs",
+            "src%5Creview.rs",
+        ] {
+            let uri = format!(
+                "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&path={path}"
+            );
+
+            assert!(
+                MentionUri::parse(&uri, PathStyle::local()).is_err(),
+                "accepted non-canonical path {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stack_review_mention_rejects_empty_comment_record_ids() {
+        for parameter in ["selected", "root"] {
+            let uri = format!(
+                "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=TOP_LEVEL&{parameter}="
+            );
+
+            assert!(MentionUri::parse(&uri, PathStyle::local()).is_err());
+        }
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_rejects_unknown_query_parameter() {
+        let uri = "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&live_path=src%2Freview.rs";
+
+        let error = MentionUri::parse(uri, PathStyle::local()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown Stack Review query parameter")
+        );
+    }
+
+    #[test]
+    fn test_stack_review_mention_uri_rejects_missing_required_parameters() {
+        for uri in [
+            "zed:///agent/stack-review?base=base&head=head&side=RIGHT",
+            "zed:///agent/stack-review?storage_key=base-head&head=head&side=RIGHT",
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&side=RIGHT",
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head",
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&path=src%2Freview.rs&line_start=2",
+        ] {
+            assert!(
+                MentionUri::parse(uri, PathStyle::local()).is_err(),
+                "accepted incomplete Stack Review URI {uri:?}"
+            );
+        }
     }
 
     #[test]

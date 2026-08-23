@@ -1,8 +1,15 @@
-use std::{fmt, ops::Range, rc::Rc, sync::Arc};
+use std::{
+    fmt,
+    ops::{Range, RangeInclusive},
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+};
 
 use git::stack_review::StackReviewCommentSide;
-use gpui::{App, Context, Entity, Global, SharedString};
+use gpui::{App, Context, Entity, Global, SharedString, WeakEntity};
 use markdown::Markdown;
+use workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StackReviewAiGeneration(u64);
@@ -193,9 +200,39 @@ impl StackReviewAiContextKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StackReviewAiResource {
-    pub label: SharedString,
-    pub uri: SharedString,
-    pub text: Arc<str>,
+    label: SharedString,
+    citation: StackReviewCitationNavigationRequest,
+    text: Arc<str>,
+}
+
+impl StackReviewAiResource {
+    pub fn new(
+        label: impl Into<SharedString>,
+        citation: StackReviewCitationNavigationRequest,
+        text: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            citation,
+            text: text.into(),
+        }
+    }
+
+    pub fn label(&self) -> &SharedString {
+        &self.label
+    }
+
+    pub fn citation(&self) -> &StackReviewCitationNavigationRequest {
+        &self.citation
+    }
+
+    pub fn uri(&self) -> SharedString {
+        self.citation.to_uri()
+    }
+
+    pub fn text(&self) -> &Arc<str> {
+        &self.text
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +247,220 @@ pub struct StackReviewAiContext {
     pub line_range: Option<Range<u32>>,
     pub selected_record_id: Option<SharedString>,
     pub resources: Arc<[StackReviewAiResource]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackReviewCitationNavigationRequest {
+    storage_key: SharedString,
+    project_identity: SharedString,
+    base_oid: SharedString,
+    head_oid: SharedString,
+    path: Option<SharedString>,
+    side: StackReviewCommentSide,
+    line_range: Option<RangeInclusive<u32>>,
+    selected_record_id: Option<SharedString>,
+    root_record_id: Option<SharedString>,
+}
+
+impl StackReviewCitationNavigationRequest {
+    pub fn try_new(
+        storage_key: impl Into<SharedString>,
+        project_identity: impl Into<SharedString>,
+        base_oid: impl Into<SharedString>,
+        head_oid: impl Into<SharedString>,
+        path: Option<SharedString>,
+        side: StackReviewCommentSide,
+        line_range: Option<RangeInclusive<u32>>,
+        selected_record_id: Option<SharedString>,
+        root_record_id: Option<SharedString>,
+    ) -> anyhow::Result<Self> {
+        let storage_key = storage_key.into();
+        let project_identity = project_identity.into();
+        let base_oid = base_oid.into();
+        let head_oid = head_oid.into();
+        anyhow::ensure!(
+            !storage_key.is_empty(),
+            "Stack Review citation storage key is empty"
+        );
+        anyhow::ensure!(
+            !project_identity.is_empty(),
+            "Stack Review citation project identity is empty"
+        );
+        anyhow::ensure!(
+            !base_oid.is_empty(),
+            "Stack Review citation base OID is empty"
+        );
+        anyhow::ensure!(
+            !head_oid.is_empty(),
+            "Stack Review citation head OID is empty"
+        );
+        if let Some(path) = path.as_deref() {
+            let canonical = !path.is_empty()
+                && !path.contains('\\')
+                && path.split('/').all(|component| {
+                    !component.is_empty() && component != "." && component != ".."
+                })
+                && Path::new(path)
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                && path.as_bytes().get(1) != Some(&b':');
+            anyhow::ensure!(canonical, "Stack Review citation path is not canonical");
+        }
+        anyhow::ensure!(
+            selected_record_id.as_ref().is_none_or(|id| !id.is_empty()),
+            "Stack Review citation selected record ID is empty"
+        );
+        anyhow::ensure!(
+            root_record_id.as_ref().is_none_or(|id| !id.is_empty()),
+            "Stack Review citation root record ID is empty"
+        );
+        anyhow::ensure!(
+            selected_record_id.is_some() == root_record_id.is_some(),
+            "Stack Review citation selected and root IDs must be provided together"
+        );
+        anyhow::ensure!(
+            !matches!(side, StackReviewCommentSide::TopLevel)
+                || (path.is_none() && line_range.is_none()),
+            "top-level Stack Review citation cannot have a file anchor"
+        );
+        anyhow::ensure!(
+            line_range.is_none() || path.is_some(),
+            "Stack Review citation line range requires a path"
+        );
+        if let Some(line_range) = &line_range {
+            anyhow::ensure!(
+                *line_range.start() > 0 && line_range.start() <= line_range.end(),
+                "Stack Review citation line range must be 1-based and ordered"
+            );
+        }
+        Ok(Self {
+            storage_key,
+            project_identity,
+            base_oid,
+            head_oid,
+            path,
+            side,
+            line_range,
+            selected_record_id,
+            root_record_id,
+        })
+    }
+
+    pub fn storage_key(&self) -> &SharedString {
+        &self.storage_key
+    }
+
+    pub fn project_identity(&self) -> &SharedString {
+        &self.project_identity
+    }
+
+    pub fn base_oid(&self) -> &SharedString {
+        &self.base_oid
+    }
+
+    pub fn head_oid(&self) -> &SharedString {
+        &self.head_oid
+    }
+
+    pub fn path(&self) -> Option<&SharedString> {
+        self.path.as_ref()
+    }
+
+    pub fn side(&self) -> StackReviewCommentSide {
+        self.side
+    }
+
+    pub fn line_range(&self) -> Option<&RangeInclusive<u32>> {
+        self.line_range.as_ref()
+    }
+
+    pub fn selected_record_id(&self) -> Option<&SharedString> {
+        self.selected_record_id.as_ref()
+    }
+
+    pub fn root_record_id(&self) -> Option<&SharedString> {
+        self.root_record_id.as_ref()
+    }
+
+    pub fn to_uri(&self) -> SharedString {
+        let mut url = url::Url::parse("zed:///agent/stack-review")
+            .expect("static Stack Review citation URL is valid");
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("storage_key", &self.storage_key)
+            .append_pair("project", &self.project_identity)
+            .append_pair("base", &self.base_oid)
+            .append_pair("head", &self.head_oid)
+            .append_pair(
+                "side",
+                match self.side {
+                    StackReviewCommentSide::Left => "LEFT",
+                    StackReviewCommentSide::Right => "RIGHT",
+                    StackReviewCommentSide::TopLevel => "TOP_LEVEL",
+                },
+            );
+        if let Some(path) = &self.path {
+            query.append_pair("path", path);
+        }
+        if let Some(line_range) = &self.line_range {
+            query
+                .append_pair("line_start", &line_range.start().to_string())
+                .append_pair("line_end", &line_range.end().to_string());
+        }
+        if let Some(selected_record_id) = &self.selected_record_id {
+            query.append_pair("selected", selected_record_id);
+        }
+        if let Some(root_record_id) = &self.root_record_id {
+            query.append_pair("root", root_record_id);
+        }
+        drop(query);
+        url.to_string().into()
+    }
+}
+
+pub trait StackReviewCitationNavigationHost {
+    fn navigate(
+        &self,
+        request: StackReviewCitationNavigationRequest,
+        workspace: WeakEntity<Workspace>,
+        window: &mut gpui::Window,
+        cx: &mut App,
+    ) -> anyhow::Result<()>;
+}
+
+struct StackReviewCitationNavigationHostGlobal(Rc<dyn StackReviewCitationNavigationHost>);
+
+impl Global for StackReviewCitationNavigationHostGlobal {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackReviewCitationNavigationHostUnavailable;
+
+impl fmt::Display for StackReviewCitationNavigationHostUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Stack Review citation navigation host is unavailable")
+    }
+}
+
+impl std::error::Error for StackReviewCitationNavigationHostUnavailable {}
+
+pub fn set_stack_review_citation_navigation_host(
+    host: Rc<dyn StackReviewCitationNavigationHost>,
+    cx: &mut App,
+) {
+    cx.set_global(StackReviewCitationNavigationHostGlobal(host));
+}
+
+pub fn navigate_stack_review_citation(
+    request: StackReviewCitationNavigationRequest,
+    workspace: WeakEntity<Workspace>,
+    window: &mut gpui::Window,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    let host = cx
+        .try_global::<StackReviewCitationNavigationHostGlobal>()
+        .map(|host| host.0.clone())
+        .ok_or(StackReviewCitationNavigationHostUnavailable)?;
+    host.navigate(request, workspace, window, cx)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -464,6 +715,142 @@ mod tests {
         }
     }
 
+    #[test]
+    fn citation_navigation_request_rejects_invalid_anchor_shapes() {
+        assert!(
+            StackReviewCitationNavigationRequest::try_new(
+                "base-head",
+                "project-a",
+                "base",
+                "head",
+                Some("src/review.rs".into()),
+                StackReviewCommentSide::TopLevel,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            StackReviewCitationNavigationRequest::try_new(
+                "base-head",
+                "project-a",
+                "base",
+                "head",
+                None,
+                StackReviewCommentSide::Left,
+                Some(1..=2),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        for (storage_key, project_identity, base_oid, head_oid) in [
+            ("", "project-a", "base", "head"),
+            ("base-head", "", "base", "head"),
+            ("base-head", "project-a", "", "head"),
+            ("base-head", "project-a", "base", ""),
+        ] {
+            assert!(
+                StackReviewCitationNavigationRequest::try_new(
+                    storage_key,
+                    project_identity,
+                    base_oid,
+                    head_oid,
+                    None,
+                    StackReviewCommentSide::TopLevel,
+                    None,
+                    None,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        for path in ["", "src/./review.rs", "src/../review.rs", "src\\review.rs"] {
+            assert!(
+                StackReviewCitationNavigationRequest::try_new(
+                    "base-head",
+                    "project-a",
+                    "base",
+                    "head",
+                    Some(path.into()),
+                    StackReviewCommentSide::Right,
+                    None,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "accepted non-canonical path {path:?}"
+            );
+        }
+        for (selected_record_id, root_record_id) in [
+            (Some("".into()), None),
+            (None, Some("".into())),
+            (Some("selected".into()), None),
+            (None, Some("root".into())),
+        ] {
+            assert!(
+                StackReviewCitationNavigationRequest::try_new(
+                    "base-head",
+                    "project-a",
+                    "base",
+                    "head",
+                    None,
+                    StackReviewCommentSide::TopLevel,
+                    None,
+                    selected_record_id,
+                    root_record_id,
+                )
+                .is_err()
+            );
+        }
+        let top_level = StackReviewCitationNavigationRequest::try_new(
+            "base-head",
+            "project-a",
+            "base",
+            "head",
+            None,
+            StackReviewCommentSide::TopLevel,
+            None,
+            Some("selected".into()),
+            Some("root".into()),
+        )
+        .unwrap();
+        assert_eq!(top_level.side(), StackReviewCommentSide::TopLevel);
+    }
+
+    #[gpui::test]
+    fn citation_navigation_reports_when_host_is_unavailable(cx: &mut gpui::TestAppContext) {
+        let request = StackReviewCitationNavigationRequest::try_new(
+            "base-head",
+            "project-a",
+            "base",
+            "head",
+            Some("src/review.rs".into()),
+            StackReviewCommentSide::Right,
+            Some(12..=18),
+            Some("selected".into()),
+            Some("root".into()),
+        )
+        .unwrap();
+        let visual_context = cx.add_empty_window();
+
+        let error = visual_context.update(|window, cx| {
+            navigate_stack_review_citation(
+                request,
+                gpui::WeakEntity::<workspace::Workspace>::new_invalid(),
+                window,
+                cx,
+            )
+            .unwrap_err()
+        });
+
+        assert_eq!(
+            error.to_string(),
+            "Stack Review citation navigation host is unavailable"
+        );
+    }
+
     #[gpui::test]
     fn reports_when_host_is_unavailable(cx: &mut gpui::TestAppContext) {
         let error = cx.read(|cx| match stack_review_ai_host(cx) {
@@ -701,11 +1088,23 @@ mod tests {
     #[test]
     fn context_preserves_snapshot_side_range_and_shared_resources() {
         let resource_text: std::sync::Arc<str> = "immutable code".into();
-        let resources: std::sync::Arc<[StackReviewAiResource]> = vec![StackReviewAiResource {
-            label: "src/main.rs (RIGHT 4-8)".into(),
-            uri: "zed-stack-review://snapshot/src/main.rs?side=right".into(),
-            text: resource_text.clone(),
-        }]
+        let citation = StackReviewCitationNavigationRequest::try_new(
+            "base-head",
+            "project-a",
+            "base",
+            "head",
+            Some("src/main.rs".into()),
+            StackReviewCommentSide::Right,
+            Some(4..=8),
+            Some("comment-a".into()),
+            Some("root-a".into()),
+        )
+        .expect("valid resource citation");
+        let resources: std::sync::Arc<[StackReviewAiResource]> = vec![StackReviewAiResource::new(
+            "src/main.rs (RIGHT 4-8)",
+            citation,
+            resource_text.clone(),
+        )]
         .into();
         let context = StackReviewAiContext {
             key: StackReviewAiContextKey::comment("base-head", "thread-a"),
@@ -727,9 +1126,13 @@ mod tests {
         );
         assert_eq!(context.line_range, Some(3..8));
         assert!(std::sync::Arc::ptr_eq(
-            &context.resources[0].text,
+            context.resources[0].text(),
             &resource_text
         ));
+        assert_eq!(
+            context.resources[0].uri().as_ref(),
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&path=src%2Fmain.rs&line_start=4&line_end=8&selected=comment-a&root=root-a"
+        );
         assert!(std::sync::Arc::ptr_eq(&context.resources, &resources));
     }
 }

@@ -65,6 +65,10 @@ pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
+    git_ui_core::stack_review_ai::set_stack_review_citation_navigation_host(
+        std::rc::Rc::new(stack_review::StackReviewCitationNavigationHandler),
+        cx,
+    );
 
     git_ui_core::set_branch_picker_builder(
         |workspace, repository, window, cx| {

@@ -277,6 +277,34 @@ pub enum UserMessageContent {
     Image(LanguageModelImage),
 }
 
+fn neutralize_stack_review_envelope_tags(input: &str) -> String {
+    const PREFIXES: [&[u8]; 4] = [
+        b"<context",
+        b"</context",
+        b"<stack_review_context",
+        b"</stack_review_context",
+    ];
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while let Some(relative_index) = input[cursor..].find('<') {
+        let index = cursor + relative_index;
+        output.push_str(&input[cursor..index]);
+        let remaining = &input.as_bytes()[index..];
+        if PREFIXES.iter().any(|prefix| {
+            remaining
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        }) {
+            output.push_str("&lt;");
+        } else {
+            output.push('<');
+        }
+        cursor = index + 1;
+    }
+    output.push_str(&input[cursor..]);
+    output
+}
+
 impl UserMessage {
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::new();
@@ -328,6 +356,7 @@ impl UserMessage {
         const MERGE_CONFLICT_TAG: &str = "<merge_conflicts>";
         const OPEN_SKILLS_TAG: &str =
             "<skills>\nThe user has attached the following agent skills:\n";
+        const OPEN_STACK_REVIEW_TAG: &str = "<stack_review_context>";
 
         let mut file_context = OPEN_FILES_TAG.to_string();
         let mut directory_context = OPEN_DIRECTORIES_TAG.to_string();
@@ -340,6 +369,7 @@ impl UserMessage {
         let mut diffs_context = OPEN_DIFFS_TAG.to_string();
         let mut merge_conflict_context = MERGE_CONFLICT_TAG.to_string();
         let mut skills_context = OPEN_SKILLS_TAG.to_string();
+        let mut stack_review_context = OPEN_STACK_REVIEW_TAG.to_string();
 
         for chunk in &*self.content {
             let chunk = match chunk {
@@ -461,6 +491,16 @@ impl UserMessage {
                             let label = format!("{} ({})", name, source);
                             write!(&mut skills_context, "\nSkill: {}\n{}\n", label, content).ok();
                         }
+                        MentionUri::StackReview { .. } => {
+                            let content = neutralize_stack_review_envelope_tags(content);
+                            write!(
+                                &mut stack_review_context,
+                                "\nCitation: {}\n{}\n",
+                                uri.as_link(),
+                                content
+                            )
+                            .ok();
+                        }
                     }
 
                     language_model::MessageContent::Text(uri.as_link().to_string())
@@ -540,6 +580,13 @@ impl UserMessage {
             message
                 .content
                 .push(language_model::MessageContent::Text(skills_context));
+        }
+
+        if stack_review_context.len() > OPEN_STACK_REVIEW_TAG.len() {
+            stack_review_context.push_str("</stack_review_context>\n");
+            message
+                .content
+                .push(language_model::MessageContent::Text(stack_review_context));
         }
 
         if merge_conflict_context.len() > MERGE_CONFLICT_TAG.len() {

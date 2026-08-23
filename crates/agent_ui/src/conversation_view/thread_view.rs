@@ -2,6 +2,7 @@ use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     agent_configuration::configure_context_server_modal::default_markdown_style,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
+    mention_set::open_stack_review_mention,
     open_abs_path_at_point,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
@@ -12490,12 +12491,59 @@ impl Render for ThreadView {
     }
 }
 
+fn parse_stack_review_link(url: &str) -> anyhow::Result<Option<MentionUri>> {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return Ok(None);
+    };
+    let decoded_path = decode_path_escapes(parsed.path());
+    let is_stack_review_route =
+        decoded_path == "/agent/stack-review" || decoded_path.starts_with("/agent/stack-review/");
+    if parsed.scheme() != "zed" || !is_stack_review_route {
+        return Ok(None);
+    }
+    let mention = MentionUri::parse(url, util::paths::PathStyle::local())?;
+    anyhow::ensure!(
+        matches!(&mention, MentionUri::StackReview { .. }),
+        "invalid Stack Review citation URI"
+    );
+    Ok(Some(mention))
+}
+
 pub(crate) fn open_link(
     url: SharedString,
     workspace: &WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    match parse_stack_review_link(&url) {
+        Ok(Some(mention)) => {
+            if let Err(error) = open_stack_review_mention(&mention, workspace.clone(), window, cx) {
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_error(
+                            format!("Unable to open Stack Review citation: {error}"),
+                            cx,
+                        );
+                    });
+                } else {
+                    log::error!("Unable to open Stack Review citation: {error:#}");
+                }
+            }
+            return;
+        }
+        Err(error) => {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .show_error(format!("Unable to open Stack Review citation: {error}"), cx);
+                });
+            } else {
+                log::error!("Unable to open Stack Review citation: {error:#}");
+            }
+            return;
+        }
+        Ok(None) => {}
+    }
     let Some(workspace) = workspace.upgrade() else {
         cx.open_url(&url);
         return;
@@ -12627,6 +12675,7 @@ pub(crate) fn open_link(
                     )
                     .detach_and_log_err(cx);
             }
+            MentionUri::StackReview { .. } => {}
         })
     } else {
         workspace.update(cx, |workspace, cx| {
@@ -12674,6 +12723,10 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_ui_core::stack_review_ai::{
+        StackReviewCitationNavigationHost, StackReviewCitationNavigationRequest,
+        set_stack_review_citation_navigation_host,
+    };
     use project::{FakeFs, Project};
     use serde_json::json;
     use std::path::Path;
@@ -12690,6 +12743,92 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
         ))
+    }
+
+    #[test]
+    fn test_stack_review_link_parser_fails_closed_for_malformed_citations() {
+        for uri in [
+            "zed:///agent/stack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT&unknown=value",
+            "zed:///agent/stack-review/?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT",
+            "zed:///agent/%73tack-review?storage_key=base-head&project=project-a&base=base&head=head&side=RIGHT",
+        ] {
+            assert!(parse_stack_review_link(uri).is_err());
+        }
+        assert_eq!(
+            parse_stack_review_link("https://example.test/review").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_stack_review_link("zed:///agent/stack-reviewer?value=ordinary").unwrap(),
+            None
+        );
+    }
+
+    struct TestCitationNavigationHost {
+        requests: Rc<RefCell<Vec<StackReviewCitationNavigationRequest>>>,
+    }
+
+    impl StackReviewCitationNavigationHost for TestCitationNavigationHost {
+        fn navigate(
+            &self,
+            request: StackReviewCitationNavigationRequest,
+            _workspace: WeakEntity<Workspace>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> anyhow::Result<()> {
+            self.requests.borrow_mut().push(request);
+            Ok(())
+        }
+    }
+
+    #[gpui::test]
+    fn test_open_link_routes_stack_review_citation_without_live_file_fallback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let host = Rc::new(TestCitationNavigationHost {
+            requests: requests.clone(),
+        });
+        let mention = MentionUri::StackReview {
+            storage_key: "base-head".to_string(),
+            project_identity: "project-a".to_string(),
+            base_oid: "base".to_string(),
+            head_oid: "head".to_string(),
+            path: Some("src/review.rs".to_string()),
+            side: acp_thread::StackReviewMentionSide::Left,
+            line_range: Some(4..=6),
+            selected_record_id: Some("selected".to_string()),
+            root_record_id: Some("root".to_string()),
+        };
+        let visual_context = cx.add_empty_window();
+
+        visual_context.update(|window, cx| {
+            set_stack_review_citation_navigation_host(host, cx);
+            open_link(
+                mention.to_uri().to_string().into(),
+                &WeakEntity::new_invalid(),
+                window,
+                cx,
+            );
+        });
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.storage_key().as_ref(), "base-head");
+        assert_eq!(
+            request.path().map(SharedString::as_ref),
+            Some("src/review.rs")
+        );
+        assert_eq!(request.line_range(), Some(&(4..=6)));
+        assert_eq!(
+            request.selected_record_id().map(SharedString::as_ref),
+            Some("selected")
+        );
+        assert_eq!(
+            request.root_record_id().map(SharedString::as_ref),
+            Some("root")
+        );
     }
 
     #[test]

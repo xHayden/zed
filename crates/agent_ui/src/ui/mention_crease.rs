@@ -14,7 +14,7 @@ use theme_settings::ThemeSettings;
 use ui::{ButtonLike, TintColor, Tooltip, prelude::*};
 use workspace::{OpenOptions, Workspace};
 
-use crate::open_abs_path_at_point;
+use crate::{mention_set::open_stack_review_mention, open_abs_path_at_point};
 
 #[derive(IntoElement)]
 pub struct MentionCrease {
@@ -154,6 +154,19 @@ fn open_mention_uri(
     window: &mut Window,
     cx: &mut App,
 ) {
+    if matches!(&mention_uri, MentionUri::StackReview { .. }) {
+        if let Err(error) = open_stack_review_mention(&mention_uri, workspace.clone(), window, cx) {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .show_error(format!("Unable to open Stack Review citation: {error}"), cx);
+                });
+            } else {
+                log::error!("Unable to open Stack Review citation: {error:#}");
+            }
+        }
+        return;
+    }
     let Some(workspace) = workspace.upgrade() else {
         return;
     };
@@ -210,7 +223,8 @@ fn open_mention_uri(
         | MentionUri::Diagnostics { .. }
         | MentionUri::TerminalSelection { .. }
         | MentionUri::GitDiff { .. }
-        | MentionUri::MergeConflict { .. } => {}
+        | MentionUri::MergeConflict { .. }
+        | MentionUri::StackReview { .. } => {}
     });
 }
 

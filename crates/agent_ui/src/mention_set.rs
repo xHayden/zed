@@ -1,5 +1,5 @@
 use crate::diagnostics::{DiagnosticsOptions, codeblock_fence_for_path, collect_diagnostics};
-use acp_thread::{MentionUri, selection_name};
+use acp_thread::{MentionUri, StackReviewMentionSide, selection_name};
 use agent::{ThreadStore, outline};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
@@ -11,6 +11,9 @@ use editor::{
     scroll::Autoscroll,
 };
 use futures::{AsyncReadExt as _, FutureExt as _, future::Shared};
+use git_ui_core::stack_review_ai::{
+    StackReviewCitationNavigationRequest, navigate_stack_review_citation,
+};
 use gpui::{
     AppContext, ClipboardEntry, Context, Empty, Entity, EntityId, Image, ImageFormat, Img,
     SharedString, Task, WeakEntity,
@@ -49,6 +52,55 @@ pub enum Mention {
     },
     Image(MentionImage),
     Link,
+}
+
+pub(crate) fn stack_review_navigation_request(
+    mention_uri: &MentionUri,
+) -> Result<StackReviewCitationNavigationRequest> {
+    let MentionUri::StackReview {
+        storage_key,
+        project_identity,
+        base_oid,
+        head_oid,
+        path,
+        side,
+        line_range,
+        selected_record_id,
+        root_record_id,
+    } = mention_uri
+    else {
+        return Err(anyhow!("mention is not a Stack Review citation"));
+    };
+    let side = match side {
+        StackReviewMentionSide::Left => git::stack_review::StackReviewCommentSide::Left,
+        StackReviewMentionSide::Right => git::stack_review::StackReviewCommentSide::Right,
+        StackReviewMentionSide::TopLevel => git::stack_review::StackReviewCommentSide::TopLevel,
+    };
+    StackReviewCitationNavigationRequest::try_new(
+        storage_key.clone(),
+        project_identity.clone(),
+        base_oid.clone(),
+        head_oid.clone(),
+        path.clone().map(Into::into),
+        side,
+        line_range.clone(),
+        selected_record_id.clone().map(Into::into),
+        root_record_id.clone().map(Into::into),
+    )
+}
+
+pub(crate) fn open_stack_review_mention(
+    mention_uri: &MentionUri,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
+    navigate_stack_review_citation(
+        stack_review_navigation_request(mention_uri)?,
+        workspace,
+        window,
+        cx,
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +189,7 @@ impl MentionSet {
         match mention_uri {
             MentionUri::Fetch { url } => self.confirm_mention_for_fetch(url, http_client, cx),
             MentionUri::Directory { .. } => Task::ready(Ok(Mention::Link)),
+            MentionUri::StackReview { .. } => Task::ready(Ok(Mention::Link)),
             MentionUri::Thread { id, .. } => self.confirm_mention_for_thread(id, cx),
             MentionUri::File { abs_path } => {
                 self.confirm_mention_for_file(abs_path, supports_images, cx)
@@ -311,6 +364,7 @@ impl MentionSet {
                 self.confirm_mention_for_fetch(url, workspace.read(cx).client().http_client(), cx)
             }
             MentionUri::Directory { .. } => Task::ready(Ok(Mention::Link)),
+            MentionUri::StackReview { .. } => Task::ready(Ok(Mention::Link)),
             MentionUri::Thread { id, .. } => self.confirm_mention_for_thread(id, cx),
             MentionUri::File { abs_path } => {
                 self.confirm_mention_for_file(abs_path, supports_images, cx)
@@ -834,6 +888,42 @@ mod tests {
             }
             other => panic!("Expected selection mention to resolve as text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_stack_review_navigation_request_preserves_top_level_identity() {
+        let mention = MentionUri::StackReview {
+            storage_key: "base-head".to_string(),
+            project_identity: "project-a".to_string(),
+            base_oid: "base".to_string(),
+            head_oid: "head".to_string(),
+            path: None,
+            side: acp_thread::StackReviewMentionSide::TopLevel,
+            line_range: None,
+            selected_record_id: Some("selected".to_string()),
+            root_record_id: Some("root".to_string()),
+        };
+
+        let request = stack_review_navigation_request(&mention).unwrap();
+        assert_eq!(
+            request.side(),
+            git::stack_review::StackReviewCommentSide::TopLevel
+        );
+        assert_eq!(request.storage_key().as_ref(), "base-head");
+        assert_eq!(request.project_identity().as_ref(), "project-a");
+        assert_eq!(request.to_uri().as_ref(), mention.to_uri().as_str());
+        assert_eq!(request.base_oid().as_ref(), "base");
+        assert_eq!(request.head_oid().as_ref(), "head");
+        assert_eq!(request.path(), None);
+        assert_eq!(request.line_range(), None);
+        assert_eq!(
+            request.selected_record_id().map(SharedString::as_ref),
+            Some("selected")
+        );
+        assert_eq!(
+            request.root_record_id().map(SharedString::as_ref),
+            Some("root")
+        );
     }
 
     #[test]
