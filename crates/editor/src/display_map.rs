@@ -245,6 +245,13 @@ pub(crate) struct Companion {
     rhs_display_map_id: EntityId,
     rhs_custom_block_to_balancing_block: RefCell<HashMap<CustomBlockId, CustomBlockId>>,
     lhs_custom_block_to_balancing_block: RefCell<HashMap<CustomBlockId, CustomBlockId>>,
+    mirrored_block_measurements: RefCell<HashMap<(bool, CustomBlockId), MirroredBlockMeasurements>>,
+}
+
+#[derive(Default)]
+struct MirroredBlockMeasurements {
+    source: Option<u32>,
+    companion: Option<u32>,
 }
 
 impl Companion {
@@ -253,6 +260,7 @@ impl Companion {
             rhs_display_map_id,
             rhs_custom_block_to_balancing_block: Default::default(),
             lhs_custom_block_to_balancing_block: Default::default(),
+            mirrored_block_measurements: Default::default(),
         }
     }
 
@@ -268,6 +276,99 @@ impl Companion {
             &self.rhs_custom_block_to_balancing_block
         } else {
             &self.lhs_custom_block_to_balancing_block
+        }
+    }
+
+    fn mirrored_block_key(
+        &self,
+        display_map_id: EntityId,
+        block_id: CustomBlockId,
+        style: BlockStyle,
+    ) -> Option<((bool, CustomBlockId), bool)> {
+        let is_rhs = self.is_rhs(display_map_id);
+        match style {
+            BlockStyle::StickyMirrored => Some(((is_rhs, block_id), true)),
+            BlockStyle::StickyMirroredCompanion => {
+                let source_map = if is_rhs {
+                    &self.lhs_custom_block_to_balancing_block
+                } else {
+                    &self.rhs_custom_block_to_balancing_block
+                };
+                source_map
+                    .borrow()
+                    .iter()
+                    .find_map(|(source_id, companion_id)| {
+                        (*companion_id == block_id).then_some(((!is_rhs, *source_id), false))
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn reconciled_mirrored_block_height(
+        &self,
+        display_map_id: EntityId,
+        block_id: CustomBlockId,
+        style: BlockStyle,
+        measured_height: u32,
+    ) -> u32 {
+        let Some((key, is_source)) = self.mirrored_block_key(display_map_id, block_id, style)
+        else {
+            return measured_height;
+        };
+        let mut measurements = self.mirrored_block_measurements.borrow_mut();
+        let measurements = measurements.entry(key).or_default();
+        if is_source {
+            measurements.source = Some(measured_height);
+        } else {
+            measurements.companion = Some(measured_height);
+        }
+        measurements
+            .source
+            .into_iter()
+            .chain(measurements.companion)
+            .max()
+            .unwrap_or(measured_height)
+    }
+
+    pub(crate) fn mirrored_block_counterpart(
+        &self,
+        display_map_id: EntityId,
+        block_id: CustomBlockId,
+        style: BlockStyle,
+    ) -> Option<CustomBlockId> {
+        let is_rhs = self.is_rhs(display_map_id);
+        match style {
+            BlockStyle::StickyMirrored => self
+                .custom_block_to_balancing_block(display_map_id)
+                .borrow()
+                .get(&block_id)
+                .copied(),
+            BlockStyle::StickyMirroredCompanion => {
+                let source_map = if is_rhs {
+                    &self.lhs_custom_block_to_balancing_block
+                } else {
+                    &self.rhs_custom_block_to_balancing_block
+                };
+                source_map
+                    .borrow()
+                    .iter()
+                    .find_map(|(source_id, companion_id)| {
+                        (*companion_id == block_id).then_some(*source_id)
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn clear_mirrored_block_measurements(
+        &self,
+        display_map_id: EntityId,
+        block_id: CustomBlockId,
+        style: BlockStyle,
+    ) {
+        if let Some((key, _)) = self.mirrored_block_key(display_map_id, block_id, style) {
+            self.mirrored_block_measurements.borrow_mut().remove(&key);
         }
     }
 
@@ -512,7 +613,7 @@ impl DisplayMap {
 
             for block in all_blocks {
                 let Some(their_block) = block_map::balancing_block(
-                    &block.properties(),
+                    &block.properties_for_companion(),
                     snapshot.buffer(),
                     companion_wrap_snapshot.buffer(),
                     self.entity_id,

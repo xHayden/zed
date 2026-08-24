@@ -2297,18 +2297,19 @@ fn attach_stack_review_ai_scope_label(
         .map(|(number, _)| format!("#{number}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let citation = context
+    let primary = context
         .resources
         .first()
-        .context("Stack Review AI context has no citable resource")?
-        .citation()
-        .clone();
+        .context("Stack Review AI context has no citable resource")?;
+    let primary_label = primary.label().clone();
+    let primary_citation = primary.citation().clone();
+    let primary_text = primary.text().clone();
     let mut resources = context.resources.to_vec();
-    resources.push(git_ui_core::stack_review_ai::StackReviewAiResource::new(
-        "Review scope",
-        citation,
-        format!("Pull requests: {scope_label}"),
-    ));
+    resources[0] = git_ui_core::stack_review_ai::StackReviewAiResource::new(
+        primary_label,
+        primary_citation,
+        format!("Pull requests: {scope_label}\n\n{primary_text}"),
+    );
     ensure_stack_review_ai_resource_bounds(&resources)?;
     let scope_revision = layer_pull_requests
         .iter()
@@ -3300,6 +3301,10 @@ type PendingStackReviewAiComposerContexts = HashMap<
         git_ui_core::stack_review_ai::StackReviewAiContext,
     ),
 >;
+type PendingStackReviewAiThreadReveals = HashMap<
+    git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    git_ui_core::stack_review_ai::StackReviewAiGeneration,
+>;
 
 fn enqueue_pending_stack_review_ai_prompt(
     pending: &mut PendingStackReviewAiPrompts,
@@ -3372,6 +3377,18 @@ fn take_pending_stack_review_ai_composer_context(
         .flatten()
 }
 
+fn take_pending_stack_review_ai_thread_reveal(
+    pending: &mut PendingStackReviewAiThreadReveals,
+    context_key: &git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    generation: git_ui_core::stack_review_ai::StackReviewAiGeneration,
+) -> bool {
+    if pending.get(context_key).copied() != Some(generation) {
+        return false;
+    }
+    pending.remove(context_key);
+    true
+}
+
 fn stack_review_loading_record_id<'a>(
     active_projection_target: Option<&'a str>,
     pending_context: Option<&'a git_ui_core::stack_review_ai::StackReviewAiContext>,
@@ -3441,6 +3458,7 @@ pub struct StackReview {
         git_ui_core::stack_review_ai::StackReviewAiContext,
     >,
     pending_ai_composer_contexts: PendingStackReviewAiComposerContexts,
+    pending_ai_thread_reveals: PendingStackReviewAiThreadReveals,
 
     ai_error: Option<SharedString>,
     ai_activation_tasks: HashMap<git_ui_core::stack_review_ai::StackReviewAiContextKey, Task<()>>,
@@ -3687,6 +3705,11 @@ impl StackReview {
                 self.ai_error = Some(error.to_string().into());
                 self.ai_projections.remove(context_key);
                 self.pending_ai_composer_contexts.remove(context_key);
+                take_pending_stack_review_ai_thread_reveal(
+                    &mut self.pending_ai_thread_reveals,
+                    context_key,
+                    generation,
+                );
                 if self
                     .ai_projection
                     .as_ref()
@@ -3698,6 +3721,30 @@ impl StackReview {
                 self.refresh_ai_comment_projection(cx);
                 cx.notify();
                 return;
+            }
+        }
+        if let (Some(session_id), Some(session_owner)) =
+            (session_id.as_ref(), session_owner.as_ref())
+            && take_pending_stack_review_ai_thread_reveal(
+                &mut self.pending_ai_thread_reveals,
+                context_key,
+                generation,
+            )
+        {
+            let reveal_result = git_ui_core::stack_review_ai::stack_review_ai_host(cx)
+                .map_err(anyhow::Error::from)
+                .and_then(|host| {
+                    host.reveal_and_focus_thread(
+                        session_id,
+                        session_owner,
+                        self.workspace.clone(),
+                        window,
+                        cx,
+                    )
+                });
+            if let Err(error) = reveal_result {
+                self.ai_error = Some(error.to_string().into());
+                cx.notify();
             }
         }
         if session_id.is_some() {
@@ -3737,6 +3784,7 @@ impl StackReview {
         &mut self,
         selection: StackReviewAiContextSelection,
         pending_prompt: Option<String>,
+        reveal_after_prepare: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3788,6 +3836,11 @@ impl StackReview {
             if failed_projection {
                 self.ai_projections.remove(&context_key);
                 self.pending_ai_composer_contexts.remove(&context_key);
+                take_pending_stack_review_ai_thread_reveal(
+                    &mut self.pending_ai_thread_reveals,
+                    &context_key,
+                    generation,
+                );
                 if self
                     .ai_projection
                     .as_ref()
@@ -3813,6 +3866,11 @@ impl StackReview {
                     let host = match git_ui_core::stack_review_ai::stack_review_ai_host(cx) {
                         Ok(host) => host,
                         Err(error) => {
+                            take_pending_stack_review_ai_thread_reveal(
+                                &mut self.pending_ai_thread_reveals,
+                                &context_key,
+                                generation,
+                            );
                             self.ai_error = Some(error.to_string().into());
                             cx.notify();
                             return;
@@ -3829,6 +3887,11 @@ impl StackReview {
                         self.ai_error = Some(error.to_string().into());
                         self.ai_projections.remove(&context_key);
                         self.pending_ai_composer_contexts.remove(&context_key);
+                        take_pending_stack_review_ai_thread_reveal(
+                            &mut self.pending_ai_thread_reveals,
+                            &context_key,
+                            generation,
+                        );
                         if self
                             .ai_projection
                             .as_ref()
@@ -3841,9 +3904,17 @@ impl StackReview {
                         cx.notify();
                         return;
                     }
+                    if reveal_after_prepare {
+                        self.pending_ai_thread_reveals
+                            .insert(context_key.clone(), generation);
+                    }
                 } else if prepare_composer {
                     self.pending_ai_composer_contexts
                         .insert(context_key.clone(), (generation, context.clone()));
+                    if reveal_after_prepare {
+                        self.pending_ai_thread_reveals
+                            .insert(context_key.clone(), generation);
+                    }
                 }
                 self.ai_context = Some(context);
                 self.ai_projection = Some(projection.clone());
@@ -3876,6 +3947,10 @@ impl StackReview {
             .and_then(|state| state.binding(&binding_key).ok().flatten())
             .map(SharedString::from);
         self.ai_generation = generation;
+        if reveal_after_prepare {
+            self.pending_ai_thread_reveals
+                .insert(context_key.clone(), generation);
+        }
         self.ai_activation_generations
             .insert(context_key.clone(), generation);
         self.refresh_ai_comment_projection(cx);
@@ -3970,6 +4045,11 @@ impl StackReview {
                         this.pending_ai_prompts.remove(&activation_context_key);
                         this.pending_ai_composer_contexts
                             .remove(&activation_context_key);
+                        take_pending_stack_review_ai_thread_reveal(
+                            &mut this.pending_ai_thread_reveals,
+                            &activation_context_key,
+                            generation,
+                        );
                         this.unbind_ai_thread(&activation_context_key, window, cx);
                         this.refresh_ai_comment_projection(cx);
                     }
@@ -3990,7 +4070,7 @@ impl StackReview {
         };
         match default_stack_review_ai_code_selection(&self.files, &self.content_entries, file_index)
         {
-            Ok(selection) => self.activate_ai_context(selection, None, window, cx),
+            Ok(selection) => self.activate_ai_context(selection, None, true, window, cx),
             Err(error) => {
                 self.ai_error = Some(error.to_string().into());
                 cx.notify();
@@ -4009,6 +4089,7 @@ impl StackReview {
                 selected_record_id: record_id.to_owned(),
             },
             None,
+            false,
             window,
             cx,
         );
@@ -4113,6 +4194,7 @@ impl StackReview {
                 selected_record_id: record_id.to_owned(),
             },
             Some(prompt),
+            false,
             window,
             cx,
         );
@@ -4138,7 +4220,15 @@ impl StackReview {
                     Some(git_ui_core::stack_review_ai::StackReviewAiContextKey::Comment { .. })
                 )
             {
-                self.activate_ai_for_comment(&record_id, window, cx);
+                self.activate_ai_context(
+                    StackReviewAiContextSelection::Comment {
+                        selected_record_id: record_id,
+                    },
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
             } else {
                 self.activate_ai_for_selected_file(window, cx);
             }
@@ -4388,6 +4478,7 @@ impl StackReview {
             ai_projections: HashMap::new(),
             ai_contexts: HashMap::new(),
             pending_ai_composer_contexts: HashMap::new(),
+            pending_ai_thread_reveals: HashMap::new(),
 
             ai_error: None,
             ai_activation_tasks: HashMap::new(),
@@ -4428,6 +4519,7 @@ impl StackReview {
         self.ai_projections.clear();
         self.ai_contexts.clear();
         self.pending_ai_composer_contexts.clear();
+        self.pending_ai_thread_reveals.clear();
         self.ai_error = None;
         self.ai_activation_tasks.clear();
         self.ai_activation_generations.clear();
@@ -7428,7 +7520,7 @@ mod tests {
     use project::{FakeFs, WorktreeSettings, project_settings::ProjectSettings};
     use serde_json::json;
     use settings::SettingsStore;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use theme::LoadThemes;
     use workspace::WorkspaceSettings;
@@ -7563,6 +7655,30 @@ mod tests {
     }
 
     #[test]
+    fn pending_stack_review_thread_reveal_is_generation_scoped() {
+        let key = git_ui_core::stack_review_ai::StackReviewAiContextKey::review("base-head");
+        let stale_generation = git_ui_core::stack_review_ai::StackReviewAiGeneration::default()
+            .next()
+            .unwrap();
+        let current_generation = stale_generation.next().unwrap();
+        let mut pending =
+            PendingStackReviewAiThreadReveals::from([(key.clone(), current_generation)]);
+
+        assert!(!take_pending_stack_review_ai_thread_reveal(
+            &mut pending,
+            &key,
+            stale_generation,
+        ));
+        assert_eq!(pending.get(&key), Some(&current_generation));
+        assert!(take_pending_stack_review_ai_thread_reveal(
+            &mut pending,
+            &key,
+            current_generation,
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn loading_indicator_stays_on_the_captured_turn_target() {
         let mut queued = pending_ai_test_context(
             git_ui_core::stack_review_ai::StackReviewAiContextKey::comment("base-head", "thread-a"),
@@ -7619,6 +7735,7 @@ mod tests {
     struct TestStackReviewAiHost {
         submissions: RefCell<Vec<(String, Option<SharedString>)>>,
         prepared_contexts: RefCell<Vec<git_ui_core::stack_review_ai::StackReviewAiContext>>,
+        reveals: Cell<usize>,
     }
 
     impl git_ui_core::stack_review_ai::StackReviewAiHost for TestStackReviewAiHost {
@@ -7676,6 +7793,7 @@ mod tests {
             _window: &mut Window,
             _cx: &mut App,
         ) -> Result<()> {
+            self.reveals.set(self.reveals.get() + 1);
             Ok(())
         }
 
@@ -8126,17 +8244,23 @@ mod tests {
         )
         .expect("attach changed PR OID");
 
-        assert_eq!(context.resources.len(), original_resources.len() + 1);
+        assert_eq!(context.resources.len(), original_resources.len());
+        assert_eq!(context.resources[0].label(), original_resources[0].label());
         assert_eq!(
-            &context.resources[..original_resources.len()],
-            original_resources.as_ref()
+            context.resources[0].citation(),
+            original_resources[0].citation()
         );
-        let scope = context
-            .resources
-            .iter()
-            .find(|resource| resource.label().as_ref() == "Review scope")
-            .expect("scope metadata resource");
-        assert_eq!(scope.text().as_ref(), "Pull requests: #12, #34");
+        assert!(
+            context.resources[0]
+                .text()
+                .starts_with("Pull requests: #12, #34\n\n")
+        );
+        assert!(
+            context.resources[0]
+                .text()
+                .ends_with(original_resources[0].text().as_ref())
+        );
+        assert_eq!(&context.resources[1..], &original_resources[1..]);
         assert_ne!(context.context_revision, original_revision);
         assert_ne!(
             context.context_revision,
@@ -11481,6 +11605,7 @@ mod tests {
                     ai_projections: HashMap::new(),
                     ai_contexts: HashMap::new(),
                     pending_ai_composer_contexts: HashMap::new(),
+                    pending_ai_thread_reveals: HashMap::new(),
                     ai_error: None,
                     ai_activation_tasks: HashMap::new(),
                     ai_activation_generations: HashMap::new(),
@@ -11569,6 +11694,15 @@ mod tests {
         assert!(
             review.read_with(&visual_context, |review, _| review.ai_context.is_some()),
             "clicking Use File in Agent must activate immutable file context"
+        );
+        assert_eq!(
+            test_ai_host.reveals.get(),
+            1,
+            "clicking Use File in Agent must reveal the prepared ordinary Agent composer"
+        );
+        assert!(
+            test_ai_host.submissions.borrow().is_empty(),
+            "clicking Use File in Agent must not submit"
         );
         assert_eq!(
             review.read_with(&visual_context, |review, _| {

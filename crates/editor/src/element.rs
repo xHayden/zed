@@ -3589,7 +3589,12 @@ impl EditorElement {
             let style = block.style();
             let width = match (style, block.place_near()) {
                 (_, true) => AvailableSpace::MinContent,
-                (BlockStyle::Sticky, _) => hitbox.size.width.into(),
+                (
+                    BlockStyle::Sticky
+                    | BlockStyle::StickyMirrored
+                    | BlockStyle::StickyMirroredCompanion,
+                    _,
+                ) => hitbox.size.width.into(),
                 (BlockStyle::Flex, _) => hitbox
                     .size
                     .width
@@ -3677,7 +3682,11 @@ impl EditorElement {
                         .max(fixed_block_max_width)
                         .max(*scroll_width + editor_margins.extended_right),
                 ),
-                BlockStyle::Sticky => AvailableSpace::Definite(hitbox.size.width),
+                BlockStyle::Sticky
+                | BlockStyle::StickyMirrored
+                | BlockStyle::StickyMirroredCompanion => {
+                    AvailableSpace::Definite(hitbox.size.width)
+                }
             };
 
             if let Some((element, element_size, _, x_offset)) = self.render_block(
@@ -3767,7 +3776,12 @@ impl EditorElement {
                 );
             }
 
-            if !matches!(block.style, BlockStyle::Sticky) {
+            if !matches!(
+                block.style,
+                BlockStyle::Sticky
+                    | BlockStyle::StickyMirrored
+                    | BlockStyle::StickyMirroredCompanion
+            ) {
                 origin += point(Pixels::from(-scroll_pixel_position.x), Pixels::ZERO);
             }
 

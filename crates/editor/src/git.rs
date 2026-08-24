@@ -1497,7 +1497,11 @@ impl Editor {
         let hunk_key_for_render = hunk_key.clone();
         let editor_handle = cx.entity().downgrade();
         let block = BlockProperties {
-            style: BlockStyle::Sticky,
+            style: if self.is_stack_review {
+                BlockStyle::StickyMirrored
+            } else {
+                BlockStyle::Sticky
+            },
             placement: BlockPlacement::Below(anchor),
             height: Some(initial_height),
             render: Arc::new(move |cx| {

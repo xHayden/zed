@@ -2397,7 +2397,7 @@ mod tests {
     use workspace::{Item, MultiWorkspace};
 
     use crate::display_map::{
-        BlockPlacement, BlockProperties, BlockStyle, Crease, FoldPlaceholder,
+        Block, BlockId, BlockPlacement, BlockProperties, BlockStyle, Crease, FoldPlaceholder,
     };
     use crate::inlays::Inlay;
     use crate::test::{editor_content_with_blocks_and_width, set_block_content_for_tests};
@@ -4812,6 +4812,161 @@ mod tests {
             .unindent(),
             &mut cx,
         );
+    }
+
+    #[gpui::test]
+    async fn test_mirrored_custom_block_renders_in_both_split_views(cx: &mut gpui::TestAppContext) {
+        use gpui::ParentElement as _;
+        use rope::Point;
+        use unindent::Unindent as _;
+
+        let (editor, mut cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+        let base_text = "
+            bbb
+            ccc
+        "
+        .unindent();
+        let current_text = "
+            aaa
+            bbb
+            ccc
+        "
+        .unindent();
+        let (buffer, diff) = buffer_with_diff(&base_text, &current_text, &mut cx);
+        editor.update(cx, |editor, cx| {
+            editor.update_excerpts_for_path(
+                PathKey::sorted(0),
+                buffer.clone(),
+                vec![Point::new(0, 0)..buffer.read(cx).max_point()],
+                0,
+                diff,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let source_block_id = editor.update(cx, |editor, cx| {
+            editor.rhs_editor.update(cx, |rhs, cx| {
+                let snapshot = rhs.buffer().read(cx).snapshot(cx);
+                let anchor = snapshot.anchor_before(Point::new(2, 0));
+                rhs.insert_blocks(
+                    [BlockProperties {
+                        placement: BlockPlacement::Above(anchor),
+                        height: Some(1),
+                        style: BlockStyle::StickyMirrored,
+                        render: Arc::new(|_| div().child("mirrored block").into_any()),
+                        priority: 0,
+                    }],
+                    None,
+                    cx,
+                )[0]
+            })
+        });
+        cx.run_until_parked();
+
+        let (rhs_editor, lhs_editor) = editor.read_with(cx, |editor, _| {
+            (
+                editor.rhs_editor.clone(),
+                editor.lhs.as_ref().unwrap().editor.clone(),
+            )
+        });
+        let balancing_block_id = lhs_editor.read_with(cx, |lhs, cx| {
+            let display_map = lhs.display_map.read(cx);
+            let companion = display_map.companion().unwrap().read(cx);
+            *companion
+                .custom_block_to_balancing_block(rhs_editor.read(cx).display_map.entity_id())
+                .borrow()
+                .get(&source_block_id)
+                .unwrap()
+        });
+        let source_block = rhs_editor.update(cx, |rhs, cx| {
+            rhs.display_snapshot(cx)
+                .block_for_id(BlockId::Custom(source_block_id))
+                .unwrap()
+        });
+        let balancing_block = lhs_editor.update(cx, |lhs, cx| {
+            lhs.display_snapshot(cx)
+                .block_for_id(BlockId::Custom(balancing_block_id))
+                .unwrap()
+        });
+        let Block::Custom(source_block) = source_block else {
+            panic!("source block must be custom")
+        };
+        let Block::Custom(balancing_block) = balancing_block else {
+            panic!("balancing block must be custom")
+        };
+        assert_eq!(source_block.style(), BlockStyle::StickyMirrored);
+        assert_eq!(balancing_block.style(), BlockStyle::StickyMirroredCompanion);
+        cx.update(|_, cx| {
+            set_block_content_for_tests(&rhs_editor, source_block_id, cx, |_| {
+                "mirrored block".to_string()
+            });
+            set_block_content_for_tests(&lhs_editor, balancing_block_id, cx, |_| {
+                "mirrored block".to_string()
+            });
+        });
+        cx.run_until_parked();
+        assert_split_content(
+            &editor,
+            "
+            § <no file>
+            § -----
+            aaa
+            bbb
+            § mirrored block
+            ccc"
+            .unindent(),
+            "
+            § <no file>
+            § -----
+            § spacer
+            bbb
+            § mirrored block
+            ccc"
+            .unindent(),
+            &mut cx,
+        );
+
+        let block_heights = |cx: &mut VisualTestContext| {
+            let source_height = rhs_editor.update(&mut *cx, |rhs, cx| {
+                rhs.display_snapshot(cx)
+                    .block_for_id(BlockId::Custom(source_block_id))
+                    .unwrap()
+                    .height()
+            });
+            let balancing_height = lhs_editor.update(&mut *cx, |lhs, cx| {
+                lhs.display_snapshot(cx)
+                    .block_for_id(BlockId::Custom(balancing_block_id))
+                    .unwrap()
+                    .height()
+            });
+            (source_height, balancing_height)
+        };
+        rhs_editor.update(&mut *cx, |rhs, cx| {
+            let mut heights = HashMap::default();
+            heights.insert(source_block_id, 1);
+            rhs.resize_blocks(heights, None, cx);
+        });
+        lhs_editor.update(&mut *cx, |lhs, cx| {
+            let mut heights = HashMap::default();
+            heights.insert(balancing_block_id, 4);
+            lhs.resize_blocks(heights, None, cx);
+        });
+        assert_eq!(block_heights(cx), (4, 4));
+
+        rhs_editor.update(&mut *cx, |rhs, cx| {
+            let mut heights = HashMap::default();
+            heights.insert(source_block_id, 1);
+            rhs.resize_blocks(heights, None, cx);
+        });
+        assert_eq!(block_heights(cx), (4, 4));
+
+        lhs_editor.update(&mut *cx, |lhs, cx| {
+            let mut heights = HashMap::default();
+            heights.insert(balancing_block_id, 2);
+            lhs.resize_blocks(heights, None, cx);
+        });
+        assert_eq!(block_heights(cx), (2, 2));
     }
 
     #[gpui::test]

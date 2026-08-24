@@ -308,6 +308,8 @@ pub enum BlockStyle {
     /// - doesn't paint in gutter
     Spacer,
     Sticky,
+    StickyMirrored,
+    StickyMirroredCompanion,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -1781,20 +1783,29 @@ pub(crate) fn balancing_block(
         // Not supported for balancing
         BlockPlacement::Near(_) | BlockPlacement::Replace(_) => return None,
     };
+    let mirrored = my_block.style == BlockStyle::StickyMirrored;
     Some(BlockProperties {
         placement: their_placement,
         height: my_block.height,
-        style: BlockStyle::Spacer,
-        render: Arc::new(move |cx| {
-            crate::EditorElement::render_spacer_block(
-                cx.block_id,
-                cx.height,
-                cx.line_height,
-                cx.indent_guide_padding,
-                cx.window,
-                cx.app,
-            )
-        }),
+        style: if mirrored {
+            BlockStyle::StickyMirroredCompanion
+        } else {
+            BlockStyle::Spacer
+        },
+        render: if mirrored {
+            my_block.render.clone()
+        } else {
+            Arc::new(move |cx| {
+                crate::EditorElement::render_spacer_block(
+                    cx.block_id,
+                    cx.height,
+                    cx.line_height,
+                    cx.indent_guide_padding,
+                    cx.window,
+                    cx.app,
+                )
+            })
+        },
         priority: my_block.priority,
     })
 }
@@ -1899,7 +1910,15 @@ impl BlockMapWriter<'_> {
     }
 
     #[ztracing::instrument(skip_all)]
-    pub fn resize(&mut self, mut heights: HashMap<CustomBlockId, u32>) {
+    pub fn resize(&mut self, heights: HashMap<CustomBlockId, u32>) {
+        self.resize_internal(heights, true);
+    }
+
+    fn resize_internal(
+        &mut self,
+        mut heights: HashMap<CustomBlockId, u32>,
+        record_measurements: bool,
+    ) {
         let wrap_snapshot = self.block_map.wrap_snapshot.borrow().clone();
         let buffer = wrap_snapshot.buffer_snapshot();
         let mut edits = Patch::default();
@@ -1907,9 +1926,18 @@ impl BlockMapWriter<'_> {
 
         let mut companion_heights = HashMap::default();
         for block in &mut self.block_map.custom_blocks {
-            if let Some(new_height) = heights.remove(&block.id) {
+            if let Some(mut new_height) = heights.remove(&block.id) {
                 if let BlockPlacement::Replace(_) = &block.placement {
                     debug_assert!(new_height > 0);
+                }
+
+                if record_measurements && let Some(companion) = &self.companion {
+                    new_height = companion.companion.reconciled_mirrored_block_height(
+                        companion.display_map_id,
+                        block.id,
+                        block.style,
+                        new_height,
+                    );
                 }
 
                 if block.height != Some(new_height) {
@@ -1929,14 +1957,25 @@ impl BlockMapWriter<'_> {
 
                     if let Some(companion) = &self.companion
                         && companion.inverse.is_some()
-                        && let Some(companion_block_id) = companion
-                            .companion
-                            .custom_block_to_balancing_block(companion.display_map_id)
-                            .borrow()
-                            .get(&block.id)
-                            .copied()
                     {
-                        companion_heights.insert(companion_block_id, new_height);
+                        let companion_block_id = companion
+                            .companion
+                            .mirrored_block_counterpart(
+                                companion.display_map_id,
+                                block.id,
+                                block.style,
+                            )
+                            .or_else(|| {
+                                companion
+                                    .companion
+                                    .custom_block_to_balancing_block(companion.display_map_id)
+                                    .borrow()
+                                    .get(&block.id)
+                                    .copied()
+                            });
+                        if let Some(companion_block_id) = companion_block_id {
+                            companion_heights.insert(companion_block_id, new_height);
+                        }
                     }
 
                     let start_row = block.placement.start().to_point(buffer).row;
@@ -1973,7 +2012,9 @@ impl BlockMapWriter<'_> {
         if let Some(companion) = &mut self.companion
             && let Some(inverse) = &mut companion.inverse
         {
-            inverse.companion_writer.resize(companion_heights);
+            inverse
+                .companion_writer
+                .resize_internal(companion_heights, false);
         }
     }
 
@@ -1987,6 +2028,13 @@ impl BlockMapWriter<'_> {
         let mut companion_block_ids: HashSet<CustomBlockId> = HashSet::default();
         self.block_map.custom_blocks.retain(|block| {
             if block_ids.contains(&block.id) {
+                if let Some(companion) = &self.companion {
+                    companion.companion.clear_mirrored_block_measurements(
+                        companion.display_map_id,
+                        block.id,
+                        block.style,
+                    );
+                }
                 let start = block.placement.start().to_point(buffer);
                 let end = block.placement.end().to_point(buffer);
                 if last_block_buffer_row != Some(end.row) {
@@ -2913,6 +2961,14 @@ impl CustomBlock {
             }),
             priority: self.priority,
         }
+    }
+
+    pub(crate) fn properties_for_companion(&self) -> BlockProperties<Anchor> {
+        let mut properties = self.properties();
+        if self.style == BlockStyle::StickyMirrored {
+            properties.render = self.render.lock().clone();
+        }
+        properties
     }
 }
 
