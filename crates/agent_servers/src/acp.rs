@@ -672,12 +672,16 @@ const MINIMUM_SUPPORTED_VERSION: ProtocolVersion = ProtocolVersion::V1;
 /// to spawn it on a background executor and hold the task for the lifetime
 /// of the connection. The `connection_tx` oneshot receives the
 /// `ConnectionTo<Agent>` handle as soon as the builder runs its `main_fn`.
+/// `Client::connect_with` produces a large chained-handler future in debug builds. Keep
+/// that state heap-allocated before it crosses `background_spawn`; embedding the concrete
+/// future in the executor task can exhaust a macOS GCD worker stack as soon as an agent
+/// sends its first request.
 fn connect_client_future(
     name: &'static str,
     transport: impl agent_client_protocol::ConnectTo<Client> + 'static,
     dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
     connection_tx: futures::channel::oneshot::Sender<ConnectionTo<Agent>>,
-) -> impl Future<Output = Result<(), acp::Error>> {
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), acp::Error>> + Send>> {
     // Each handler forwards its inputs onto the foreground dispatch queue.
     // The SDK requires the closure to be `Send`, so we move a clone of
     // `dispatch_tx` into each one.
@@ -700,65 +704,67 @@ fn connect_client_future(
         }};
     }
 
-    Client
-        .builder()
-        .name(name)
-        // --- Request handlers (agent→client) ---
-        .on_receive_request(
-            on_request!(handle_request_permission),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_write_text_file),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_read_text_file),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_create_terminal),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_kill_terminal),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_release_terminal),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_terminal_output),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_wait_for_terminal_exit),
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            on_request!(handle_create_elicitation),
-            agent_client_protocol::on_receive_request!(),
-        )
-        // --- Notification handlers (agent→client) ---
-        .on_receive_notification(
-            on_notification!(handle_session_notification),
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .on_receive_notification(
-            on_notification!(handle_complete_elicitation),
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .connect_with(
-            transport,
-            move |connection: ConnectionTo<Agent>| async move {
-                if connection_tx.send(connection).is_err() {
-                    log::error!("failed to send ACP connection handle — receiver was dropped");
-                }
-                // Keep the connection alive until the transport closes.
-                futures::future::pending::<Result<(), acp::Error>>().await
-            },
-        )
+    Box::pin(
+        Client
+            .builder()
+            .name(name)
+            // --- Request handlers (agent→client) ---
+            .on_receive_request(
+                on_request!(handle_request_permission),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_write_text_file),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_read_text_file),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_create_terminal),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_kill_terminal),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_release_terminal),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_terminal_output),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_wait_for_terminal_exit),
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                on_request!(handle_create_elicitation),
+                agent_client_protocol::on_receive_request!(),
+            )
+            // --- Notification handlers (agent→client) ---
+            .on_receive_notification(
+                on_notification!(handle_session_notification),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_notification(
+                on_notification!(handle_complete_elicitation),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                transport,
+                move |connection: ConnectionTo<Agent>| async move {
+                    if connection_tx.send(connection).is_err() {
+                        log::error!("failed to send ACP connection handle — receiver was dropped");
+                    }
+                    // Keep the connection alive until the transport closes.
+                    futures::future::pending::<Result<(), acp::Error>>().await
+                },
+            ),
+    )
 }
 
 fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities {
