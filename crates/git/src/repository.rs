@@ -931,6 +931,15 @@ pub trait GitRepository: Send + Sync {
             .boxed()
     }
 
+    fn stack_review_range_diff_rewritten_commit(
+        &self,
+        _base_ref: String,
+        _head_ref: String,
+        _candidate_oid: String,
+    ) -> BoxFuture<'_, Result<Option<String>>> {
+        async move { Ok(None) }.boxed()
+    }
+
     fn is_ancestor(&self, _base_ref: String, _head_ref: String) -> BoxFuture<'_, Result<bool>> {
         async move { bail!("ancestry checks are unavailable for this repository") }.boxed()
     }
@@ -1590,6 +1599,42 @@ async fn stable_patch_ids(git: &GitBinary, input: Vec<u8>) -> Result<Vec<(String
         .collect()
 }
 
+fn range_diff_rewritten_commit_abbreviation(
+    output: &str,
+    candidate_oid: &str,
+) -> Result<Option<String>> {
+    let mut matches = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(old_index), Some(old_oid), Some(marker), Some(new_index), Some(new_oid)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        if !old_index.ends_with(':')
+            || !new_index.ends_with(':')
+            || !matches!(marker, "=" | "!")
+            || old_oid.len() < 7
+            || new_oid.len() < 7
+            || !old_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !new_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !candidate_oid.starts_with(old_oid)
+        {
+            continue;
+        }
+        matches.push(new_oid.to_owned());
+    }
+    match matches.as_slice() {
+        [] => Ok(None),
+        [mapped] => Ok(Some(mapped.clone())),
+        _ => anyhow::bail!("git range-diff mapped the commit boundary more than once"),
+    }
+}
+
 impl GitRepository for RealGitRepository {
     fn path(&self) -> PathBuf {
         self.git_dir.clone()
@@ -1789,6 +1834,63 @@ impl GitRepository for RealGitRepository {
                         (patch_id == *candidate_patch_id).then_some(commit_id)
                     })
                     .collect())
+            })
+            .boxed()
+    }
+
+    fn stack_review_range_diff_rewritten_commit(
+        &self,
+        base_ref: String,
+        head_ref: String,
+        candidate_oid: String,
+    ) -> BoxFuture<'_, Result<Option<String>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let merge_base = git
+                    .build_command(&["merge-base", &base_ref, &candidate_oid])
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .kill_on_drop(true)
+                    .output()
+                    .await?;
+                match merge_base.status.code() {
+                    Some(0) => {}
+                    Some(1) => return Ok(None),
+                    _ => anyhow::bail!(
+                        "git merge-base failed while mapping rewritten commit: {}",
+                        String::from_utf8_lossy(&merge_base.stderr)
+                    ),
+                }
+                let old_base = String::from_utf8(merge_base.stdout)?.trim().to_owned();
+                let old_range = format!("{old_base}..{candidate_oid}");
+                let current_range = format!("{base_ref}..{head_ref}");
+                let range_diff = bounded_git_stdout(
+                    &git,
+                    &[
+                        "range-diff",
+                        "--no-color",
+                        "--no-dual-color",
+                        "--no-patch",
+                        &old_range,
+                        &current_range,
+                    ],
+                    "git range-diff failed while mapping rewritten commit",
+                )
+                .await?;
+                let range_diff = String::from_utf8(range_diff)?;
+                let Some(mapped_abbreviation) =
+                    range_diff_rewritten_commit_abbreviation(&range_diff, &candidate_oid)?
+                else {
+                    return Ok(None);
+                };
+                let revision = format!("{mapped_abbreviation}^{{commit}}");
+                let mapped = bounded_git_stdout(
+                    &git,
+                    &["rev-parse", "--verify", &revision],
+                    "git rev-parse failed for range-diff mapping",
+                )
+                .await?;
+                Ok(Some(String::from_utf8(mapped)?.trim().to_owned()))
             })
             .boxed()
     }
