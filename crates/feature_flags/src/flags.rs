@@ -39,18 +39,6 @@ impl FeatureFlag for DiffReviewFeatureFlag {
 }
 register_feature_flag!(DiffReviewFeatureFlag);
 
-pub struct StackReviewFeatureFlag;
-
-impl FeatureFlag for StackReviewFeatureFlag {
-    const NAME: &'static str = "stack-review";
-    type Value = PresenceFlag;
-
-    fn enabled_for_staff() -> bool {
-        false
-    }
-}
-register_feature_flag!(StackReviewFeatureFlag);
-
 /// Gates the `create_thread` and `list_agents_and_models` tools, which let
 /// the agent spawn independent sibling threads that show up in the agent
 /// panel sidebar.

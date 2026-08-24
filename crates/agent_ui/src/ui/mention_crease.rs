@@ -224,7 +224,8 @@ fn open_mention_uri(
         | MentionUri::TerminalSelection { .. }
         | MentionUri::GitDiff { .. }
         | MentionUri::MergeConflict { .. }
-        | MentionUri::StackReview { .. } => {}
+        | MentionUri::StackReview { .. }
+        | MentionUri::StackReviewTurn => {}
     });
 }
 

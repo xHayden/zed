@@ -497,6 +497,8 @@
       "ctrl-alt-r": "editor::ToggleActiveReviewCommentResolved",
       "ctrl-alt-t": "git::StackReviewToggleTests",
       "ctrl-alt-m": "git::StackReviewToggleMigrations",
+      "ctrl-alt-a": "git::StackReviewUseFileInAgent",
+      "ctrl-alt-shift-a": "git::StackReviewOpenAgent",
     },
   },
   {

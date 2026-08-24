@@ -6,9 +6,11 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context as _;
 use git::stack_review::StackReviewCommentSide;
-use gpui::{App, Context, Entity, Global, SharedString, WeakEntity};
+use gpui::{App, Context, Entity, Global, SharedString, Subscription, WeakEntity};
 use markdown::Markdown;
+use serde::{Deserialize, Serialize};
 use workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,8 +76,11 @@ impl StackReviewAiTurn {
 pub struct StackReviewAiProjection {
     generation: StackReviewAiGeneration,
     session_id: Option<SharedString>,
+    session_owner: Option<SharedString>,
     status: StackReviewAiStatus,
     assistant_turns: Vec<StackReviewAiTurn>,
+    durable_binding_allowed: bool,
+    subscriptions: Vec<Subscription>,
 }
 
 impl StackReviewAiProjection {
@@ -83,8 +88,11 @@ impl StackReviewAiProjection {
         Self {
             generation,
             session_id: None,
+            session_owner: None,
             status: StackReviewAiStatus::Loading,
             assistant_turns: Vec::new(),
+            durable_binding_allowed: false,
+            subscriptions: Vec::new(),
         }
     }
 
@@ -96,12 +104,46 @@ impl StackReviewAiProjection {
         self.session_id.as_ref()
     }
 
+    pub fn session_owner(&self) -> Option<&SharedString> {
+        self.session_owner.as_ref()
+    }
+
+    pub fn set_session_owner(&mut self, owner: impl Into<SharedString>) {
+        self.session_owner = Some(owner.into());
+    }
+
     pub fn status(&self) -> &StackReviewAiStatus {
         &self.status
     }
 
     pub fn assistant_turns(&self) -> &[StackReviewAiTurn] {
         &self.assistant_turns
+    }
+
+    pub fn durable_binding_allowed(&self) -> bool {
+        self.durable_binding_allowed
+    }
+
+    pub fn allow_durable_binding(&mut self) {
+        self.durable_binding_allowed = true;
+    }
+
+    pub fn retain_subscription(&mut self, subscription: Subscription) {
+        self.subscriptions.push(subscription);
+    }
+
+    pub fn apply_status(
+        &mut self,
+        generation: StackReviewAiGeneration,
+        status: StackReviewAiStatus,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.status = status;
+        cx.notify();
+        true
     }
 
     pub fn begin_generation(
@@ -115,6 +157,7 @@ impl StackReviewAiProjection {
 
         self.generation = generation;
         self.session_id = None;
+        self.session_owner = None;
         self.status = StackReviewAiStatus::Loading;
         self.assistant_turns.clear();
         cx.notify();
@@ -146,7 +189,13 @@ pub struct StackReviewAiProjectionUpdate {
     pub assistant_turns: Vec<StackReviewAiTurn>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum StackReviewAiContextKey {
     Review {
         storage_key: SharedString,
@@ -194,6 +243,13 @@ impl StackReviewAiContextKey {
                 thread_key.len()
             )
             .into(),
+        }
+    }
+
+    pub fn presentation_binding_key(&self) -> SharedString {
+        match self {
+            Self::Review { .. } => git::stack_review::STACK_REVIEW_REVIEW_BINDING_KEY.into(),
+            Self::Comment { thread_key, .. } => format!("comment:{thread_key}").into(),
         }
     }
 }
@@ -468,11 +524,14 @@ pub struct StackReviewAiActivationRequest {
     pub context: StackReviewAiContext,
     pub persisted_session_id: Option<SharedString>,
     pub generation: StackReviewAiGeneration,
+    pub prepare_composer: bool,
 }
 
 pub const STACK_REVIEW_TURN_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+pub const STACK_REVIEW_TURN_ENVELOPE_URI: &str = "zed:///agent/stack-review-turn";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StackReviewTurnEnvelope {
     schema_version: u32,
     turn_id: SharedString,
@@ -507,8 +566,97 @@ impl StackReviewTurnEnvelope {
         self.schema_version
     }
 
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn from_json(json: &str) -> anyhow::Result<Self> {
+        let envelope: Self = serde_json::from_str(json)?;
+        anyhow::ensure!(
+            envelope.schema_version == STACK_REVIEW_TURN_ENVELOPE_SCHEMA_VERSION,
+            "unsupported Stack Review turn envelope version"
+        );
+        anyhow::ensure!(
+            !envelope.turn_id.is_empty(),
+            "Stack Review turn ID is empty"
+        );
+        anyhow::ensure!(
+            !envelope.project_identity.is_empty(),
+            "Stack Review project identity is empty"
+        );
+        anyhow::ensure!(
+            !envelope.storage_key.is_empty(),
+            "Stack Review storage key is empty"
+        );
+        anyhow::ensure!(
+            envelope.context_key.storage_key() == &envelope.storage_key,
+            "Stack Review context key storage does not match its envelope"
+        );
+        anyhow::ensure!(
+            !envelope.context_revision.is_empty(),
+            "Stack Review context revision is empty"
+        );
+        anyhow::ensure!(
+            envelope
+                .selected_record_id
+                .as_ref()
+                .is_none_or(|id| !id.is_empty()),
+            "Stack Review selected record ID is empty"
+        );
+        anyhow::ensure!(
+            envelope
+                .projection_target
+                .as_ref()
+                .is_none_or(|id| !id.is_empty()),
+            "Stack Review projection target is empty"
+        );
+        Ok(envelope)
+    }
+
+    pub fn to_metadata_text(&self) -> anyhow::Result<String> {
+        let mut url = url::Url::parse(STACK_REVIEW_TURN_ENVELOPE_URI)?;
+        url.query_pairs_mut()
+            .append_pair("payload", &self.to_json()?);
+        Ok(format!("<!--{url}-->"))
+    }
+
+    pub fn from_metadata_text(text: &str) -> anyhow::Result<Self> {
+        let url = text
+            .trim()
+            .strip_prefix("<!--")
+            .and_then(|text| text.strip_suffix("-->"))
+            .context("Stack Review turn metadata wrapper is invalid")?;
+        let url = url::Url::parse(url)?;
+        anyhow::ensure!(
+            url.scheme() == "zed"
+                && url.host_str().is_none()
+                && url.path() == "/agent/stack-review-turn"
+                && url.fragment().is_none(),
+            "Stack Review turn metadata URI is invalid"
+        );
+        let mut payload = None;
+        for (key, value) in url.query_pairs() {
+            anyhow::ensure!(key == "payload", "unknown Stack Review turn metadata field");
+            anyhow::ensure!(payload.is_none(), "duplicate Stack Review turn payload");
+            payload = Some(value.into_owned());
+        }
+        Self::from_json(
+            payload
+                .as_deref()
+                .context("Stack Review turn payload is missing")?,
+        )
+    }
+
     pub fn turn_id(&self) -> &SharedString {
         &self.turn_id
+    }
+
+    pub fn with_turn_id(&self, turn_id: impl Into<SharedString>) -> anyhow::Result<Self> {
+        let turn_id = turn_id.into();
+        anyhow::ensure!(!turn_id.is_empty(), "Stack Review turn ID is empty");
+        let mut envelope = self.clone();
+        envelope.turn_id = turn_id;
+        Ok(envelope)
     }
 
     pub fn project_identity(&self) -> &SharedString {
@@ -539,6 +687,8 @@ impl StackReviewTurnEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StackReviewAiSubmitRequest {
     context: StackReviewAiContext,
+    session_id: SharedString,
+    session_owner: SharedString,
     prompt: SharedString,
     envelope: StackReviewTurnEnvelope,
     generation: StackReviewAiGeneration,
@@ -547,6 +697,8 @@ pub struct StackReviewAiSubmitRequest {
 impl StackReviewAiSubmitRequest {
     pub fn new(
         context: StackReviewAiContext,
+        session_id: impl Into<SharedString>,
+        session_owner: impl Into<SharedString>,
         prompt: impl Into<SharedString>,
         turn_id: impl Into<SharedString>,
         project_identity: impl Into<SharedString>,
@@ -557,6 +709,8 @@ impl StackReviewAiSubmitRequest {
             StackReviewTurnEnvelope::new(turn_id, project_identity, &context, projection_target);
         Self {
             context,
+            session_id: session_id.into(),
+            session_owner: session_owner.into(),
             prompt: prompt.into(),
             envelope,
             generation,
@@ -565,6 +719,14 @@ impl StackReviewAiSubmitRequest {
 
     pub fn context(&self) -> &StackReviewAiContext {
         &self.context
+    }
+
+    pub fn session_id(&self) -> &SharedString {
+        &self.session_id
+    }
+
+    pub fn session_owner(&self) -> &SharedString {
+        &self.session_owner
     }
 
     pub fn prompt(&self) -> &SharedString {
@@ -584,21 +746,26 @@ pub trait StackReviewAiHost {
     fn activate_context(
         &self,
         request: StackReviewAiActivationRequest,
+        workspace: WeakEntity<Workspace>,
         window: &mut gpui::Window,
         cx: &mut App,
     ) -> gpui::Task<anyhow::Result<Entity<StackReviewAiProjection>>>;
 
-    fn update_context(
+    fn prepare_composer(
         &self,
         context: StackReviewAiContext,
-        generation: StackReviewAiGeneration,
+        session_id: &SharedString,
+        session_owner: &SharedString,
+        workspace: WeakEntity<Workspace>,
         window: &mut gpui::Window,
         cx: &mut App,
     ) -> anyhow::Result<()>;
 
     fn reveal_and_focus_thread(
         &self,
-        context_key: &StackReviewAiContextKey,
+        session_id: &SharedString,
+        session_owner: &SharedString,
+        workspace: WeakEntity<Workspace>,
         window: &mut gpui::Window,
         cx: &mut App,
     ) -> anyhow::Result<()>;
@@ -606,6 +773,7 @@ pub trait StackReviewAiHost {
     fn submit_local_prompt(
         &self,
         request: StackReviewAiSubmitRequest,
+        workspace: WeakEntity<Workspace>,
         window: &mut gpui::Window,
         cx: &mut App,
     ) -> gpui::Task<anyhow::Result<()>>;
@@ -647,55 +815,70 @@ mod tests {
     #[derive(Default)]
     struct TestHost {
         activations: std::cell::RefCell<Vec<StackReviewAiActivationRequest>>,
-        context_updates: std::cell::RefCell<Vec<(StackReviewAiContext, StackReviewAiGeneration)>>,
-        revealed_contexts: std::cell::RefCell<Vec<StackReviewAiContextKey>>,
+        workspaces: std::cell::RefCell<Vec<WeakEntity<Workspace>>>,
+        revealed_session_ids: std::cell::RefCell<Vec<SharedString>>,
+        revealed_session_owners: std::cell::RefCell<Vec<SharedString>>,
         submissions: std::cell::RefCell<Vec<StackReviewAiSubmitRequest>>,
+        prepared: std::cell::RefCell<Vec<(StackReviewAiContextKey, SharedString)>>,
     }
 
     impl StackReviewAiHost for TestHost {
         fn activate_context(
             &self,
             request: StackReviewAiActivationRequest,
+            workspace: WeakEntity<Workspace>,
             _window: &mut gpui::Window,
             cx: &mut gpui::App,
         ) -> gpui::Task<anyhow::Result<gpui::Entity<StackReviewAiProjection>>> {
             let generation = request.generation;
             self.activations.borrow_mut().push(request);
+            self.workspaces.borrow_mut().push(workspace);
             gpui::Task::ready(Ok(cx.new(|_| StackReviewAiProjection::new(generation))))
         }
 
-        fn update_context(
+        fn prepare_composer(
             &self,
             context: StackReviewAiContext,
-            generation: StackReviewAiGeneration,
+            session_id: &SharedString,
+            _session_owner: &SharedString,
+            workspace: WeakEntity<Workspace>,
             _window: &mut gpui::Window,
             _cx: &mut gpui::App,
         ) -> anyhow::Result<()> {
-            self.context_updates
+            self.prepared
                 .borrow_mut()
-                .push((context, generation));
+                .push((context.key, session_id.clone()));
+            self.workspaces.borrow_mut().push(workspace);
             Ok(())
         }
 
         fn reveal_and_focus_thread(
             &self,
-            context_key: &StackReviewAiContextKey,
+            session_id: &SharedString,
+            session_owner: &SharedString,
+            workspace: WeakEntity<Workspace>,
             _window: &mut gpui::Window,
             _cx: &mut gpui::App,
         ) -> anyhow::Result<()> {
-            self.revealed_contexts
+            self.revealed_session_ids
                 .borrow_mut()
-                .push(context_key.clone());
+                .push(session_id.clone());
+            self.revealed_session_owners
+                .borrow_mut()
+                .push(session_owner.clone());
+            self.workspaces.borrow_mut().push(workspace);
             Ok(())
         }
 
         fn submit_local_prompt(
             &self,
             request: StackReviewAiSubmitRequest,
+            workspace: WeakEntity<Workspace>,
             _window: &mut gpui::Window,
             _cx: &mut gpui::App,
         ) -> gpui::Task<anyhow::Result<()>> {
             self.submissions.borrow_mut().push(request);
+            self.workspaces.borrow_mut().push(workspace);
             gpui::Task::ready(Ok(()))
         }
     }
@@ -887,6 +1070,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn turn_envelope_round_trips_strict_versioned_json() {
+        let context = test_context();
+        let envelope =
+            StackReviewTurnEnvelope::new("turn-1", "project-a", &context, Some("comment-a".into()));
+        let json = envelope.to_json().expect("serialize turn envelope");
+        assert_eq!(
+            StackReviewTurnEnvelope::from_json(&json).expect("decode turn envelope"),
+            envelope
+        );
+        let metadata = envelope
+            .to_metadata_text()
+            .expect("serialize turn envelope metadata");
+        assert_eq!(
+            StackReviewTurnEnvelope::from_metadata_text(&metadata)
+                .expect("decode turn envelope metadata"),
+            envelope
+        );
+        assert!(
+            StackReviewTurnEnvelope::from_metadata_text(&metadata.replacen(
+                "-->",
+                "&payload=%7B%7D-->",
+                1
+            ))
+            .is_err()
+        );
+        assert!(
+            StackReviewTurnEnvelope::from_metadata_text(
+                &metadata.replace("stack-review-turn", "stack-review-spoof")
+            )
+            .is_err()
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::Value::Bool(true));
+        assert!(StackReviewTurnEnvelope::from_json(&value.to_string()).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["contextKey"]["unexpected"] = serde_json::Value::Bool(true);
+        assert!(StackReviewTurnEnvelope::from_json(&value.to_string()).is_err());
+    }
+
     #[gpui::test]
     fn registered_host_preserves_dispatched_arguments(cx: &mut gpui::TestAppContext) {
         let host = Rc::new(TestHost::default());
@@ -898,9 +1126,12 @@ mod tests {
             context: context.clone(),
             persisted_session_id: Some("session-1".into()),
             generation,
+            prepare_composer: false,
         };
         let submission = StackReviewAiSubmitRequest::new(
-            context.clone(),
+            context,
+            "session-1",
+            "native",
             "Please review this comment.",
             "turn-1",
             "project-a",
@@ -910,6 +1141,7 @@ mod tests {
 
         let visual_context = cx.add_empty_window();
         visual_context.update(|window, cx| {
+            let workspace = WeakEntity::<Workspace>::new_invalid();
             set_stack_review_ai_host(host.clone(), cx);
             let registered_host = match stack_review_ai_host(cx) {
                 Ok(host) => host,
@@ -917,7 +1149,7 @@ mod tests {
             };
 
             let projection = match registered_host
-                .activate_context(activation.clone(), window, cx)
+                .activate_context(activation.clone(), workspace.clone(), window, cx)
                 .now_or_never()
             {
                 Some(Ok(projection)) => projection,
@@ -927,17 +1159,18 @@ mod tests {
             assert_eq!(projection.read(cx).generation(), generation);
             assert!(
                 registered_host
-                    .update_context(context.clone(), generation, window, cx)
-                    .is_ok()
-            );
-            assert!(
-                registered_host
-                    .reveal_and_focus_thread(&context.key, window, cx)
+                    .reveal_and_focus_thread(
+                        &"session-1".into(),
+                        &"native".into(),
+                        workspace.clone(),
+                        window,
+                        cx,
+                    )
                     .is_ok()
             );
             assert!(matches!(
                 registered_host
-                    .submit_local_prompt(submission.clone(), window, cx)
+                    .submit_local_prompt(submission.clone(), workspace, window, cx)
                     .now_or_never(),
                 Some(Ok(()))
             ));
@@ -945,14 +1178,15 @@ mod tests {
 
         assert_eq!(host.activations.borrow().as_slice(), &[activation]);
         assert_eq!(
-            host.context_updates.borrow().as_slice(),
-            &[(context.clone(), generation)]
+            host.revealed_session_ids.borrow().as_slice(),
+            &[SharedString::from("session-1")]
         );
         assert_eq!(
-            host.revealed_contexts.borrow().as_slice(),
-            std::slice::from_ref(&context.key)
+            host.revealed_session_owners.borrow().as_slice(),
+            &[SharedString::from("native")]
         );
         assert_eq!(host.submissions.borrow().as_slice(), &[submission]);
+        assert_eq!(host.workspaces.borrow().len(), 3);
     }
 
     #[test]

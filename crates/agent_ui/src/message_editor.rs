@@ -207,6 +207,7 @@ pub struct MessageEditor {
     local_commands: SharedLocalCommands,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
+    managed_context_blocks: Vec<acp::ContentBlock>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -609,6 +610,7 @@ impl MessageEditor {
             local_commands,
             agent_id,
             thread_store,
+            managed_context_blocks: Vec::new(),
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }
@@ -939,6 +941,16 @@ impl MessageEditor {
                 cx,
             )
         });
+    }
+
+    pub fn set_managed_context_blocks(&mut self, blocks: Vec<acp::ContentBlock>) {
+        self.managed_context_blocks = blocks;
+    }
+
+    pub fn clear_after_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let managed_context_blocks = self.managed_context_blocks.clone();
+        self.clear(window, cx);
+        self.insert_message_blocks(managed_context_blocks, false, window, cx);
     }
 
     pub fn send(&mut self, cx: &mut Context<Self>) {
@@ -5631,6 +5643,34 @@ mod tests {
             text, "new content",
             "set_message should replace old content"
         );
+    }
+
+    #[gpui::test]
+    async fn test_clear_after_send_restores_managed_context(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+        let managed = vec![acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+                "managed context",
+                "zed:///agent/stack-review-turn",
+            )),
+        ))];
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor
+                .session_capabilities
+                .write()
+                .set_prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true));
+            let mut message = vec![acp::ContentBlock::Text(acp::TextContent::new("question"))];
+            message.extend(managed.clone());
+            editor.set_message(message, window, cx);
+            editor.set_managed_context_blocks(managed.clone());
+            editor.clear_after_send(window, cx);
+        });
+
+        let blocks =
+            message_editor.read_with(cx, |editor, cx| editor.draft_content_blocks_snapshot(cx));
+        assert_eq!(blocks, managed);
     }
 
     #[gpui::test]

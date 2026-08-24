@@ -1118,6 +1118,8 @@ pub struct Editor {
     /// Uses a Vec instead of HashMap because DiffHunkKey contains an Anchor
     /// which doesn't implement Hash/Eq in a way suitable for HashMap keys.
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
+    stack_review_agent_projections: HashMap<String, Vec<Entity<Markdown>>>,
+    stack_review_agent_projection_subscriptions: Vec<Subscription>,
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
     hovered_diff_hunk_row: Option<DisplayRow>,
@@ -2420,6 +2422,8 @@ impl Editor {
             diff_review_drag_state: None,
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
+            stack_review_agent_projections: HashMap::default(),
+            stack_review_agent_projection_subscriptions: Vec::new(),
             next_review_comment_id: 0,
             hovered_diff_hunk_row: None,
             _subscriptions: (!is_minimap)

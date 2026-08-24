@@ -761,6 +761,37 @@ mod test_support {
         supports_session_additional_directories: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
+        session_modes: Option<StubAgentSessionModes>,
+    }
+
+    #[derive(Clone)]
+    pub struct StubAgentSessionModes {
+        current: Arc<Mutex<acp::SessionModeId>>,
+        available: Arc<[acp::SessionMode]>,
+    }
+
+    impl StubAgentSessionModes {
+        pub fn new(current: acp::SessionModeId, available: Vec<acp::SessionMode>) -> Self {
+            Self {
+                current: Arc::new(Mutex::new(current)),
+                available: available.into(),
+            }
+        }
+    }
+
+    impl AgentSessionModes for StubAgentSessionModes {
+        fn current_mode(&self) -> acp::SessionModeId {
+            self.current.lock().clone()
+        }
+
+        fn all_modes(&self) -> Vec<acp::SessionMode> {
+            self.available.to_vec()
+        }
+
+        fn set_mode(&self, mode: acp::SessionModeId, _cx: &mut App) -> Task<Result<()>> {
+            *self.current.lock() = mode;
+            Task::ready(Ok(()))
+        }
     }
 
     struct Session {
@@ -784,6 +815,7 @@ mod test_support {
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
+                session_modes: None,
             }
         }
 
@@ -819,6 +851,11 @@ mod test_support {
 
         pub fn with_telemetry_id(mut self, telemetry_id: SharedString) -> Self {
             self.telemetry_id = telemetry_id;
+            self
+        }
+
+        pub fn with_session_modes(mut self, modes: StubAgentSessionModes) -> Self {
+            self.session_modes = Some(modes);
             self
         }
 
@@ -912,6 +949,16 @@ mod test_support {
             _session_id: &acp::SessionId,
         ) -> Option<Rc<dyn AgentModelSelector>> {
             Some(self.model_selector_impl())
+        }
+
+        fn session_modes(
+            &self,
+            _session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionModes>> {
+            self.session_modes
+                .clone()
+                .map(|modes| Rc::new(modes) as Rc<dyn AgentSessionModes>)
         }
 
         fn new_session(

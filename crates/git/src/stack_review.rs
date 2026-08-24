@@ -97,6 +97,10 @@ pub struct StackReviewGitHubCommentIdentity {
     pub kind: StackReviewGitHubCommentKind,
     #[serde(default)]
     pub commit_oid: Option<String>,
+    #[serde(default)]
+    pub original_commit_oid: Option<String>,
+    #[serde(default)]
+    pub original_line: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1476,6 +1480,52 @@ fn resolve_branch(
 mod tests {
     use super::*;
     use crate::repository::GitBinary;
+
+    #[test]
+    fn github_comment_identity_defaults_original_anchor_for_cached_records() {
+        let record = StackReviewCommentRecord::new_github_inline(
+            "github-comment".into(),
+            "base".into(),
+            "head".into(),
+            "src/lib.rs".into(),
+            StackReviewCommentSide::Right,
+            4,
+            "Comment".into(),
+            StackReviewCommentAuthor {
+                name: "Reviewer".into(),
+                login: Some("reviewer".into()),
+            },
+            None,
+            "2026-08-24T00:00:00Z".into(),
+            StackReviewGitHubCommentIdentity {
+                pull_request_number: 1,
+                github_id: "10".into(),
+                url: "https://github.test/comment".into(),
+                kind: StackReviewGitHubCommentKind::Inline,
+                commit_oid: Some("base".into()),
+                original_commit_oid: Some("base".into()),
+                original_line: Some(2),
+            },
+            false,
+        );
+        let mut json = serde_json::to_value(record).unwrap();
+        let github = json
+            .get_mut("github")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        github.remove("originalCommitOid");
+        github.remove("originalLine");
+
+        let restored = StackReviewCommentRecord::from_json(
+            &serde_json::to_string(&json).unwrap(),
+            "base",
+            "head",
+        )
+        .unwrap();
+        let github = restored.github.unwrap();
+        assert_eq!(github.original_commit_oid, None);
+        assert_eq!(github.original_line, None);
+    }
 
     fn thread_record(
         id: &str,

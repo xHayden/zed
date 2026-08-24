@@ -9,6 +9,7 @@ use ::git::{
     status::FileStatus,
 };
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
+use markdown::{MarkdownElement, MarkdownFont, MarkdownStyle};
 use ui::CopyButton;
 
 pub(crate) fn format_stack_review_comment_timestamp_at_offset(
@@ -1230,6 +1231,26 @@ impl Editor {
         self.restore_stack_review_comments_with_stashed(comments, stashed_record_ids, false, cx);
         self.dismiss_empty_stack_review_projection_overlays(cx);
         self.reveal_restored_stack_review_comments(window, cx);
+        cx.notify();
+    }
+
+    pub fn replace_stack_review_agent_projection(
+        &mut self,
+        projections: HashMap<String, Vec<Entity<Markdown>>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_stack_review {
+            return;
+        }
+        self.stack_review_agent_projection_subscriptions.clear();
+        let mut observed = HashSet::default();
+        for markdown in projections.values().flatten() {
+            if observed.insert(markdown.entity_id()) {
+                self.stack_review_agent_projection_subscriptions
+                    .push(cx.observe(markdown, |_editor, _markdown, cx| cx.notify()));
+            }
+        }
+        self.stack_review_agent_projections = projections;
         cx.notify();
     }
 
@@ -3857,6 +3878,7 @@ impl Editor {
             pending_reply_to_record_id,
             is_stack_review,
             inline_editors,
+            agent_projections,
             user_avatar_uri,
             line_ranges,
         ) = editor_handle
@@ -3913,6 +3935,7 @@ impl Editor {
                     pending_reply_to_record_id,
                     editor.is_stack_review,
                     editors,
+                    editor.stack_review_agent_projections.clone(),
                     avatar_uri,
                     line_ranges,
                 )
@@ -3925,11 +3948,13 @@ impl Editor {
                 None,
                 false,
                 HashMap::default(),
+                HashMap::default(),
                 None,
                 None,
             ));
 
         let comment_count = comments.len();
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
         let avatar_size = px(20.);
         let action_icon_size = IconSize::XSmall;
         let close_editor = editor_handle.clone();
@@ -4047,6 +4072,8 @@ impl Editor {
                     pending_reply_to,
                     pending_reply_to_record_id.as_deref(),
                     is_stack_review,
+                    agent_projections,
+                    markdown_style,
                     prompt_editor.clone(),
                     inline_editors,
                     user_avatar_uri,
@@ -4067,6 +4094,8 @@ impl Editor {
         pending_reply_to: Option<usize>,
         pending_reply_to_record_id: Option<&str>,
         is_stack_review: bool,
+        agent_projections: HashMap<String, Vec<Entity<Markdown>>>,
+        markdown_style: MarkdownStyle,
         prompt_editor: Entity<Editor>,
         inline_editors: HashMap<ReviewCommentKey, Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
@@ -4148,12 +4177,20 @@ impl Editor {
                             reply_metadata,
                         } => {
                             let inline_editor = inline_editors.get(&comment.routing_key()).cloned();
+                            let agent_projection = comment
+                                .record_id
+                                .as_ref()
+                                .and_then(|record_id| agent_projections.get(record_id))
+                                .cloned()
+                                .unwrap_or_default();
                             Self::render_comment_row(
                                 comment,
                                 occurrence,
                                 depth,
                                 reply_metadata,
                                 is_stack_review,
+                                agent_projection,
+                                markdown_style.clone(),
                                 inline_editor,
                                 user_avatar_uri.clone(),
                                 avatar_size,
@@ -4256,6 +4293,8 @@ impl Editor {
         _depth: usize,
         reply_metadata: Option<StackReviewReplyMetadata>,
         is_stack_review: bool,
+        agent_projection: Vec<Entity<Markdown>>,
+        markdown_style: MarkdownStyle,
         inline_editor: Option<Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
         avatar_size: Pixels,
@@ -4273,6 +4312,7 @@ impl Editor {
         let delete_editor = editor_handle.clone();
         let checkpoint_editor = editor_handle.clone();
         let selection_editor = editor_handle.clone();
+        let keyboard_selection_editor = selection_editor.clone();
         let stash_editor = editor_handle.clone();
         let resolution_editor = editor_handle;
         let resolved = comment.resolved;
@@ -4296,6 +4336,7 @@ impl Editor {
         let edit_record_id = comment.record_id.clone();
         let delete_record_id = comment.record_id.clone();
         let selection_record_id = comment.record_id.clone();
+        let keyboard_selection_record_id = selection_record_id.clone();
         let stash_record_id = comment.record_id.clone();
         let content_selector = if is_stack_review {
             stack_review_comment_instance_debug_selector(
@@ -4361,6 +4402,25 @@ impl Editor {
             .opacity(if stashed { 0.6 } else { 1.0 })
             .id(row_selector.clone())
             .debug_selector(move || row_selector)
+            .when_some(keyboard_selection_record_id, move |row, record_id| {
+                row.cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label("Use review comment as Agent context")
+                    .tab_index(0)
+                    .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
+                        if event.keystroke.modifiers.modified()
+                            || !matches!(event.keystroke.key.as_str(), "enter" | "space")
+                        {
+                            return;
+                        }
+                        if let Some(editor) = keyboard_selection_editor.upgrade() {
+                            editor.update(cx, |editor, cx| {
+                                editor.request_stack_review_comment_selection(&record_id, cx);
+                            });
+                        }
+                        cx.stop_propagation();
+                    })
+            })
             .when_some(selection_record_id, move |row, record_id| {
                 row.on_click(move |_, _, cx| {
                     if let Some(editor) = selection_editor.upgrade() {
@@ -4425,6 +4485,15 @@ impl Editor {
                         )
                     })
                     .child(comment_content)
+                    .children(agent_projection.into_iter().map(|markdown| {
+                        div()
+                            .id(("stack-review-agent-response", markdown.entity_id()))
+                            .w_full()
+                            .role(gpui::Role::Group)
+                            .aria_label("Agent response")
+                            .debug_selector(|| "STACK_REVIEW_AGENT_RESPONSE".into())
+                            .child(MarkdownElement::new(markdown, markdown_style.clone()))
+                    }))
                     .into_any_element()
             } else {
                 div().flex_1().child(comment_content).into_any_element()

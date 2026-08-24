@@ -2450,11 +2450,17 @@ const AI_ACTION_NAMESPACES: &[&str] = &[
     "zeta::",
 ];
 
+const AI_ACTION_NAMES: &[&str] = &[
+    "git::StackReviewUseFileInAgent",
+    "git::StackReviewOpenAgent",
+];
+
 fn is_ai_keybinding(binding: &KeyBinding) -> bool {
     let name = binding.action().name();
-    AI_ACTION_NAMESPACES
-        .iter()
-        .any(|namespace| name.starts_with(namespace))
+    AI_ACTION_NAMES.contains(&name)
+        || AI_ACTION_NAMESPACES
+            .iter()
+            .any(|namespace| name.starts_with(namespace))
 }
 
 fn filter_disabled_ai_bindings(bindings: Vec<KeyBinding>, cx: &App) -> Vec<KeyBinding> {
@@ -6382,6 +6388,14 @@ mod tests {
                 has_ai_binding,
                 "expected AI-namespaced bindings in the default keymap before disabling AI"
             );
+            for action_name in AI_ACTION_NAMES {
+                assert!(
+                    keymap
+                        .bindings()
+                        .any(|binding| binding.action().name() == *action_name),
+                    "expected `{action_name}` in the enabled default keymap"
+                );
+            }
         });
 
         cx.update(|cx| {
@@ -6405,6 +6419,14 @@ mod tests {
                 panic!(
                     "expected no AI-namespaced bindings after disabling AI, but found `{}`",
                     binding.action().name()
+                );
+            }
+            for action_name in AI_ACTION_NAMES {
+                assert!(
+                    keymap
+                        .bindings()
+                        .all(|binding| binding.action().name() != *action_name),
+                    "expected `{action_name}` to be removed when AI is disabled"
                 );
             }
         });

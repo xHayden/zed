@@ -7,13 +7,16 @@ use acp_thread::{
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
-use agent::{NativeAgentServer, NoModelConfiguredError, ThreadStore};
+use agent::{
+    NativeAgentServer, NoModelConfiguredError, StackReviewThreadOrigin, ThreadCreationOptions,
+    ThreadStore,
+};
 use agent_client_protocol::schema::v1 as acp;
 #[cfg(test)]
 use agent_servers::AgentServerDelegate;
 use agent_servers::{AgentServer, GEMINI_TERMINAL_AUTH_METHOD_ID};
 use agent_settings::{AgentProfileId, AgentSettings};
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;
@@ -596,6 +599,7 @@ pub struct ConversationView {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     thread_store: Option<Entity<ThreadStore>>,
+    stack_review_origin: Option<StackReviewThreadOrigin>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp::SessionId>,
     server_state: ServerState,
@@ -663,6 +667,17 @@ impl ConversationView {
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
+    }
+
+    pub(crate) fn stack_review_origin(&self) -> Option<&StackReviewThreadOrigin> {
+        self.stack_review_origin.as_ref()
+    }
+
+    pub(crate) fn load_error(&self) -> Option<SharedString> {
+        match &self.server_state {
+            ServerState::LoadError { error } => Some(error.to_string().into()),
+            ServerState::Loading { .. } | ServerState::Connected(_) => None,
+        }
     }
 
     pub fn root_thread_view(&self) -> Option<Entity<ThreadView>> {
@@ -813,6 +828,78 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_stack_review_origin(
+            agent,
+            connection_store,
+            connection_key,
+            resume_session_id,
+            thread_id,
+            work_dirs,
+            title,
+            initial_content,
+            workspace,
+            project,
+            thread_store,
+            None,
+            source,
+            window,
+            cx,
+        )
+    }
+
+    pub(crate) fn new_stack_review(
+        agent: Rc<dyn AgentServer>,
+        connection_store: Entity<AgentConnectionStore>,
+        connection_key: Agent,
+        resume_session_id: Option<acp::SessionId>,
+        thread_id: Option<ThreadId>,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        initial_content: Option<AgentInitialContent>,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        thread_store: Option<Entity<ThreadStore>>,
+        stack_review_origin: StackReviewThreadOrigin,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_stack_review_origin(
+            agent,
+            connection_store,
+            connection_key,
+            resume_session_id,
+            thread_id,
+            work_dirs,
+            title,
+            initial_content,
+            workspace,
+            project,
+            thread_store,
+            Some(stack_review_origin),
+            source,
+            window,
+            cx,
+        )
+    }
+
+    fn new_with_stack_review_origin(
+        agent: Rc<dyn AgentServer>,
+        connection_store: Entity<AgentConnectionStore>,
+        connection_key: Agent,
+        resume_session_id: Option<acp::SessionId>,
+        thread_id: Option<ThreadId>,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        initial_content: Option<AgentInitialContent>,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        thread_store: Option<Entity<ThreadStore>>,
+        stack_review_origin: Option<StackReviewThreadOrigin>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let agent_server_store = project.read(cx).agent_server_store().clone();
         let code_span_resolver = AgentCodeSpanResolver::new(&project.downgrade(), cx);
         let mut subscriptions = vec![
@@ -866,6 +953,7 @@ impl ConversationView {
             workspace,
             project: project.clone(),
             thread_store,
+            stack_review_origin: stack_review_origin.clone(),
             thread_id,
             root_session_id: resume_session_id.clone(),
             server_state: Self::initial_state(
@@ -877,6 +965,7 @@ impl ConversationView {
                 title,
                 project,
                 initial_content,
+                stack_review_origin,
                 source,
                 window,
                 cx,
@@ -967,6 +1056,62 @@ impl ConversationView {
             .request_elicitations()
     }
 
+    fn validate_stack_review_thread(
+        connection: &Rc<dyn AgentConnection>,
+        thread: &Entity<AcpThread>,
+        expected_origin: &StackReviewThreadOrigin,
+        cx: &App,
+    ) -> Result<()> {
+        let native_connection = connection
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+            .context("Stack Review requires Zed's native Agent connection")?;
+        let session_id = thread.read(cx).session_id();
+        let native_thread = native_connection
+            .thread(session_id, cx)
+            .context("Stack Review native thread is unavailable")?;
+        let native_thread = native_thread.read(cx);
+        anyhow::ensure!(
+            native_thread.execution_policy() == acp_thread::ThreadExecutionPolicy::ReadOnly,
+            "Stack Review Agent thread is not read-only"
+        );
+        anyhow::ensure!(
+            native_thread.stack_review_origin() == Some(expected_origin),
+            "Stack Review Agent thread origin does not match the immutable review context"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_stack_review_submission(&self, cx: &App) -> Result<()> {
+        let thread = self
+            .root_thread(cx)
+            .context("Stack Review Agent thread is still loading")?;
+        self.validate_stack_review_submission_for_thread(&thread, cx)
+    }
+
+    pub(crate) fn validate_stack_review_submission_for_thread(
+        &self,
+        thread: &Entity<AcpThread>,
+        cx: &App,
+    ) -> Result<()> {
+        let expected_origin = self
+            .stack_review_origin
+            .as_ref()
+            .context("Agent conversation is not a Stack Review thread")?;
+        let connection = self
+            .as_connected()
+            .map(|connected| connected.connection.clone())
+            .context("Stack Review Agent connection is unavailable")?;
+        match &self.connection_key {
+            Agent::NativeAgent => {
+                Self::validate_stack_review_thread(&connection, thread, expected_origin, cx)
+            }
+            Agent::Custom { .. } => Ok(()),
+            #[cfg(any(test, feature = "test-support"))]
+            Agent::Stub => Ok(()),
+        }
+    }
+
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (resume_session_id, work_dirs, title) = self
             .root_thread_view()
@@ -1004,6 +1149,7 @@ impl ConversationView {
             title,
             self.project.clone(),
             None,
+            self.stack_review_origin.clone(),
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -1029,6 +1175,7 @@ impl ConversationView {
         title: Option<SharedString>,
         project: Entity<Project>,
         initial_content: Option<AgentInitialContent>,
+        stack_review_origin: Option<StackReviewThreadOrigin>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1135,9 +1282,21 @@ impl ConversationView {
                 .log_err()
             } else {
                 cx.update(|_, cx| {
-                    connection
-                        .clone()
-                        .new_session(project.clone(), session_work_dirs, cx)
+                    if let Some(origin) = stack_review_origin.clone()
+                        && let Some(native_connection) = connection
+                            .clone()
+                            .downcast::<agent::NativeAgentConnection>()
+                    {
+                        native_connection.new_session_with_options(
+                            project.clone(),
+                            ThreadCreationOptions::stack_review(origin),
+                            cx,
+                        )
+                    } else {
+                        connection
+                            .clone()
+                            .new_session(project.clone(), session_work_dirs, cx)
+                    }
                 })
                 .log_err()
             };
@@ -1158,6 +1317,54 @@ impl ConversationView {
                     Err(err) => Err(err),
                 },
                 Ok(thread) => Ok(thread),
+            };
+            let result = match result {
+                Ok(thread) => {
+                    let validation = if let Some(expected_origin) = stack_review_origin.as_ref()
+                        && connection
+                            .clone()
+                            .downcast::<agent::NativeAgentConnection>()
+                            .is_some()
+                    {
+                        match cx.update(|_, cx| {
+                            Self::validate_stack_review_thread(
+                                &connection,
+                                &thread,
+                                expected_origin,
+                                cx,
+                            )
+                        }) {
+                            Ok(validation) => validation,
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        Ok(())
+                    };
+                    match validation {
+                        Ok(()) => Ok(thread),
+                        Err(error) => {
+                            let session_id =
+                                match cx.update(|_, cx| thread.read(cx).session_id().clone()) {
+                                    Ok(session_id) => session_id,
+                                    Err(read_error) => {
+                                        anyhow::Result::<()>::Err(read_error).log_err();
+                                        return;
+                                    }
+                                };
+                            if connection.supports_close_session()
+                                && let Some(close_task) = cx
+                                    .update(|_, cx| {
+                                        connection.clone().close_session(&session_id, cx)
+                                    })
+                                    .log_err()
+                            {
+                                close_task.await.log_err();
+                            }
+                            Err(error)
+                        }
+                    }
+                }
+                Err(error) => Err(error),
             };
 
             this.update_in(cx, |this, window, cx| {
@@ -3666,7 +3873,7 @@ fn plan_label_markdown_style(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use acp_thread::StubAgentConnection;
+    use acp_thread::{AgentSessionModes as _, StubAgentConnection, StubAgentSessionModes};
     use action_log::ActionLog;
     use agent::{AgentTool, EditFileTool, FetchTool, TerminalTool, ToolPermissionContext};
     use agent_servers::FakeAcpAgentServer;
@@ -3705,6 +3912,113 @@ pub(crate) mod tests {
             matches!(error, ThreadError::DataRetentionConsentRequired),
             "expected ThreadError::DataRetentionConsentRequired, got: {error:?}"
         );
+    }
+
+    #[gpui::test]
+    async fn stack_review_external_agent_preserves_write_capable_mode(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+        let modes = StubAgentSessionModes::new(
+            acp::SessionModeId::new("default"),
+            vec![
+                acp::SessionMode::new("default", "Manual"),
+                acp::SessionMode::new("plan", "Plan Mode"),
+            ],
+        );
+        let connection = StubAgentConnection::new().with_session_modes(modes.clone());
+        let origin = StackReviewThreadOrigin {
+            project_identity: "project".into(),
+            storage_key: "base-head".into(),
+            context_key: "review:9:base-head".into(),
+            base_oid: "base".into(),
+            head_oid: "head".into(),
+        };
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new_stack_review(
+                    Rc::new(StubAgentServer::new(connection.clone())),
+                    connection_store,
+                    Agent::Custom {
+                        id: "claude-acp".into(),
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    origin,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        assert_eq!(modes.current_mode().0.as_ref(), "default");
+        let thread = conversation_view
+            .read_with(cx, |view, cx| view.root_thread(cx))
+            .expect("external Stack Review thread");
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.execution_policy()),
+            acp_thread::ThreadExecutionPolicy::Standard
+        );
+        let thread_view = conversation_view
+            .read_with(cx, |view, _| view.root_thread_view())
+            .expect("external ThreadView");
+        assert!(thread_view.read_with(cx, |thread_view, _| thread_view.mode_selector.is_some()));
+        assert!(
+            conversation_view
+                .read_with(cx, |view, cx| view.validate_stack_review_submission(cx))
+                .is_ok(),
+            "write-capable external modes must remain valid for Stack Review"
+        );
+        cx.update(|window, cx| {
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view
+                    .submit_content_blocks(
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "first write",
+                        ))],
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                thread_view
+                    .submit_content_blocks(
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "second write",
+                        ))],
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                assert!(thread_view.is_loading_contents);
+                assert_eq!(
+                    thread_view.message_queue.len(),
+                    1,
+                    "a rapid second Stack Review prompt must enter the normal Agent FIFO"
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            thread.read_with(cx, |thread, _| !thread.entries().is_empty()),
+            "external Stack Review submissions must reach the normal Agent send path"
+        );
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
     }
 
     #[gpui::test]

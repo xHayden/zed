@@ -40830,6 +40830,42 @@ fn test_stack_review_deep_chain_renders_flat_with_direct_parent_metadata(cx: &mu
 }
 
 #[gpui::test]
+fn test_stack_review_agent_projection_renders_inside_target_comment(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("line\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+        editor.enable_stack_review_mode(cx);
+        let prompt_editor = editor
+            .diff_review_prompt_editor()
+            .cloned()
+            .expect("review prompt");
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.insert("@agent explain this", window, cx);
+        });
+        editor.submit_diff_review_comment(window, cx);
+        editor.stored_review_comments[0].1[0].record_id = Some("agent-target".into());
+
+        let markdown = cx.new(|cx| Markdown::new("Agent response".into(), None, None, cx));
+        let mut projections = collections::HashMap::default();
+        projections.insert("agent-target".into(), vec![markdown]);
+        editor.replace_stack_review_agent_projection(projections, cx);
+    });
+
+    cx.run_until_parked();
+    let response_bounds = cx
+        .debug_bounds("STACK_REVIEW_AGENT_RESPONSE")
+        .expect("agent response must render inside its target comment");
+    assert!(response_bounds.size.width > px(0.));
+    assert!(response_bounds.size.height > px(0.));
+}
+
+#[gpui::test]
 fn test_stack_review_reply_composer_renders_full_width_with_target_metadata(
     cx: &mut TestAppContext,
 ) {

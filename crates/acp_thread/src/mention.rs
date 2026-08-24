@@ -118,6 +118,7 @@ pub enum MentionUri {
         selected_record_id: Option<String>,
         root_record_id: Option<String>,
     },
+    StackReviewTurn,
 }
 
 impl MentionUri {
@@ -324,6 +325,12 @@ impl MentionUri {
                         "Stack Review mention URI is not canonical"
                     );
                     Ok(mention)
+                } else if path == "/agent/stack-review-turn" {
+                    anyhow::ensure!(
+                        url.query().is_none() && url.fragment().is_none(),
+                        "Stack Review turn URI is not canonical"
+                    );
+                    Ok(Self::StackReviewTurn)
                 } else {
                     bail!("invalid zed url: {:?}", input);
                 }
@@ -380,7 +387,8 @@ impl MentionUri {
             | MentionUri::TerminalSelection { .. }
             | MentionUri::GitDiff { .. }
             | MentionUri::MergeConflict { .. }
-            | MentionUri::StackReview { .. } => None,
+            | MentionUri::StackReview { .. }
+            | MentionUri::StackReviewTurn => None,
         }
     }
 
@@ -440,6 +448,7 @@ impl MentionUri {
                     format!("{label} ({})", side.as_str())
                 }
             }
+            MentionUri::StackReviewTurn => "Stack Review context".to_string(),
         }
     }
 
@@ -528,6 +537,7 @@ impl MentionUri {
                 }
                 Some(label.into())
             }
+            MentionUri::StackReviewTurn => Some("Immutable Stack Review turn metadata".into()),
             _ => None,
         }
     }
@@ -550,7 +560,9 @@ impl MentionUri {
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
             MentionUri::Skill { .. } => IconName::Sparkle.path().into(),
-            MentionUri::StackReview { .. } => IconName::GitBranch.path().into(),
+            MentionUri::StackReview { .. } | MentionUri::StackReviewTurn => {
+                IconName::GitBranch.path().into()
+            }
         }
     }
 
@@ -718,6 +730,7 @@ impl MentionUri {
                 drop(query);
                 url
             }
+            MentionUri::StackReviewTurn => Url::parse("zed:///agent/stack-review-turn").unwrap(),
         }
     }
 }

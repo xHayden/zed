@@ -32,6 +32,8 @@ use crate::ui::{
 use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
+use git_ui_core::stack_review_ai::StackReviewAiStatus;
+
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
@@ -630,6 +632,7 @@ pub struct ThreadView {
     /// Cloned from the parent `ConversationView` so the cache is shared and the
     /// snapshot stays in sync via the parent's project-event subscription.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
+
     pub show_external_source_prompt_warning: bool,
     pub show_codex_windows_warning: bool,
     sandbox_status: Option<VerifiedSandboxStatus>,
@@ -654,6 +657,29 @@ impl Focusable for ThreadView {
 }
 
 impl ThreadView {
+    pub(crate) fn stack_review_error_status(&self) -> Option<StackReviewAiStatus> {
+        match self.thread_error.as_ref()? {
+            ThreadError::NoModelSelected => Some(StackReviewAiStatus::NoModel),
+            ThreadError::AuthenticationRequired(message) | ThreadError::Other { message, .. } => {
+                Some(StackReviewAiStatus::Failed(message.clone()))
+            }
+            ThreadError::NoCredentials { provider }
+            | ThreadError::AuthenticationFailed { provider }
+            | ThreadError::ApiError { provider }
+            | ThreadError::RateLimitExceeded { provider }
+            | ThreadError::ServerOverloaded { provider }
+            | ThreadError::StreamError { provider } => Some(StackReviewAiStatus::Failed(
+                format!("Agent provider error: {provider}").into(),
+            )),
+            ThreadError::PermissionDenied { message, .. } => Some(StackReviewAiStatus::Failed(
+                message
+                    .clone()
+                    .unwrap_or_else(|| "Agent permission was denied".into()),
+            )),
+            error => Some(StackReviewAiStatus::Failed(format!("{error:?}").into())),
+        }
+    }
+
     pub(crate) fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
         if self.parent_session_id.is_some() {
             self.focus_handle.clone()
@@ -1040,6 +1066,7 @@ impl ThreadView {
             fast_mode_menu_handle: PopoverMenuHandle::default(),
             project,
             code_span_resolver,
+
             show_external_source_prompt_warning,
             show_codex_windows_warning,
             sandbox_status: None,
@@ -1622,6 +1649,56 @@ impl ThreadView {
     ) {
         let contents = self.resolve_message_contents(&message_editor, cx);
 
+        self.prepare_user_send(window, cx);
+
+        let contents_task = cx.spawn_in(window, async move |_this, cx| {
+            let (mut contents, tracked_buffers) = contents.await?;
+
+            if contents.is_empty() {
+                return Ok(None);
+            }
+
+            crate::stack_review_ai::renew_stack_review_turn_envelope(&mut contents)?;
+
+            let _ = cx.update(|window, cx| {
+                message_editor.update(cx, |message_editor, cx| {
+                    message_editor.clear_after_send(window, cx);
+                });
+            });
+
+            Ok(Some((contents, tracked_buffers)))
+        });
+
+        self.send_content(contents_task, false, window, cx);
+    }
+
+    pub(crate) fn submit_content_blocks(
+        &mut self,
+        contents: Vec<acp::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(!contents.is_empty(), "Agent message content is empty");
+        anyhow::ensure!(
+            self.thread.read(cx).prompt_capabilities().embedded_context,
+            "Agent does not support embedded Stack Review context"
+        );
+        cx.emit(AcpThreadViewEvent::Interacted);
+        self.prepare_user_send(window, cx);
+        if self.is_loading_contents || self.thread.read(cx).status() != ThreadStatus::Idle {
+            self.add_to_queue(contents, Vec::new(), window, cx);
+            return Ok(());
+        }
+        self.send_content(
+            Task::ready(Ok(Some((contents, Vec::new())))),
+            false,
+            window,
+            cx,
+        );
+        Ok(())
+    }
+
+    fn prepare_user_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.thread_error.take();
         self.thread_feedback.clear();
         self.editing_message.take();
@@ -1636,24 +1713,6 @@ impl ThreadView {
                 })
                 .ok();
         }
-
-        let contents_task = cx.spawn_in(window, async move |_this, cx| {
-            let (contents, tracked_buffers) = contents.await?;
-
-            if contents.is_empty() {
-                return Ok(None);
-            }
-
-            let _ = cx.update(|window, cx| {
-                message_editor.update(cx, |message_editor, cx| {
-                    message_editor.clear(window, cx);
-                });
-            });
-
-            Ok(Some((contents, tracked_buffers)))
-        });
-
-        self.send_content(contents_task, false, window, cx);
     }
 
     pub fn send_content(
@@ -1686,6 +1745,18 @@ impl ThreadView {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
             };
+
+            this.update(cx, |this, cx| -> anyhow::Result<()> {
+                let Some(conversation_view) = this.server_view.upgrade() else {
+                    return Ok(());
+                };
+                let conversation_view = conversation_view.read(cx);
+                if conversation_view.stack_review_origin().is_some() {
+                    conversation_view
+                        .validate_stack_review_submission_for_thread(&this.thread, cx)?;
+                }
+                Ok(())
+            })??;
 
             let generation = this.update(cx, |this, cx| {
                 this.clear_external_source_prompt_warning(cx);
@@ -12675,7 +12746,7 @@ pub(crate) fn open_link(
                     )
                     .detach_and_log_err(cx);
             }
-            MentionUri::StackReview { .. } => {}
+            MentionUri::StackReview { .. } | MentionUri::StackReviewTurn => {}
         })
     } else {
         workspace.update(cx, |workspace, cx| {

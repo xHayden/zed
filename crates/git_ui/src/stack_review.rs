@@ -1,7 +1,7 @@
 use crate::multi_diff_view::{ContentDiffEntry, MultiDiffView};
 use anyhow::{Context as _, Result, anyhow};
 use editor::{Editor, EditorEvent, scroll::Autoscroll};
-use feature_flags::{FeatureFlagAppExt as _, StackReviewFeatureFlag};
+
 use fs::{Fs, RemoveOptions};
 use futures::{StreamExt as _, channel::oneshot};
 use git::{
@@ -18,15 +18,17 @@ use git::{
 };
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DragMoveEvent,
-    Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Pixels, PromptLevel,
-    Render, SharedString, Subscription, Task, Window, actions, deferred, prelude::*, px,
-    uniform_list,
+    Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Pixels,
+    PromptLevel, Render, SharedString, Subscription, Task, Window, actions, deferred, prelude::*,
+    px, uniform_list,
 };
 use language::Point;
-use project::{Project, git_store::Repository};
+
+use project::{DisableAiSettings, Project, git_store::Repository};
+use settings::Settings as _;
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     path::{Path, PathBuf},
     sync::{
@@ -65,6 +67,10 @@ actions!(
         StackReviewToggleTests,
         /// Shows or hides migration files in Stack Review.
         StackReviewToggleMigrations,
+        /// Uses the selected immutable file as Agent context.
+        StackReviewUseFileInAgent,
+        /// Opens or starts the Agent thread for the selected context.
+        StackReviewOpenAgent,
     ]
 );
 
@@ -478,6 +484,16 @@ fn github_comment_records(
                     .get("commit_id")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
+                original_commit_oid: value
+                    .get("original_commit_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                original_line: value
+                    .get("original_line")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|line| u32::try_from(line.saturating_sub(1)))
+                    .transpose()
+                    .context("GitHub original line exceeds u32")?,
             },
             current_line.is_none() || thread_outdated || force_outdated,
         );
@@ -542,6 +558,8 @@ fn github_comment_records(
                         .get("commit_id")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
+                    original_commit_oid: None,
+                    original_line: None,
                 },
             );
             record.updated_at = value
@@ -1731,6 +1749,15 @@ fn projected_reply_to_record_id(
     })
 }
 
+fn github_base_projection_row(record: &StackReviewCommentRecord, base_oid: &str) -> Option<u32> {
+    let github = record.github.as_ref()?;
+    (github.kind == StackReviewGitHubCommentKind::Inline
+        && github.original_commit_oid.as_deref() == Some(base_oid)
+        && record.side == StackReviewCommentSide::Right)
+        .then_some(github.original_line)
+        .flatten()
+}
+
 fn project_comment_records(
     records: &HashMap<String, LoadedCommentRecord>,
     storage_key: &str,
@@ -1773,10 +1800,12 @@ fn project_comment_records(
         .flat_map(|thread| thread.member_record_ids.iter())
         .filter_map(|record_id| records.get(record_id))
         .filter(|loaded| {
-            matches!(
+            let has_inline_projection = matches!(
                 loaded.record.side,
                 StackReviewCommentSide::Left | StackReviewCommentSide::Right
-            ) && !loaded.record.outdated
+            ) && !loaded.record.outdated;
+            (has_inline_projection
+                || github_base_projection_row(&loaded.record, base_oid).is_some())
                 && (include_resolved || !loaded.record.is_resolved())
                 && (show_stashed || !stashed_record_ids.contains(&loaded.record.id))
         })
@@ -1814,6 +1843,16 @@ fn project_comment_records(
                 loaded.record.id.clone(),
             );
         }
+        if github_base_projection_row(&loaded.record, base_oid).is_some()
+            && let Some(editor_id) = editor_id_by_record_id.get(&loaded.record.id).copied()
+        {
+            bind_editor_comment_record_id(
+                &mut record_id_by_editor_id,
+                StackReviewCommentSide::Left,
+                editor_id,
+                loaded.record.id.clone(),
+            );
+        }
     }
     let comments = inline_records
         .into_iter()
@@ -1822,31 +1861,41 @@ fn project_comment_records(
                 .get(&loaded.record.id)
                 .copied()
                 .context("projected comment has no editor id")?;
-            Ok((
-                loaded.record.side,
-                StackReviewComment {
-                    id: editor_id,
-                    record_id: Some(loaded.record.id.clone()),
-                    path: loaded.record.path.clone().unwrap_or_default(),
-                    start_row: loaded.record.start_row.unwrap_or_default(),
-                    start_column: loaded.record.start_column.unwrap_or_default(),
-                    end_row: loaded.record.end_row.unwrap_or_default(),
-                    end_column: loaded.record.end_column.unwrap_or_default(),
-                    body: loaded.record.body.clone(),
-                    created_at: loaded.record.created_at.clone(),
-                    resolved: loaded.record.is_resolved(),
-                    author: loaded.record.author.clone(),
-                    source: loaded.record.source,
-                    reply_to: loaded
-                        .record
-                        .reply_to
-                        .as_ref()
-                        .and_then(|reply_to| editor_id_by_record_id.get(reply_to).copied()),
-                    reply_to_record_id: loaded.record.reply_to.clone(),
-                },
-            ))
+            let comment = StackReviewComment {
+                id: editor_id,
+                record_id: Some(loaded.record.id.clone()),
+                path: loaded.record.path.clone().unwrap_or_default(),
+                start_row: loaded.record.start_row.unwrap_or_default(),
+                start_column: loaded.record.start_column.unwrap_or_default(),
+                end_row: loaded.record.end_row.unwrap_or_default(),
+                end_column: loaded.record.end_column.unwrap_or_default(),
+                body: loaded.record.body.clone(),
+                created_at: loaded.record.created_at.clone(),
+                resolved: loaded.record.is_resolved(),
+                author: loaded.record.author.clone(),
+                source: loaded.record.source,
+                reply_to: loaded
+                    .record
+                    .reply_to
+                    .as_ref()
+                    .and_then(|reply_to| editor_id_by_record_id.get(reply_to).copied()),
+                reply_to_record_id: loaded.record.reply_to.clone(),
+            };
+            let mut projections = Vec::with_capacity(2);
+            if !loaded.record.outdated {
+                projections.push((loaded.record.side, comment.clone()));
+            }
+            if let Some(original_row) = github_base_projection_row(&loaded.record, base_oid) {
+                let mut historical = comment;
+                historical.start_row = original_row;
+                historical.end_row = original_row;
+                projections.push((StackReviewCommentSide::Left, historical));
+            }
+            Ok(projections)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten();
     let mut comments_by_path = HashMap::<String, FileCommentProjection>::new();
     for (side, comment) in comments {
         let projection = comments_by_path.entry(comment.path.clone()).or_default();
@@ -2101,6 +2150,60 @@ pub enum StackReviewAiContextSelection {
     Comment {
         selected_record_id: String,
     },
+}
+
+fn stack_review_agent_comment_prompt(value: &str) -> Option<String> {
+    let remainder = value.trim().strip_prefix("@agent")?;
+    if !remainder.is_empty() && !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let prompt = remainder.trim();
+    (!prompt.is_empty()).then(|| prompt.to_owned())
+}
+
+fn default_stack_review_ai_code_selection(
+    files: &[StackReviewFileItem],
+    content_entries: &[ContentDiffEntry],
+    file_index: usize,
+) -> Result<StackReviewAiContextSelection> {
+    let file = files
+        .get(file_index)
+        .context("Stack Review AI selected file is unavailable")?;
+    let entry = content_entries
+        .get(file_index)
+        .context("Stack Review AI selected endpoint content is unavailable")?;
+    anyhow::ensure!(
+        entry.path.to_string_lossy().as_ref() == file.path.as_ref(),
+        "Stack Review AI file inventory and content disagree"
+    );
+    let side = if stack_review_file_side_exists(file.status, StackReviewCommentSide::Right) {
+        StackReviewCommentSide::Right
+    } else {
+        anyhow::ensure!(
+            stack_review_file_side_exists(file.status, StackReviewCommentSide::Left),
+            "Stack Review AI selected file has no endpoint side"
+        );
+        StackReviewCommentSide::Left
+    };
+    let line_range = if file.content_kind == StackReviewContentKind::Text {
+        let text = match side {
+            StackReviewCommentSide::Left => entry.old_text.as_ref(),
+            StackReviewCommentSide::Right => entry.new_text.as_ref(),
+            StackReviewCommentSide::TopLevel => {
+                anyhow::bail!("Top-level Stack Review context has no code side")
+            }
+        };
+        let line_count = u32::try_from(text.lines().count()).unwrap_or(u32::MAX);
+        anyhow::ensure!(line_count > 0, "Stack Review AI selected file is empty");
+        Some(0..line_count.min(STACK_REVIEW_AI_MAX_CODE_LINES))
+    } else {
+        None
+    };
+    Ok(StackReviewAiContextSelection::Code {
+        file_index,
+        side,
+        line_range,
+    })
 }
 
 fn bounded_stack_review_code(
@@ -2731,13 +2834,23 @@ fn build_stack_review_ai_comment_context(
     let storage_key = stack_review_storage_key(&review_state.base_oid, &review_state.head_oid);
     let selected_record = &selected.record;
 
-    let selected_line_range = match (
-        selected_record.start_row,
-        selected_record.end_row,
-        selected_record.outdated,
-    ) {
-        (Some(start), Some(end), false) => Some(start..end.saturating_add(1)),
-        _ => None,
+    let (selected_side, selected_line_range) = if !selected_record.outdated {
+        (
+            selected_record.side,
+            selected_record
+                .start_row
+                .zip(selected_record.end_row)
+                .map(|(start, end)| start..end.saturating_add(1)),
+        )
+    } else if let Some(original_row) =
+        github_base_projection_row(selected_record, &review_state.base_oid)
+    {
+        (
+            StackReviewCommentSide::Left,
+            Some(original_row..original_row.saturating_add(1)),
+        )
+    } else {
+        (selected_record.side, None)
     };
     let file_index = selected_record.path.as_ref().and_then(|path| {
         content_entries
@@ -2752,7 +2865,7 @@ fn build_stack_review_ai_comment_context(
             files,
             content_entries,
             file_index,
-            selected_record.side,
+            selected_side,
             Some(line_range),
         )?
     } else {
@@ -2763,7 +2876,7 @@ fn build_stack_review_ai_comment_context(
             base_oid: review_state.base_oid.clone().into(),
             head_oid: review_state.head_oid.clone().into(),
             path: None,
-            side: Some(selected_record.side),
+            side: Some(selected_side),
             line_range: None,
             selected_record_id: Some(selected_record_id.to_owned().into()),
             resources: Vec::new().into(),
@@ -3171,6 +3284,58 @@ struct LoadedStackReview {
     github_comments_directory: PathBuf,
 }
 
+type PendingStackReviewAiPrompt = (
+    git_ui_core::stack_review_ai::StackReviewAiGeneration,
+    String,
+    git_ui_core::stack_review_ai::StackReviewAiContext,
+);
+type PendingStackReviewAiPrompts = HashMap<
+    git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    VecDeque<PendingStackReviewAiPrompt>,
+>;
+
+fn enqueue_pending_stack_review_ai_prompt(
+    pending: &mut PendingStackReviewAiPrompts,
+    context_key: git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    prompt: PendingStackReviewAiPrompt,
+) {
+    pending.entry(context_key).or_default().push_back(prompt);
+}
+
+fn enqueue_pending_stack_review_ai_prompt_for_activation(
+    pending: &mut PendingStackReviewAiPrompts,
+    active_generations: &HashMap<
+        git_ui_core::stack_review_ai::StackReviewAiContextKey,
+        git_ui_core::stack_review_ai::StackReviewAiGeneration,
+    >,
+    context_key: &git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    prompt: String,
+    context: git_ui_core::stack_review_ai::StackReviewAiContext,
+) -> bool {
+    let Some(generation) = active_generations.get(context_key).copied() else {
+        return false;
+    };
+    enqueue_pending_stack_review_ai_prompt(
+        pending,
+        context_key.clone(),
+        (generation, prompt, context),
+    );
+    true
+}
+
+fn take_pending_stack_review_ai_prompts(
+    pending: &mut PendingStackReviewAiPrompts,
+    context_key: &git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    generation: git_ui_core::stack_review_ai::StackReviewAiGeneration,
+) -> Vec<PendingStackReviewAiPrompt> {
+    pending
+        .remove(context_key)
+        .into_iter()
+        .flatten()
+        .filter(|(pending_generation, _, _)| *pending_generation == generation)
+        .collect()
+}
+
 pub struct StackReview {
     snapshot: StackSnapshot,
     current_layer: usize,
@@ -3218,6 +3383,23 @@ pub struct StackReview {
     selected_comment_record_id: Option<String>,
     pending_comment_reveal: Option<PendingCommentReveal>,
     pending_citation_reveal: Option<StackReviewCitationTarget>,
+    ai_generation: git_ui_core::stack_review_ai::StackReviewAiGeneration,
+    ai_context: Option<git_ui_core::stack_review_ai::StackReviewAiContext>,
+    ai_projection: Option<Entity<git_ui_core::stack_review_ai::StackReviewAiProjection>>,
+    ai_projections: HashMap<
+        git_ui_core::stack_review_ai::StackReviewAiContextKey,
+        Entity<git_ui_core::stack_review_ai::StackReviewAiProjection>,
+    >,
+    ai_projected_turn_ids: HashSet<EntityId>,
+
+    ai_error: Option<SharedString>,
+    ai_activation_tasks: HashMap<git_ui_core::stack_review_ai::StackReviewAiContextKey, Task<()>>,
+    ai_activation_generations: HashMap<
+        git_ui_core::stack_review_ai::StackReviewAiContextKey,
+        git_ui_core::stack_review_ai::StackReviewAiGeneration,
+    >,
+    pending_ai_prompts: PendingStackReviewAiPrompts,
+    ai_projection_subscriptions: Vec<Subscription>,
     selected_commenter: Option<String>,
     reviewer_login: Option<String>,
     refreshed_github_snapshots: HashSet<String>,
@@ -3271,20 +3453,514 @@ impl StackReview {
         Ok(context)
     }
 
+    fn refresh_ai_comment_projection(&mut self, cx: &mut Context<Self>) {
+        let mut projections =
+            collections::HashMap::<String, Vec<Entity<markdown::Markdown>>>::default();
+        let mut projected_turn_ids = HashSet::new();
+        for projection in self.ai_projections.values() {
+            for turn in projection.read(cx).assistant_turns() {
+                if let Some(target) = turn.projection_target() {
+                    let markdown = turn.markdown();
+                    let target_turns = projections.entry(target.to_string()).or_default();
+                    if !target_turns
+                        .iter()
+                        .any(|existing| existing.entity_id() == markdown.entity_id())
+                    {
+                        projected_turn_ids.insert(markdown.entity_id());
+                        target_turns.push(markdown.clone());
+                    }
+                }
+            }
+        }
+        if projected_turn_ids == self.ai_projected_turn_ids {
+            return;
+        }
+        self.ai_projected_turn_ids = projected_turn_ids;
+        if let Some(diff_view) = &self.diff_view {
+            diff_view.read(cx).editor().update(cx, |editor, cx| {
+                editor.replace_stack_review_agent_projection(projections.clone(), cx);
+            });
+            if let Some(left_editor) = diff_view.read(cx).left_editor(cx) {
+                left_editor.update(cx, |editor, cx| {
+                    editor.replace_stack_review_agent_projection(projections, cx);
+                });
+            }
+        }
+    }
+
+    fn sync_ai_projection(
+        &mut self,
+        projection: &Entity<git_ui_core::stack_review_ai::StackReviewAiProjection>,
+        context_key: &git_ui_core::stack_review_ai::StackReviewAiContextKey,
+        generation: git_ui_core::stack_review_ai::StackReviewAiGeneration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (projection_generation, session_id, status, durable_binding_allowed) = {
+            let projection = projection.read(cx);
+            (
+                projection.generation(),
+                projection.session_id().cloned(),
+                projection.status().clone(),
+                projection.durable_binding_allowed(),
+            )
+        };
+        if projection_generation != generation {
+            return;
+        }
+        if durable_binding_allowed && let Some(session_id) = &session_id {
+            let binding_key = context_key.presentation_binding_key();
+            let changed = self
+                .presentation_state
+                .as_mut()
+                .and_then(|state| {
+                    state
+                        .bind_thread(binding_key.to_string(), session_id.to_string())
+                        .ok()
+                })
+                .is_some_and(|previous| previous.as_deref() != Some(session_id.as_ref()));
+            if changed {
+                self.queue_presentation_state_write(window, cx);
+            }
+        }
+        self.refresh_ai_comment_projection(cx);
+        if session_id.is_some() {
+            for (_, prompt, context) in take_pending_stack_review_ai_prompts(
+                &mut self.pending_ai_prompts,
+                context_key,
+                generation,
+            ) {
+                self.submit_ai_prompt(context, projection.clone(), prompt, generation, window, cx);
+            }
+        }
+        if self
+            .ai_projection
+            .as_ref()
+            .is_none_or(|active| active.entity_id() != projection.entity_id())
+        {
+            cx.notify();
+            return;
+        }
+        self.ai_error = match &status {
+            git_ui_core::stack_review_ai::StackReviewAiStatus::Failed(error) => Some(error.clone()),
+            git_ui_core::stack_review_ai::StackReviewAiStatus::MissingThread => {
+                Some("Stack Review Agent thread is unavailable".into())
+            }
+            git_ui_core::stack_review_ai::StackReviewAiStatus::NoModel => {
+                Some("Configure an Agent model to use Stack Review AI".into())
+            }
+            git_ui_core::stack_review_ai::StackReviewAiStatus::Loading
+            | git_ui_core::stack_review_ai::StackReviewAiStatus::Ready
+            | git_ui_core::stack_review_ai::StackReviewAiStatus::Generating
+            | git_ui_core::stack_review_ai::StackReviewAiStatus::Canceled => None,
+        };
+        cx.notify();
+    }
+
+    fn activate_ai_context(
+        &mut self,
+        selection: StackReviewAiContextSelection,
+        pending_prompt: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if DisableAiSettings::get_global(cx).disable_ai {
+            self.ai_error = None;
+            return;
+        }
+        let context = match self.build_ai_context(selection) {
+            Ok(context) => context,
+            Err(error) => {
+                self.ai_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let context_key = context.key.clone();
+        if let Some(prompt) = pending_prompt.as_ref()
+            && enqueue_pending_stack_review_ai_prompt_for_activation(
+                &mut self.pending_ai_prompts,
+                &self.ai_activation_generations,
+                &context_key,
+                prompt.clone(),
+                context.clone(),
+            )
+        {
+            self.ai_context = Some(context);
+            self.ai_error = None;
+            cx.notify();
+            return;
+        }
+        if let Some(projection) = self.ai_projections.get(&context_key).cloned() {
+            let (generation, session_id, session_owner, failed_without_session) = {
+                let projection = projection.read(cx);
+                (
+                    projection.generation(),
+                    projection.session_id().cloned(),
+                    projection.session_owner().cloned(),
+                    matches!(
+                        projection.status(),
+                        git_ui_core::stack_review_ai::StackReviewAiStatus::Failed(_)
+                            | git_ui_core::stack_review_ai::StackReviewAiStatus::MissingThread
+                            | git_ui_core::stack_review_ai::StackReviewAiStatus::NoModel
+                    ) && projection.session_id().is_none(),
+                )
+            };
+            if failed_without_session {
+                self.ai_projections.remove(&context_key);
+            } else {
+                let prepare_composer = pending_prompt.is_none();
+                if let Some(prompt) = pending_prompt {
+                    enqueue_pending_stack_review_ai_prompt(
+                        &mut self.pending_ai_prompts,
+                        context_key.clone(),
+                        (generation, prompt, context.clone()),
+                    );
+                }
+                if prepare_composer
+                    && let (Some(session_id), Some(session_owner)) =
+                        (session_id.as_ref(), session_owner.as_ref())
+                {
+                    let host = match git_ui_core::stack_review_ai::stack_review_ai_host(cx) {
+                        Ok(host) => host,
+                        Err(error) => {
+                            self.ai_error = Some(error.to_string().into());
+                            cx.notify();
+                            return;
+                        }
+                    };
+                    if let Err(error) = host.prepare_composer(
+                        context.clone(),
+                        session_id,
+                        session_owner,
+                        self.workspace.clone(),
+                        window,
+                        cx,
+                    ) {
+                        self.ai_error = Some(error.to_string().into());
+                        cx.notify();
+                        return;
+                    }
+                }
+                self.ai_context = Some(context);
+                self.ai_projection = Some(projection.clone());
+                self.ai_error = None;
+                self.sync_ai_projection(&projection, &context_key, generation, window, cx);
+                if session_id.is_none() {
+                    cx.notify();
+                }
+                return;
+            }
+        }
+        let Some(generation) = self.ai_generation.next() else {
+            self.ai_error = Some("Stack Review Agent context generation is exhausted".into());
+            cx.notify();
+            return;
+        };
+        let host = match git_ui_core::stack_review_ai::stack_review_ai_host(cx) {
+            Ok(host) => host,
+            Err(error) => {
+                self.ai_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let binding_key = context_key.presentation_binding_key();
+        let persisted_session_id = self
+            .presentation_state
+            .as_ref()
+            .and_then(|state| state.binding(&binding_key).ok().flatten())
+            .map(SharedString::from);
+        self.ai_generation = generation;
+        self.ai_activation_generations
+            .insert(context_key.clone(), generation);
+        let prepare_composer = pending_prompt.is_none();
+        if let Some(prompt) = pending_prompt {
+            enqueue_pending_stack_review_ai_prompt(
+                &mut self.pending_ai_prompts,
+                context_key.clone(),
+                (generation, prompt, context.clone()),
+            );
+        }
+        self.ai_context = Some(context.clone());
+        self.ai_projection = None;
+        self.ai_error = None;
+        let activation = host.activate_context(
+            git_ui_core::stack_review_ai::StackReviewAiActivationRequest {
+                context,
+                persisted_session_id,
+                generation,
+                prepare_composer,
+            },
+            self.workspace.clone(),
+            window,
+            cx,
+        );
+        let activation_context_key = context_key.clone();
+        let activation_task = cx.spawn_in(window, async move |this, cx| match activation.await {
+            Ok(projection) => {
+                this.update_in(cx, |this, window, cx| {
+                    if this
+                        .ai_activation_generations
+                        .get(&activation_context_key)
+                        .copied()
+                        != Some(generation)
+                    {
+                        return;
+                    }
+                    this.ai_activation_generations
+                        .remove(&activation_context_key);
+                    let observed_context_key = activation_context_key.clone();
+                    let subscription =
+                        cx.observe_in(&projection, window, move |this, projection, window, cx| {
+                            this.sync_ai_projection(
+                                &projection,
+                                &observed_context_key,
+                                generation,
+                                window,
+                                cx,
+                            );
+                        });
+                    this.ai_projection_subscriptions.push(subscription);
+                    this.ai_projections
+                        .insert(activation_context_key.clone(), projection.clone());
+                    if this
+                        .ai_context
+                        .as_ref()
+                        .is_some_and(|context| context.key == activation_context_key)
+                    {
+                        this.ai_projection = Some(projection.clone());
+                    }
+                    this.sync_ai_projection(
+                        &projection,
+                        &activation_context_key,
+                        generation,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+            }
+            Err(error) => {
+                this.update(cx, |this, cx| {
+                    let is_current = this
+                        .ai_activation_generations
+                        .get(&activation_context_key)
+                        .copied()
+                        == Some(generation);
+                    if is_current {
+                        this.ai_activation_generations
+                            .remove(&activation_context_key);
+                    }
+                    if is_current
+                        && this
+                            .ai_context
+                            .as_ref()
+                            .is_some_and(|context| context.key == activation_context_key)
+                    {
+                        this.ai_error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                    if is_current {
+                        this.pending_ai_prompts.remove(&activation_context_key);
+                    }
+                })
+                .ok();
+            }
+        });
+        self.ai_activation_tasks
+            .insert(context_key, activation_task);
+        cx.notify();
+    }
+
+    fn activate_ai_for_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file_index) = self.selected_file_index else {
+            self.ai_error = Some("Select a Stack Review file first".into());
+            cx.notify();
+            return;
+        };
+        match default_stack_review_ai_code_selection(&self.files, &self.content_entries, file_index)
+        {
+            Ok(selection) => self.activate_ai_context(selection, None, window, cx),
+            Err(error) => {
+                self.ai_error = Some(error.to_string().into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn activate_ai_for_comment(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_ai_context(
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: record_id.to_owned(),
+            },
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn select_ai_comment_context(
+        &mut self,
+        record_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_comment_record_id = Some(record_id.to_owned());
+        self.activate_ai_for_comment(record_id, window, cx);
+    }
+
+    fn submit_ai_prompt(
+        &mut self,
+        context: git_ui_core::stack_review_ai::StackReviewAiContext,
+        projection: Entity<git_ui_core::stack_review_ai::StackReviewAiProjection>,
+        prompt: String,
+        generation: git_ui_core::stack_review_ai::StackReviewAiGeneration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = projection.read(cx).session_id().cloned() else {
+            if self
+                .ai_projection
+                .as_ref()
+                .is_some_and(|active| active.entity_id() == projection.entity_id())
+            {
+                self.ai_error = Some("Stack Review Agent thread is still loading".into());
+                cx.notify();
+            }
+            return;
+        };
+        let Some(session_owner) = projection.read(cx).session_owner().cloned() else {
+            self.ai_error = Some("Stack Review Agent session owner is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let Some(project_identity) = context
+            .resources
+            .first()
+            .map(|resource| resource.citation().project_identity().clone())
+        else {
+            self.ai_error = Some("Stack Review Agent context has no immutable citation".into());
+            cx.notify();
+            return;
+        };
+        let host = match git_ui_core::stack_review_ai::stack_review_ai_host(cx) {
+            Ok(host) => host,
+            Err(error) => {
+                self.ai_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let projection_target = context.selected_record_id.clone();
+        let submit = host.submit_local_prompt(
+            git_ui_core::stack_review_ai::StackReviewAiSubmitRequest::new(
+                context,
+                session_id,
+                session_owner,
+                prompt,
+                Uuid::new_v4().to_string(),
+                project_identity,
+                projection_target,
+                generation,
+            ),
+            self.workspace.clone(),
+            window,
+            cx,
+        );
+        cx.spawn(async move |this, cx| match submit.await {
+            Ok(()) => {}
+            Err(error) => {
+                this.update(cx, |this, cx| {
+                    if this
+                        .ai_projection
+                        .as_ref()
+                        .is_some_and(|projection| projection.read(cx).generation() == generation)
+                    {
+                        this.ai_error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn invoke_ai_for_comment(
+        &mut self,
+        record_id: &str,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_ai_context(
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: record_id.to_owned(),
+            },
+            Some(prompt),
+            window,
+            cx,
+        );
+    }
+
+    fn reveal_ai_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if DisableAiSettings::get_global(cx).disable_ai {
+            self.ai_error = None;
+            return;
+        }
+        let Some((session_id, session_owner)) =
+            self.ai_projection.as_ref().and_then(|projection| {
+                let projection = projection.read(cx);
+                Some((
+                    projection.session_id()?.clone(),
+                    projection.session_owner()?.clone(),
+                ))
+            })
+        else {
+            if let Some(record_id) = self.selected_comment_record_id.clone()
+                && matches!(
+                    self.ai_context.as_ref().map(|context| &context.key),
+                    Some(git_ui_core::stack_review_ai::StackReviewAiContextKey::Comment { .. })
+                )
+            {
+                self.activate_ai_for_comment(&record_id, window, cx);
+            } else {
+                self.activate_ai_for_selected_file(window, cx);
+            }
+            return;
+        };
+        let host = match git_ui_core::stack_review_ai::stack_review_ai_host(cx) {
+            Ok(host) => host,
+            Err(error) => {
+                self.ai_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        if let Err(error) = host.reveal_and_focus_thread(
+            &session_id,
+            &session_owner,
+            self.workspace.clone(),
+            window,
+            cx,
+        ) {
+            self.ai_error = Some(error.to_string().into());
+            cx.notify();
+        }
+    }
+
     fn deploy(
         workspace: &mut Workspace,
         _: &ReviewStack,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if !cx.has_flag::<StackReviewFeatureFlag>() {
-            Self::notify_error(
-                "Enable the stack-review feature flag to use Stack Review",
-                window,
-                cx,
-            );
-            return;
-        }
         let project = workspace.project().clone();
         let fs = project.read(cx).fs().clone();
         let Some(repository) = project.read(cx).active_repository(cx) else {
@@ -3449,6 +4125,7 @@ impl StackReview {
             editor.set_placeholder_text("Commit or SHA", window, cx);
             editor
         });
+
         Self {
             snapshot,
             current_layer,
@@ -3496,6 +4173,17 @@ impl StackReview {
             selected_comment_record_id: None,
             pending_comment_reveal: None,
             pending_citation_reveal: None,
+            ai_generation: Default::default(),
+            ai_context: None,
+            ai_projection: None,
+            ai_projections: HashMap::new(),
+            ai_projected_turn_ids: HashSet::new(),
+
+            ai_error: None,
+            ai_activation_tasks: HashMap::new(),
+            ai_activation_generations: HashMap::new(),
+            pending_ai_prompts: HashMap::new(),
+            ai_projection_subscriptions: Vec::new(),
             selected_commenter: None,
             reviewer_login: None,
             refreshed_github_snapshots: HashSet::new(),
@@ -3525,6 +4213,15 @@ impl StackReview {
     fn load_scope(&mut self, scope: StackReviewScope, window: &mut Window, cx: &mut Context<Self>) {
         self.remember_active_split_ratio(cx);
         self.pending_citation_reveal = None;
+        self.ai_context = None;
+        self.ai_projection = None;
+        self.ai_projections.clear();
+        self.ai_error = None;
+        self.ai_activation_tasks.clear();
+        self.ai_activation_generations.clear();
+        self.pending_ai_prompts.clear();
+        self.ai_projection_subscriptions.clear();
+        self.refresh_ai_comment_projection(cx);
         self.checkpoint_boundary_requests.invalidate();
         let scope_changed = scope.boundaries() != self.selected_scope.boundaries();
         if scope_changed {
@@ -3955,7 +4652,7 @@ impl StackReview {
                 match event {
                     EditorEvent::ReviewCommentsChanged { .. } => {
                         let comments = editor.read(cx).stack_review_comments(cx);
-                        this.reconcile_editor_comments(&active_path, side, comments, cx);
+                        this.reconcile_editor_comments(&active_path, side, comments, window, cx);
                     }
                     EditorEvent::ReviewCommentResolutionChanged { ids, resolved } => {
                         this.persist_comment_resolution(ids, side, *resolved, window, cx);
@@ -3975,7 +4672,7 @@ impl StackReview {
                         this.use_comment_record_as_from(record_id, window, cx);
                     }
                     EditorEvent::ReviewCommentSelected { record_id } => {
-                        this.selected_comment_record_id = Some(record_id.clone());
+                        this.select_ai_comment_context(record_id, window, cx);
                     }
                     EditorEvent::ReviewCommentStashRequested { record_id } => {
                         this.set_comment_thread_stashed(record_id, true, false, window, cx);
@@ -4109,6 +4806,7 @@ impl StackReview {
         if let Some(target) = self.pending_comment_reveal.take() {
             self.reveal_comment_target(target, window, cx);
         }
+        self.refresh_ai_comment_projection(cx);
         cx.notify();
     }
 
@@ -4443,6 +5141,7 @@ impl StackReview {
         active_path: &str,
         side: StackReviewCommentSide,
         comments: Vec<StackReviewComment>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let rendered_comment_ids = match side {
@@ -4497,6 +5196,7 @@ impl StackReview {
             });
         }
         let timestamp = stack_review_timestamp();
+        let mut agent_requests = Vec::new();
         for comment in comments {
             let Some(record_id) =
                 projected_comment_record_id(&comment, side, &self.record_id_by_editor_id)
@@ -4512,6 +5212,12 @@ impl StackReview {
             {
                 continue;
             }
+            let agent_prompt = (comment.source == StackReviewCommentSource::LocalHuman
+                && existing
+                    .as_ref()
+                    .is_none_or(|loaded| loaded.record.body != comment.body))
+            .then(|| stack_review_agent_comment_prompt(&comment.body))
+            .flatten();
             let mut record = StackReviewCommentRecord::new_inline(
                 record_id.clone(),
                 review_state.base_oid.clone(),
@@ -4559,13 +5265,16 @@ impl StackReview {
                 serialized: serialized.clone(),
             });
             self.comment_records.insert(
-                record_id,
+                record_id.clone(),
                 LoadedCommentRecord {
                     path,
                     record,
                     serialized,
                 },
             );
+            if let Some(prompt) = agent_prompt {
+                agent_requests.push((record_id, prompt));
+            }
         }
         match side {
             StackReviewCommentSide::Left => {
@@ -4582,10 +5291,20 @@ impl StackReview {
         }
         let fs = self.fs.clone();
         let write_lock = self.comment_write_lock.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = apply_comment_writes(fs, write_lock, writes).await;
-            if let Err(update_error) = this.update(cx, |this, cx| {
-                this.state_error = result.err().map(|error| error.to_string().into());
+            if let Err(update_error) = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(()) => {
+                        this.state_error = None;
+                        for (record_id, prompt) in agent_requests {
+                            this.invoke_ai_for_comment(&record_id, prompt, window, cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.state_error = Some(error.to_string().into());
+                    }
+                }
                 cx.notify();
             }) {
                 log::error!("failed to report Stack Review comment write: {update_error:#}");
@@ -5835,6 +6554,30 @@ impl StackReview {
         let current_scope = StackReviewScope::Layer(self.current_layer);
         let from_dropdown = self.render_boundary_dropdown(true, window, cx);
         let to_dropdown = self.render_boundary_dropdown(false, window, cx);
+        let ai_enabled = !DisableAiSettings::get_global(cx).disable_ai;
+        let ai_context_active = self.ai_context.is_some();
+        let ai_thread_ready = self
+            .ai_projection
+            .as_ref()
+            .is_some_and(|projection| projection.read(cx).session_id().is_some());
+        let ai_status_label =
+            self.ai_projection
+                .as_ref()
+                .and_then(|projection| match projection.read(cx).status() {
+                    git_ui_core::stack_review_ai::StackReviewAiStatus::Loading => {
+                        Some("Agent loading…")
+                    }
+                    git_ui_core::stack_review_ai::StackReviewAiStatus::Generating => {
+                        Some("Agent responding…")
+                    }
+                    git_ui_core::stack_review_ai::StackReviewAiStatus::Canceled => {
+                        Some("Agent canceled")
+                    }
+                    git_ui_core::stack_review_ai::StackReviewAiStatus::Ready
+                    | git_ui_core::stack_review_ai::StackReviewAiStatus::Failed(_)
+                    | git_ui_core::stack_review_ai::StackReviewAiStatus::MissingThread
+                    | git_ui_core::stack_review_ai::StackReviewAiStatus::NoModel => None,
+                });
         let shortcut_focus = self.focus_handle(cx);
         let shortcuts = DropdownMenu::new(
             "stack-review-shortcuts",
@@ -6020,6 +6763,41 @@ impl StackReview {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.add_comment_at_cursor(window, cx);
                     })),
+            )
+            .when(ai_enabled, |status| {
+                status.child(
+                    div()
+                        .debug_selector(|| "STACK_REVIEW_AI_FILE_CONTEXT".into())
+                        .child(
+                            Button::new("stack-review-use-file-in-agent", "Use File in Agent")
+                                .disabled(
+                                    self.selected_file_index.is_none()
+                                        || self.review_state.is_none(),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.activate_ai_for_selected_file(window, cx);
+                                })),
+                        ),
+                )
+            })
+            .when(ai_enabled && ai_context_active, |status| {
+                status.child(
+                    Button::new(
+                        "stack-review-open-agent",
+                        if ai_thread_ready {
+                            "Open Agent"
+                        } else {
+                            "Start Agent"
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.reveal_ai_thread(window, cx);
+                    })),
+                )
+            })
+            .when_some(
+                ai_enabled.then_some(ai_status_label).flatten(),
+                |status, label| status.child(Label::new(label).color(Color::Muted)),
             );
 
         let commenter_filter_label = self
@@ -6212,6 +6990,17 @@ impl StackReview {
             .child(time_controls)
             .child(status)
             .when_some(
+                ai_enabled.then(|| self.ai_error.clone()).flatten(),
+                |header, error| {
+                    header.child(
+                        div()
+                            .w_full()
+                            .debug_selector(|| "STACK_REVIEW_AI_ERROR".into())
+                            .child(Label::new(error).color(Color::Error)),
+                    )
+                },
+            )
+            .when_some(
                 StackReviewStateErrors {
                     transient: self.state_error.clone(),
                     presentation: self.presentation_state_error.clone(),
@@ -6339,6 +7128,14 @@ impl Render for StackReview {
                     this.toggle_migration_filter(window, cx);
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &StackReviewUseFileInAgent, window, cx| {
+                    this.activate_ai_for_selected_file(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &StackReviewOpenAgent, window, cx| {
+                this.reveal_ai_thread(window, cx);
+            }))
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<DraggedStackReviewSidebar>, _window, cx| {
                     this.sidebar_width = (event.event.position.x - event.bounds.left()).clamp(
@@ -6409,15 +7206,100 @@ mod tests {
     use language::language_settings::AllLanguageSettings;
     use project::{FakeFs, WorktreeSettings, project_settings::ProjectSettings};
     use serde_json::json;
-    use settings::{Settings as _, SettingsStore};
+    use settings::SettingsStore;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use theme::LoadThemes;
     use workspace::WorkspaceSettings;
+
+    fn pending_ai_test_context(
+        key: git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    ) -> git_ui_core::stack_review_ai::StackReviewAiContext {
+        git_ui_core::stack_review_ai::StackReviewAiContext {
+            key,
+            context_revision: "revision".into(),
+            title: "Review".into(),
+            base_oid: "base".into(),
+            head_oid: "head".into(),
+            path: None,
+            side: None,
+            line_range: None,
+            selected_record_id: None,
+            resources: Vec::new().into(),
+        }
+    }
+
+    #[test]
+    fn pending_stack_review_ai_prompts_preserve_fifo_and_drop_stale_generations() {
+        let key = git_ui_core::stack_review_ai::StackReviewAiContextKey::review("base-head");
+        let generation = git_ui_core::stack_review_ai::StackReviewAiGeneration::default()
+            .next()
+            .unwrap();
+        let stale_generation = generation.next().unwrap();
+        let context = pending_ai_test_context(key.clone());
+        let mut pending = PendingStackReviewAiPrompts::default();
+        enqueue_pending_stack_review_ai_prompt(
+            &mut pending,
+            key.clone(),
+            (generation, "first".into(), context.clone()),
+        );
+        enqueue_pending_stack_review_ai_prompt(
+            &mut pending,
+            key.clone(),
+            (stale_generation, "stale".into(), context.clone()),
+        );
+        enqueue_pending_stack_review_ai_prompt(
+            &mut pending,
+            key.clone(),
+            (generation, "second".into(), context),
+        );
+
+        let prompts = take_pending_stack_review_ai_prompts(&mut pending, &key, generation)
+            .into_iter()
+            .map(|(_, prompt, _)| prompt)
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, ["first", "second"]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_stack_review_ai_prompts_reuse_the_live_activation_generation() {
+        let key = git_ui_core::stack_review_ai::StackReviewAiContextKey::review("base-head");
+        let generation = git_ui_core::stack_review_ai::StackReviewAiGeneration::default()
+            .next()
+            .unwrap();
+        let active_generations = HashMap::from([(key.clone(), generation)]);
+        let context = pending_ai_test_context(key.clone());
+        let mut pending = PendingStackReviewAiPrompts::default();
+
+        assert!(enqueue_pending_stack_review_ai_prompt_for_activation(
+            &mut pending,
+            &active_generations,
+            &key,
+            "first".into(),
+            context.clone(),
+        ));
+        assert!(enqueue_pending_stack_review_ai_prompt_for_activation(
+            &mut pending,
+            &active_generations,
+            &key,
+            "second".into(),
+            context,
+        ));
+
+        let prompts = take_pending_stack_review_ai_prompts(&mut pending, &key, generation)
+            .into_iter()
+            .map(|(_, prompt, _)| prompt)
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, ["first", "second"]);
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         zlog::init_test();
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
+            DisableAiSettings::register(cx);
             theme_settings::init(LoadThemes::JustBase, cx);
             AllLanguageSettings::register(cx);
             editor::init(cx);
@@ -6425,6 +7307,84 @@ mod tests {
             WorktreeSettings::register(cx);
             WorkspaceSettings::register(cx);
         });
+    }
+
+    #[derive(Default)]
+    struct TestStackReviewAiHost {
+        submissions: RefCell<Vec<(String, Option<SharedString>)>>,
+        prepared_contexts: RefCell<Vec<git_ui_core::stack_review_ai::StackReviewAiContext>>,
+    }
+
+    impl git_ui_core::stack_review_ai::StackReviewAiHost for TestStackReviewAiHost {
+        fn activate_context(
+            &self,
+            request: git_ui_core::stack_review_ai::StackReviewAiActivationRequest,
+            _workspace: gpui::WeakEntity<Workspace>,
+            _window: &mut Window,
+            cx: &mut App,
+        ) -> Task<Result<Entity<git_ui_core::stack_review_ai::StackReviewAiProjection>>> {
+            let generation = request.generation;
+            if request.prepare_composer {
+                self.prepared_contexts.borrow_mut().push(request.context);
+            }
+            let projection = cx.new(|_| {
+                let mut projection =
+                    git_ui_core::stack_review_ai::StackReviewAiProjection::new(generation);
+                projection.set_session_owner("native");
+                projection.allow_durable_binding();
+                projection
+            });
+            projection.update(cx, |projection, cx| {
+                projection.apply_update(
+                    git_ui_core::stack_review_ai::StackReviewAiProjectionUpdate {
+                        generation,
+                        session_id: Some("test-stack-review-session".into()),
+                        status: git_ui_core::stack_review_ai::StackReviewAiStatus::Ready,
+                        assistant_turns: Vec::new(),
+                    },
+                    cx,
+                );
+            });
+            Task::ready(Ok(projection))
+        }
+
+        fn prepare_composer(
+            &self,
+            context: git_ui_core::stack_review_ai::StackReviewAiContext,
+            _session_id: &SharedString,
+            _session_owner: &SharedString,
+            _workspace: gpui::WeakEntity<Workspace>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Result<()> {
+            self.prepared_contexts.borrow_mut().push(context);
+            Ok(())
+        }
+
+        fn reveal_and_focus_thread(
+            &self,
+            _session_id: &SharedString,
+            _session_owner: &SharedString,
+            _workspace: gpui::WeakEntity<Workspace>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn submit_local_prompt(
+            &self,
+            request: git_ui_core::stack_review_ai::StackReviewAiSubmitRequest,
+            _workspace: gpui::WeakEntity<Workspace>,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
+            self.submissions.borrow_mut().push((
+                request.prompt().to_string(),
+                request.envelope().projection_target().cloned(),
+            ));
+            Task::ready(Ok(()))
+        }
     }
 
     #[gpui::test]
@@ -6446,6 +7406,8 @@ mod tests {
                     "editor::ToggleActiveReviewCommentResolved",
                     "git::StackReviewToggleTests",
                     "git::StackReviewToggleMigrations",
+                    "git::StackReviewUseFileInAgent",
+                    "git::StackReviewOpenAgent",
                 ] {
                     assert!(
                         bindings
@@ -6469,6 +7431,8 @@ mod tests {
                 "path": "src/lib.rs",
                 "line": 5,
                 "side": "RIGHT",
+                "original_line": 3,
+                "original_commit_id": "base",
                 "body": "Inline",
                 "user": { "login": "octocat" },
                 "html_url": "https://github.test/inline",
@@ -6502,12 +7466,132 @@ mod tests {
         assert_eq!(github_comment_boundary_oid(&records[1]), Some("abc"));
         assert_eq!(github_comment_boundary_oid(&records[2]), None);
         assert_eq!(records[0].start_row, Some(4));
+        assert_eq!(
+            records[0]
+                .github
+                .as_ref()
+                .and_then(|github| github.original_line),
+            Some(2)
+        );
+        assert_eq!(
+            records[0]
+                .github
+                .as_ref()
+                .and_then(|github| github.original_commit_oid.as_deref()),
+            Some("base")
+        );
         assert!(!records[0].is_writable());
         assert!(records[0].resolved);
         assert_eq!(records[1].side, StackReviewCommentSide::TopLevel);
         assert_eq!(records[2].side, StackReviewCommentSide::TopLevel);
         assert_eq!(records[2].created_at, "2026-08-21T12:02:00Z");
         assert_eq!(records[2].updated_at, "2026-08-22T12:02:00Z");
+    }
+
+    #[test]
+    fn github_base_anchors_project_on_previous_and_current_diff_sides() {
+        let mut loaded = test_comment_record(
+            "github-comment",
+            "src/lib.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        loaded.record.start_row = Some(8);
+        loaded.record.end_row = Some(8);
+        loaded.record.github = Some(StackReviewGitHubCommentIdentity {
+            pull_request_number: 42,
+            github_id: "10".into(),
+            url: "https://github.test/inline".into(),
+            kind: StackReviewGitHubCommentKind::Inline,
+            commit_oid: Some("base".into()),
+            original_commit_oid: Some("base".into()),
+            original_line: Some(2),
+        });
+        let records = HashMap::from([("github-comment".into(), loaded.clone())]);
+
+        let projection = project_test_comment_records(&records, false, &HashMap::new(), 0)
+            .expect("project GitHub base anchor");
+        let file = &projection.comments_by_path["src/lib.rs"];
+        assert_eq!(file.right.len(), 1);
+        assert_eq!(file.right[0].start_row, 8);
+        assert_eq!(file.left.len(), 1);
+        assert_eq!(file.left[0].start_row, 2);
+        assert_eq!(file.left[0].record_id, file.right[0].record_id);
+        assert_eq!(file.left[0].id, file.right[0].id);
+
+        let mut outdated = loaded;
+        outdated.record.outdated = true;
+        let projection = project_test_comment_records(
+            &HashMap::from([("github-comment".into(), outdated)]),
+            false,
+            &HashMap::new(),
+            0,
+        )
+        .expect("project outdated GitHub base anchor");
+        let file = &projection.comments_by_path["src/lib.rs"];
+        assert!(file.right.is_empty());
+        assert_eq!(file.left.len(), 1);
+        assert_eq!(file.left[0].start_row, 2);
+    }
+
+    #[test]
+    fn stack_review_agent_comment_prompt_requires_explicit_prefix() {
+        assert_eq!(
+            stack_review_agent_comment_prompt(" @agent explain this comment ").as_deref(),
+            Some("explain this comment")
+        );
+        assert_eq!(stack_review_agent_comment_prompt("@agent"), None);
+        assert_eq!(stack_review_agent_comment_prompt("normal comment"), None);
+        assert_eq!(stack_review_agent_comment_prompt("@agentic behavior"), None);
+    }
+
+    #[test]
+    fn stack_review_ai_default_file_selection_uses_existing_side_and_bounded_range() {
+        let text = (0..250)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut modified = test_file_item("src/modified.rs");
+        modified.status = StackReviewFileStatus::Modified;
+        let modified_entry = ContentDiffEntry {
+            path: PathBuf::from("src/modified.rs"),
+            source_path: None,
+            was_deleted: false,
+            old_text: text.clone().into(),
+            new_text: text.into(),
+        };
+        assert_eq!(
+            default_stack_review_ai_code_selection(&[modified], &[modified_entry], 0).unwrap(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Right,
+                line_range: Some(0..STACK_REVIEW_AI_MAX_CODE_LINES),
+            }
+        );
+
+        let mut deleted = test_file_item("src/deleted.rs");
+        deleted.status = StackReviewFileStatus::Deleted;
+        assert_eq!(
+            default_stack_review_ai_code_selection(
+                &[deleted],
+                &[ContentDiffEntry {
+                    path: PathBuf::from("src/deleted.rs"),
+                    source_path: None,
+                    was_deleted: true,
+                    old_text: "one\ntwo\n".into(),
+                    new_text: "".into(),
+                }],
+                0,
+            )
+            .unwrap(),
+            StackReviewAiContextSelection::Code {
+                file_index: 0,
+                side: StackReviewCommentSide::Left,
+                line_range: Some(0..2),
+            }
+        );
     }
 
     #[test]
@@ -7477,6 +8561,67 @@ mod tests {
             chain.citation().root_record_id().map(SharedString::as_ref),
             Some("root")
         );
+    }
+
+    #[test]
+    fn stack_review_ai_historical_github_comment_uses_original_base_anchor() {
+        let mut historical = test_comment_record(
+            "historical",
+            "src/review.rs",
+            StackReviewCommentSource::Github,
+            Some("reviewer"),
+            None,
+            "2026-08-21T12:00:00Z",
+        );
+        historical.record.outdated = true;
+        historical.record.side = StackReviewCommentSide::Right;
+        historical.record.github = Some(StackReviewGitHubCommentIdentity {
+            pull_request_number: 42,
+            github_id: "10".into(),
+            url: "https://github.test/inline".into(),
+            kind: StackReviewGitHubCommentKind::Inline,
+            commit_oid: Some("old-head".into()),
+            original_commit_oid: Some("base".into()),
+            original_line: Some(1),
+        });
+        let records = HashMap::from([(historical.record.id.clone(), historical)]);
+        let storage_key = stack_review_storage_key("base", "head");
+        let thread_index =
+            CommentThreadIndex::new(storage_key, records.values().map(|record| &record.record))
+                .expect("historical GitHub comment thread");
+
+        let context = build_stack_review_ai_context(
+            "project-a",
+            &StackReviewState::new("base", "head"),
+            &[test_file_item("src/review.rs")],
+            &[ContentDiffEntry {
+                path: PathBuf::from("src/review.rs"),
+                source_path: None,
+                was_deleted: false,
+                old_text: Arc::from("left one\nleft two\n"),
+                new_text: Arc::from("right one\nright two\n"),
+            }],
+            &records,
+            &thread_index,
+            StackReviewAiContextSelection::Comment {
+                selected_record_id: "historical".to_string(),
+            },
+        )
+        .expect("build historical GitHub comment context");
+
+        assert_eq!(context.side, Some(StackReviewCommentSide::Left));
+        assert_eq!(context.line_range, Some(1..2));
+        assert_eq!(
+            context.resources[0].citation().side(),
+            StackReviewCommentSide::Left
+        );
+        assert!(context.resources[0].text().contains("left two"));
+        let chain = context
+            .resources
+            .iter()
+            .find(|resource| resource.label().as_ref() == "Comment thread")
+            .expect("historical comment chain");
+        assert!(!chain.text().contains("Anchor: unavailable"));
     }
 
     #[test]
@@ -9875,6 +11020,10 @@ mod tests {
         let workspace =
             cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let mut visual_context = VisualTestContext::from_window(*workspace, cx);
+        let test_ai_host = Rc::new(TestStackReviewAiHost::default());
+        visual_context.update(|_window, cx| {
+            git_ui_core::stack_review_ai::set_stack_review_ai_host(test_ai_host.clone(), cx);
+        });
         let build_task = workspace
             .update(&mut visual_context, |_workspace, window, cx| {
                 MultiDiffView::build_from_content(
@@ -10019,11 +11168,23 @@ mod tests {
                     selected_comment_record_id: None,
                     pending_comment_reveal: None,
                     pending_citation_reveal: None,
+                    ai_generation: Default::default(),
+                    ai_context: None,
+                    ai_projection: None,
+                    ai_projections: HashMap::new(),
+                    ai_projected_turn_ids: HashSet::new(),
+                    ai_error: None,
+                    ai_activation_tasks: HashMap::new(),
+                    ai_activation_generations: HashMap::new(),
+                    pending_ai_prompts: HashMap::new(),
+                    ai_projection_subscriptions: Vec::new(),
                     selected_commenter: None,
                     reviewer_login: Some("xHayden".into()),
                     refreshed_github_snapshots: HashSet::new(),
                     github_refreshing: false,
-                    comments_directory: None,
+                    comments_directory: Some(PathBuf::from(
+                        "/project/.git/zed-stack-review/comments",
+                    )),
                     github_comments_directory: None,
                     diff_view: Some(diff_view.clone()),
                     provenance_summary: None,
@@ -10074,6 +11235,145 @@ mod tests {
         });
         visual_context.run_until_parked();
 
+        assert!(
+            visual_context
+                .debug_bounds("STACK_REVIEW_AI_FILE_CONTEXT")
+                .is_some_and(|bounds| bounds.size.width > px(0.) && bounds.size.height > px(0.)),
+            "Use File in Agent must render with a nonzero hitbox"
+        );
+        let ai_context_bounds = visual_context
+            .debug_bounds("STACK_REVIEW_AI_FILE_CONTEXT")
+            .expect("Use File in Agent bounds");
+        visual_context.simulate_event(MouseDownEvent {
+            position: ai_context_bounds.center(),
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        visual_context.simulate_event(MouseUpEvent {
+            position: ai_context_bounds.center(),
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+        });
+        visual_context.run_until_parked();
+        assert!(
+            review.read_with(&visual_context, |review, _| review.ai_context.is_some()),
+            "clicking Use File in Agent must activate immutable file context"
+        );
+        assert_eq!(
+            review.read_with(&visual_context, |review, _| {
+                review
+                    .presentation_state
+                    .as_ref()
+                    .and_then(|state| state.binding("review").ok().flatten())
+                    .map(str::to_owned)
+            }),
+            Some("test-stack-review-session".to_owned()),
+            "Agent session binding must use snapshot-bound presentation state"
+        );
+
+        let local_author = StackReviewCommentAuthor {
+            login: Some("xHayden".into()),
+            name: "Hayden".into(),
+        };
+        let agent_record_id = Uuid::now_v7().to_string();
+        let ordinary_record_id = Uuid::now_v7().to_string();
+        review.update_in(&mut visual_context, |review, window, cx| {
+            review.reconcile_editor_comments(
+                "first.rs",
+                StackReviewCommentSide::Right,
+                vec![
+                    StackReviewComment {
+                        id: 0,
+                        record_id: Some(agent_record_id.clone()),
+                        path: "first.rs".into(),
+                        start_row: 0,
+                        start_column: 0,
+                        end_row: 0,
+                        end_column: 2,
+                        body: "@agent explain this line".into(),
+                        created_at: String::new(),
+                        resolved: false,
+                        author: local_author.clone(),
+                        source: StackReviewCommentSource::LocalHuman,
+                        reply_to: None,
+                        reply_to_record_id: None,
+                    },
+                    StackReviewComment {
+                        id: 1,
+                        record_id: Some(ordinary_record_id.clone()),
+                        path: "first.rs".into(),
+                        start_row: 0,
+                        start_column: 0,
+                        end_row: 0,
+                        end_column: 2,
+                        body: "ordinary review note".into(),
+                        created_at: String::new(),
+                        resolved: false,
+                        author: local_author,
+                        source: StackReviewCommentSource::LocalHuman,
+                        reply_to: None,
+                        reply_to_record_id: None,
+                    },
+                ],
+                window,
+                cx,
+            );
+        });
+        visual_context.run_until_parked();
+        review.update_in(&mut visual_context, |review, window, cx| {
+            review.select_ai_comment_context(&ordinary_record_id, window, cx);
+        });
+        visual_context.run_until_parked();
+        assert_eq!(
+            test_ai_host
+                .prepared_contexts
+                .borrow()
+                .last()
+                .and_then(|context| context.selected_record_id.as_deref()),
+            Some(ordinary_record_id.as_str()),
+            "selecting a review comment must prepare that comment in the ordinary Agent composer"
+        );
+        let ai_debug_state = review.read_with(&visual_context, |review, cx| {
+            (
+                review.state_error.clone(),
+                review.ai_error.clone(),
+                review.pending_ai_prompts.len(),
+                review.ai_projection.as_ref().and_then(|projection| {
+                    projection.read(cx).session_id().map(ToString::to_string)
+                }),
+                review.comment_records.len(),
+            )
+        });
+        assert_eq!(
+            test_ai_host.submissions.borrow().as_slice(),
+            &[("explain this line".into(), Some(agent_record_id.into()))],
+            "only a persisted standalone @agent comment should submit; state={ai_debug_state:?}"
+        );
+        review.update(&mut visual_context, |review, cx| {
+            review.file_comment_statuses = HashMap::from([
+                (
+                    "first.rs".into(),
+                    FileCommentSummary {
+                        status: FileCommentStatus::Comments,
+                        comment_count: 2,
+                        stashed_thread_count: 0,
+                    },
+                ),
+                (
+                    "second.rs".into(),
+                    FileCommentSummary {
+                        status: FileCommentStatus::AwaitingResponse,
+                        comment_count: 3,
+                        stashed_thread_count: 0,
+                    },
+                ),
+            ]);
+            cx.notify();
+        });
+        visual_context.run_until_parked();
         assert_eq!(
             review.read_with(&visual_context, |review, _| {
                 review.selected_boundary_label(true, 0)
@@ -10226,6 +11526,21 @@ mod tests {
         });
         assert_eq!(selected_path.as_deref(), Some("second.rs"));
 
+        let ai_context_bounds = visual_context
+            .debug_bounds("STACK_REVIEW_AI_FILE_CONTEXT")
+            .expect("Use File in Agent bounds after file switch");
+        visual_context.simulate_click(ai_context_bounds.center(), Modifiers::none());
+        visual_context.run_until_parked();
+        assert_eq!(
+            test_ai_host
+                .prepared_contexts
+                .borrow()
+                .last()
+                .and_then(|context| context.path.as_deref()),
+            Some("second.rs"),
+            "cached review sessions must replace composer context after switching files"
+        );
+
         let citation = git_ui_core::stack_review_ai::StackReviewCitationNavigationRequest::try_new(
             stack_review_storage_key("base", "head"),
             stack_review_project_identity(Path::new("/project")),
@@ -10276,6 +11591,17 @@ mod tests {
                 })
                 .expect("read active workspace item"),
             Some(review.clone())
+        );
+        review.update(&mut visual_context, |_review, cx| {
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+            cx.notify();
+        });
+        visual_context.run_until_parked();
+        assert!(
+            visual_context
+                .debug_bounds("STACK_REVIEW_AI_FILE_CONTEXT")
+                .is_none(),
+            "Stack Review Agent controls must be absent when AI is disabled"
         );
     }
 }

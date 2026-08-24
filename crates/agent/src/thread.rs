@@ -501,6 +501,7 @@ impl UserMessage {
                             )
                             .ok();
                         }
+                        MentionUri::StackReviewTurn => {}
                     }
 
                     language_model::MessageContent::Text(uri.as_link().to_string())

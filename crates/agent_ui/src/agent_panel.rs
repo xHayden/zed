@@ -3191,6 +3191,175 @@ impl AgentPanel {
     /// switching the active view to it. Used by the `create_thread` agent tool,
     /// which passes an initial prompt, and optionally an agent and model
     /// override.
+    pub(crate) fn create_stack_review_thread(
+        &mut self,
+        agent: Agent,
+        origin: agent::StackReviewThreadOrigin,
+        title: SharedString,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ThreadId {
+        let selected_agent = self.selected_agent.clone();
+        let thread = self.create_agent_thread_with_server_and_stack_review_origin(
+            agent,
+            None,
+            None,
+            None,
+            Some(title),
+            initial_content,
+            None,
+            AgentThreadSource::AgentPanel,
+            Some(origin),
+            window,
+            cx,
+        );
+        self.set_selected_agent_and_persist(selected_agent, cx);
+        let thread_id = thread.conversation_view.read(cx).thread_id;
+        self.retained_threads
+            .insert(thread_id, thread.conversation_view);
+        thread_id
+    }
+
+    pub(crate) fn resume_stack_review_thread(
+        &mut self,
+        agent: Agent,
+        session_id: acp::SessionId,
+        origin: agent::StackReviewThreadOrigin,
+        title: SharedString,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<ConversationView>> {
+        let metadata = ThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry_by_session(&session_id).cloned());
+        let agent = metadata
+            .as_ref()
+            .map(|metadata| Agent::from(metadata.agent_id.clone()))
+            .unwrap_or(agent);
+        if let Some(thread_id) = self.thread_id_for_session(&session_id, cx)
+            && let Some(conversation_view) = self.conversation_view_for_id(&thread_id, cx).cloned()
+        {
+            if let Some(error) = conversation_view.read(cx).load_error() {
+                self.remove_thread_without_activating_draft(thread_id, window, cx);
+                return Err(anyhow!(
+                    "persisted Stack Review Agent session failed to load: {error}"
+                ));
+            }
+            anyhow::ensure!(
+                conversation_view.read(cx).stack_review_origin() == Some(&origin),
+                "persisted Stack Review Agent origin does not match"
+            );
+            anyhow::ensure!(
+                conversation_view.read(cx).agent_key() == &agent,
+                "persisted Stack Review session belongs to a different Agent"
+            );
+            if let Some(initial_content) = initial_content.as_ref() {
+                Self::replace_stack_review_initial_content(
+                    &conversation_view,
+                    initial_content,
+                    window,
+                    cx,
+                )?;
+            }
+            return Ok(conversation_view);
+        }
+
+        let selected_agent = self.selected_agent.clone();
+        let thread = if let Some(metadata) = metadata {
+            self.create_agent_thread_with_server_and_stack_review_origin(
+                agent,
+                None,
+                Some(metadata.thread_id),
+                Some(metadata.folder_paths().clone()),
+                Some(title),
+                initial_content,
+                None,
+                AgentThreadSource::AgentPanel,
+                Some(origin),
+                window,
+                cx,
+            )
+        } else {
+            self.create_agent_thread_inner(
+                agent,
+                None,
+                None,
+                Some(session_id),
+                None,
+                Some(title),
+                initial_content,
+                None,
+                AgentThreadSource::AgentPanel,
+                Some(origin),
+                window,
+                cx,
+            )
+        };
+        self.set_selected_agent_and_persist(selected_agent, cx);
+        let conversation_view = thread.conversation_view;
+        let thread_id = conversation_view.read(cx).thread_id;
+        self.retained_threads
+            .insert(thread_id, conversation_view.clone());
+        Ok(conversation_view)
+    }
+
+    pub(crate) fn prepare_stack_review_composer(
+        &mut self,
+        session_owner: &str,
+        session_id: &acp::SessionId,
+        origin: &agent::StackReviewThreadOrigin,
+        initial_content: &AgentInitialContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let thread_id = self
+            .thread_id_for_owned_session(session_owner, session_id, cx)
+            .context("Stack Review Agent session is unavailable")?;
+        let conversation_view = self
+            .conversation_view_for_id(&thread_id, cx)
+            .cloned()
+            .context("Stack Review Agent conversation is unavailable")?;
+        anyhow::ensure!(
+            conversation_view.read(cx).stack_review_origin() == Some(origin),
+            "Stack Review Agent origin does not match"
+        );
+        Self::replace_stack_review_initial_content(&conversation_view, initial_content, window, cx)
+    }
+
+    fn replace_stack_review_initial_content(
+        conversation_view: &Entity<ConversationView>,
+        initial_content: &AgentInitialContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let AgentInitialContent::ContentBlock {
+            blocks,
+            auto_submit: false,
+        } = initial_content
+        else {
+            anyhow::bail!("Stack Review composer context must not auto-submit");
+        };
+        let thread_view = conversation_view
+            .read(cx)
+            .root_thread_view()
+            .context("Stack Review Agent thread is still loading")?;
+        thread_view.update(cx, |thread_view, cx| {
+            let editor = thread_view.message_editor.clone();
+            editor.update(cx, |editor, cx| {
+                let mut next = editor
+                    .draft_content_blocks_snapshot(cx)
+                    .into_iter()
+                    .filter(|block| !crate::stack_review_ai::is_stack_review_context_block(block))
+                    .collect::<Vec<_>>();
+                next.extend(blocks.iter().cloned());
+                editor.set_message(next, window, cx);
+                editor.set_managed_context_blocks(blocks.clone());
+            });
+        });
+        Ok(())
+    }
+
     pub fn create_thread_with_options(
         &mut self,
         options: CreateThreadOptions,
@@ -3265,6 +3434,68 @@ impl AgentPanel {
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn thread_id_for_session(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<ThreadId> {
+        let matches_session = |conversation_view: &Entity<ConversationView>| {
+            let conversation_view = conversation_view.read(cx);
+            conversation_view.root_session_id.as_ref() == Some(session_id)
+                || conversation_view
+                    .root_thread(cx)
+                    .is_some_and(|thread| thread.read(cx).session_id() == session_id)
+        };
+        self.active_conversation_view()
+            .filter(|conversation_view| matches_session(conversation_view))
+            .map(|conversation_view| conversation_view.read(cx).thread_id)
+            .or_else(|| {
+                self.retained_threads
+                    .iter()
+                    .find_map(|(thread_id, conversation_view)| {
+                        matches_session(conversation_view).then_some(*thread_id)
+                    })
+            })
+            .or_else(|| {
+                self.draft_thread.as_ref().and_then(|conversation_view| {
+                    matches_session(conversation_view).then(|| conversation_view.read(cx).thread_id)
+                })
+            })
+    }
+
+    pub(crate) fn thread_id_for_owned_session(
+        &self,
+        session_owner: &str,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<ThreadId> {
+        let matches = |conversation_view: &Entity<ConversationView>| {
+            let conversation_view = conversation_view.read(cx);
+            if conversation_view.thread_id.to_key_string() != session_owner {
+                return false;
+            }
+            conversation_view.root_session_id.as_ref() == Some(session_id)
+                || conversation_view
+                    .root_thread(cx)
+                    .is_some_and(|thread| thread.read(cx).session_id() == session_id)
+        };
+        self.active_conversation_view()
+            .filter(|conversation_view| matches(conversation_view))
+            .map(|conversation_view| conversation_view.read(cx).thread_id)
+            .or_else(|| {
+                self.retained_threads
+                    .iter()
+                    .find_map(|(thread_id, conversation_view)| {
+                        matches(conversation_view).then_some(*thread_id)
+                    })
+            })
+            .or_else(|| {
+                self.draft_thread.as_ref().and_then(|conversation_view| {
+                    matches(conversation_view).then(|| conversation_view.read(cx).thread_id)
+                })
+            })
     }
 
     /// Drops a thread — retained or the active ephemeral draft — from
@@ -4020,15 +4251,22 @@ impl AgentPanel {
         thread_id: &ThreadId,
         cx: &App,
     ) -> Option<&Entity<ConversationView>> {
-        self.retained_threads.get(thread_id).or_else(|| {
-            if let Some(view) = self.active_conversation_view()
-                && view.read(cx).thread_id == *thread_id
-            {
-                Some(view)
-            } else {
-                None
-            }
-        })
+        self.retained_threads
+            .get(thread_id)
+            .or_else(|| {
+                if let Some(view) = self.active_conversation_view()
+                    && view.read(cx).thread_id == *thread_id
+                {
+                    Some(view)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.draft_thread
+                    .as_ref()
+                    .filter(|view| view.read(cx).thread_id == *thread_id)
+            })
     }
 
     pub fn regenerate_thread_title(
@@ -4461,6 +4699,35 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AgentThread {
+        self.create_agent_thread_with_server_and_stack_review_origin(
+            agent,
+            server_override,
+            resume_thread_id,
+            work_dirs,
+            title,
+            initial_content,
+            model_override,
+            source,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    fn create_agent_thread_with_server_and_stack_review_origin(
+        &mut self,
+        agent: Agent,
+        server_override: Option<Rc<dyn AgentServer>>,
+        resume_thread_id: Option<ThreadId>,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        initial_content: Option<AgentInitialContent>,
+        model_override: Option<String>,
+        source: AgentThreadSource,
+        stack_review_origin: Option<agent::StackReviewThreadOrigin>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AgentThread {
         let resume_session_id = resume_thread_id.and_then(|tid| {
             ThreadMetadataStore::try_global(cx)
                 .and_then(|store| store.read(cx).entry(tid).and_then(|m| m.session_id.clone()))
@@ -4475,6 +4742,7 @@ impl AgentPanel {
             initial_content,
             model_override,
             source,
+            stack_review_origin,
             window,
             cx,
         )
@@ -4510,6 +4778,7 @@ impl AgentPanel {
             initial_content,
             None,
             source,
+            None,
             window,
             cx,
         )
@@ -4526,6 +4795,7 @@ impl AgentPanel {
         initial_content: Option<AgentInitialContent>,
         model_override: Option<String>,
         source: AgentThreadSource,
+        stack_review_origin: Option<agent::StackReviewThreadOrigin>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AgentThread {
@@ -4545,8 +4815,25 @@ impl AgentPanel {
 
         let connection_store = self.connection_store.clone();
 
-        let conversation_view = cx.new(|cx| {
-            crate::ConversationView::new(
+        let conversation_view = cx.new(|cx| match stack_review_origin {
+            Some(origin) => crate::ConversationView::new_stack_review(
+                server,
+                connection_store,
+                agent,
+                resume_session_id,
+                Some(thread_id),
+                work_dirs,
+                title,
+                initial_content,
+                workspace.clone(),
+                project,
+                thread_store,
+                origin,
+                source,
+                window,
+                cx,
+            ),
+            None => crate::ConversationView::new(
                 server,
                 connection_store,
                 agent,
@@ -4561,7 +4848,7 @@ impl AgentPanel {
                 source,
                 window,
                 cx,
-            )
+            ),
         });
 
         cx.observe_in(
@@ -13484,4 +13771,6 @@ mod tests {
             );
         });
     }
+
+    mod stack_review_tests;
 }
