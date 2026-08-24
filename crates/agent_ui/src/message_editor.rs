@@ -943,8 +943,74 @@ impl MessageEditor {
         });
     }
 
+    #[cfg(test)]
     pub fn set_managed_context_blocks(&mut self, blocks: Vec<acp::ContentBlock>) {
         self.managed_context_blocks = blocks;
+    }
+
+    pub fn replace_managed_context_blocks(
+        &mut self,
+        blocks: Vec<acp::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let managed_creases = self.editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+            let mention_set = self.mention_set.read(cx);
+            display_snapshot
+                .crease_snapshot
+                .crease_items_with_offsets(&buffer_snapshot)
+                .into_iter()
+                .filter(|(crease_id, _)| {
+                    matches!(
+                        mention_set.mention_uri_for_crease(crease_id),
+                        Some(MentionUri::StackReview { .. } | MentionUri::StackReviewTurn)
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        if !managed_creases.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_creases(
+                    managed_creases
+                        .iter()
+                        .map(|(crease_id, _)| *crease_id)
+                        .collect::<Vec<_>>(),
+                    cx,
+                );
+                editor.edit(
+                    managed_creases.iter().map(|(_, range)| (range.clone(), "")),
+                    cx,
+                );
+            });
+            self.mention_set.update(cx, |mention_set, cx| {
+                for (crease_id, _) in &managed_creases {
+                    mention_set.remove_mention(crease_id, cx);
+                }
+            });
+        }
+        self.managed_context_blocks = blocks.clone();
+        let selection_ranges = self.editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let selection_ranges = editor
+                .selections
+                .all::<MultiBufferOffset>(&display_snapshot)
+                .into_iter()
+                .map(|selection| selection.start..selection.end)
+                .collect::<Vec<_>>();
+            let end = display_snapshot.buffer_snapshot().len();
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([end..end]);
+            });
+            selection_ranges
+        });
+        self.insert_message_blocks(blocks, true, window, cx);
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges(selection_ranges);
+            });
+        });
     }
 
     pub fn clear_after_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5671,6 +5737,53 @@ mod tests {
         let blocks =
             message_editor.read_with(cx, |editor, cx| editor.draft_content_blocks_snapshot(cx));
         assert_eq!(blocks, managed);
+    }
+
+    #[gpui::test]
+    async fn test_replace_managed_context_preserves_user_cursor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+        let context_block = |text: &str| {
+            acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new(text, "zed:///agent/stack-review-turn"),
+                ),
+            ))
+        };
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor
+                .session_capabilities
+                .write()
+                .set_prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true));
+            editor.set_text("keep this draft", window, cx);
+            editor.set_cursor_offset(4, window, cx);
+            editor.replace_managed_context_blocks(vec![context_block("first context")], window, cx);
+            editor.replace_managed_context_blocks(
+                vec![context_block("second context")],
+                window,
+                cx,
+            );
+        });
+
+        message_editor.update(cx, |editor, cx| {
+            let cursor = editor.editor.update(cx, |editor, cx| {
+                editor
+                    .selections
+                    .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                    .head()
+            });
+            assert_eq!(cursor, MultiBufferOffset(4));
+            let user_text = editor
+                .draft_content_blocks_snapshot(cx)
+                .into_iter()
+                .filter_map(|block| match block {
+                    acp::ContentBlock::Text(text) => Some(text.text),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(user_text, "keep this draft");
+        });
     }
 
     #[gpui::test]

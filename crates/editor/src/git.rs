@@ -521,6 +521,14 @@ pub(super) fn stack_review_comment_debug_identity(record_id: Option<&str>, id: u
         .debug_identity()
 }
 
+fn stack_review_agent_prompt_body(value: &str) -> Option<&str> {
+    let remainder = value.trim().strip_prefix("@agent")?;
+    if !remainder.is_empty() && !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    Some(remainder.trim())
+}
+
 pub(super) fn stack_review_comment_instance_debug_selector(
     prefix: &str,
     record_id: Option<&str>,
@@ -1237,6 +1245,7 @@ impl Editor {
     pub fn replace_stack_review_agent_projection(
         &mut self,
         projections: HashMap<String, Vec<Entity<Markdown>>>,
+        loading_record_ids: HashSet<String>,
         cx: &mut Context<Self>,
     ) {
         if !self.is_stack_review {
@@ -1251,6 +1260,7 @@ impl Editor {
             }
         }
         self.stack_review_agent_projections = projections;
+        self.stack_review_agent_loading_record_ids = loading_record_ids;
         cx.notify();
     }
 
@@ -3879,6 +3889,7 @@ impl Editor {
             is_stack_review,
             inline_editors,
             agent_projections,
+            agent_loading_record_ids,
             user_avatar_uri,
             line_ranges,
         ) = editor_handle
@@ -3936,6 +3947,7 @@ impl Editor {
                     editor.is_stack_review,
                     editors,
                     editor.stack_review_agent_projections.clone(),
+                    editor.stack_review_agent_loading_record_ids.clone(),
                     avatar_uri,
                     line_ranges,
                 )
@@ -3949,12 +3961,14 @@ impl Editor {
                 false,
                 HashMap::default(),
                 HashMap::default(),
+                HashSet::default(),
                 None,
                 None,
             ));
 
         let comment_count = comments.len();
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+        let loading_record_ids = agent_loading_record_ids;
         let avatar_size = px(20.);
         let action_icon_size = IconSize::XSmall;
         let close_editor = editor_handle.clone();
@@ -4073,6 +4087,7 @@ impl Editor {
                     pending_reply_to_record_id.as_deref(),
                     is_stack_review,
                     agent_projections,
+                    loading_record_ids,
                     markdown_style,
                     prompt_editor.clone(),
                     inline_editors,
@@ -4095,6 +4110,7 @@ impl Editor {
         pending_reply_to_record_id: Option<&str>,
         is_stack_review: bool,
         agent_projections: HashMap<String, Vec<Entity<Markdown>>>,
+        loading_record_ids: HashSet<String>,
         markdown_style: MarkdownStyle,
         prompt_editor: Entity<Editor>,
         inline_editors: HashMap<ReviewCommentKey, Entity<Editor>>,
@@ -4183,6 +4199,10 @@ impl Editor {
                                 .and_then(|record_id| agent_projections.get(record_id))
                                 .cloned()
                                 .unwrap_or_default();
+                            let agent_loading = comment
+                                .record_id
+                                .as_ref()
+                                .is_some_and(|record_id| loading_record_ids.contains(record_id));
                             Self::render_comment_row(
                                 comment,
                                 occurrence,
@@ -4190,6 +4210,7 @@ impl Editor {
                                 reply_metadata,
                                 is_stack_review,
                                 agent_projection,
+                                agent_loading,
                                 markdown_style.clone(),
                                 inline_editor,
                                 user_avatar_uri.clone(),
@@ -4294,6 +4315,7 @@ impl Editor {
         reply_metadata: Option<StackReviewReplyMetadata>,
         is_stack_review: bool,
         agent_projection: Vec<Entity<Markdown>>,
+        agent_loading: bool,
         markdown_style: MarkdownStyle,
         inline_editor: Option<Entity<Editor>>,
         user_avatar_uri: Option<SharedUri>,
@@ -4318,6 +4340,7 @@ impl Editor {
         let resolved = comment.resolved;
         let stashed = comment.stashed;
         let comment_text = comment.comment.clone();
+        let agent_prompt_body = stack_review_agent_prompt_body(&comment_text).map(str::to_owned);
         let reply_record_id = comment.record_id.clone();
         let comment_identity = comment.debug_identity();
         let action_identity = if is_stack_review {
@@ -4382,6 +4405,22 @@ impl Editor {
                 .py_1()
                 .child(editor)
                 .into_any_element()
+        } else if let Some(prompt_body) = agent_prompt_body {
+            h_flex()
+                .w_full()
+                .items_start()
+                .gap_1()
+                .debug_selector(|| "STACK_REVIEW_AGENT_PROMPT".into())
+                .child(
+                    Label::new("@agent")
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::SEMIBOLD)
+                        .color(Color::Accent),
+                )
+                .when(!prompt_body.is_empty(), |content| {
+                    content.child(Label::new(prompt_body).size(LabelSize::Small))
+                })
+                .into_any_element()
         } else {
             div()
                 .w_full()
@@ -4407,6 +4446,7 @@ impl Editor {
                     .role(gpui::Role::Button)
                     .aria_label("Use review comment as Agent context")
                     .tab_index(0)
+                    .focus(|style| style.border_1().border_color(colors.border_focused))
                     .on_key_down(move |event: &gpui::KeyDownEvent, _, cx| {
                         if event.keystroke.modifiers.modified()
                             || !matches!(event.keystroke.key.as_str(), "enter" | "space")
@@ -4485,6 +4525,22 @@ impl Editor {
                         )
                     })
                     .child(comment_content)
+                    .when(agent_loading, |content| {
+                        content.child(
+                            h_flex()
+                                .id(("stack-review-agent-loading", comment_id))
+                                .w_full()
+                                .mt_1()
+                                .role(gpui::Role::Group)
+                                .aria_label("Agent is working")
+                                .debug_selector(|| "STACK_REVIEW_AGENT_LOADING".into())
+                                .child(
+                                    LoadingLabel::new("Agent is working")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .children(agent_projection.into_iter().map(|markdown| {
                         div()
                             .id(("stack-review-agent-response", markdown.entity_id()))

@@ -47,6 +47,18 @@ pub(crate) fn stack_review_turn_envelope(
     })
 }
 
+fn update_stack_review_turn_envelope(
+    current: &mut Option<StackReviewTurnEnvelope>,
+    is_optimistic: bool,
+    chunks: &[acp::ContentBlock],
+    context_key: &StackReviewAiContextKey,
+    project_identity: &gpui::SharedString,
+) {
+    if is_optimistic {
+        *current = stack_review_turn_envelope(chunks, context_key, project_identity);
+    }
+}
+
 fn stack_review_status_for_stop(reason: acp::StopReason) -> StackReviewAiStatus {
     match reason {
         acp::StopReason::EndTurn => StackReviewAiStatus::Ready,
@@ -97,6 +109,7 @@ fn append_stack_review_context_with_envelope(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn is_stack_review_context_block(block: &acp::ContentBlock) -> bool {
     if let acp::ContentBlock::Text(text) = block {
         return StackReviewTurnEnvelope::from_metadata_text(&text.text).is_ok();
@@ -190,8 +203,13 @@ impl ZedStackReviewAiHost {
         for entry in thread.entries() {
             match entry {
                 AgentThreadEntry::UserMessage(message) => {
-                    envelope =
-                        stack_review_turn_envelope(&message.chunks, context_key, project_identity);
+                    update_stack_review_turn_envelope(
+                        &mut envelope,
+                        message.is_optimistic,
+                        &message.chunks,
+                        context_key,
+                        project_identity,
+                    );
                 }
                 AgentThreadEntry::AssistantMessage(message) => {
                     for chunk in &message.chunks {
@@ -214,11 +232,20 @@ impl ZedStackReviewAiHost {
                 | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
+        let active_projection_target = matches!(status, StackReviewAiStatus::Generating)
+            .then(|| {
+                envelope
+                    .as_ref()
+                    .and_then(StackReviewTurnEnvelope::projection_target)
+                    .cloned()
+            })
+            .flatten();
         projection.apply_update(
             StackReviewAiProjectionUpdate {
                 generation,
                 session_id: Some(session_id),
                 status,
+                active_projection_target,
                 assistant_turns,
             },
             cx,
@@ -280,6 +307,7 @@ impl ZedStackReviewAiHost {
                         generation,
                         session_id: None,
                         status: StackReviewAiStatus::Failed(error),
+                        active_projection_target: None,
                         assistant_turns: Vec::new(),
                     },
                     cx,
@@ -292,6 +320,7 @@ impl ZedStackReviewAiHost {
                         status: StackReviewAiStatus::Failed(
                             "Agent authentication is required; open Agent Panel to sign in".into(),
                         ),
+                        active_projection_target: None,
                         assistant_turns: Vec::new(),
                     },
                     cx,
@@ -727,6 +756,57 @@ mod tests {
             envelope.projection_target(),
             context.selected_record_id.as_ref()
         );
+    }
+
+    #[test]
+    fn only_optimistic_user_chunks_can_supply_projection_envelopes() {
+        let context = test_context();
+        let AgentInitialContent::ContentBlock { blocks, .. } =
+            ZedStackReviewAiHost::composer_initial_content(&context).unwrap()
+        else {
+            panic!("expected content-block initial content");
+        };
+        let project_identity: gpui::SharedString = "project-a".into();
+
+        let mut active = None;
+        update_stack_review_turn_envelope(
+            &mut active,
+            false,
+            &blocks,
+            &context.key,
+            &project_identity,
+        );
+        assert!(active.is_none());
+        update_stack_review_turn_envelope(
+            &mut active,
+            true,
+            &blocks,
+            &context.key,
+            &project_identity,
+        );
+        assert_eq!(
+            active
+                .as_ref()
+                .and_then(StackReviewTurnEnvelope::projection_target)
+                .map(|target| target.as_ref()),
+            Some("comment-a")
+        );
+        update_stack_review_turn_envelope(
+            &mut active,
+            false,
+            &blocks,
+            &context.key,
+            &project_identity,
+        );
+        assert_eq!(
+            active
+                .as_ref()
+                .and_then(StackReviewTurnEnvelope::projection_target)
+                .map(|target| target.as_ref()),
+            Some("comment-a")
+        );
+        update_stack_review_turn_envelope(&mut active, true, &[], &context.key, &project_identity);
+        assert!(active.is_none());
     }
 
     #[test]

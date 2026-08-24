@@ -352,7 +352,7 @@ async fn test_stack_review_ai_host_uses_workspace_owned_agent_thread(cx: &mut Te
     let original_conversation_id = panel.read_with(&cx, |panel, cx| {
         let session_id = acp::SessionId::new(session_id.to_string());
         let thread_id = panel
-            .thread_id_for_session(&session_id, cx)
+            .thread_id_for_agent_session(&Agent::NativeAgent, &session_id, cx)
             .expect("Stack Review panel thread");
         panel
             .conversation_view_for_id(&thread_id, cx)
@@ -395,7 +395,7 @@ async fn test_stack_review_ai_host_uses_workspace_owned_agent_thread(cx: &mut Te
     panel.read_with(&cx, |panel, cx| {
         let native_session_id = acp::SessionId::new(session_id.to_string());
         let thread_id = panel
-            .thread_id_for_session(&native_session_id, cx)
+            .thread_id_for_agent_session(&Agent::NativeAgent, &native_session_id, cx)
             .expect("resumed Stack Review panel thread");
         assert_eq!(
             panel

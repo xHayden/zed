@@ -40854,15 +40854,25 @@ fn test_stack_review_agent_projection_renders_inside_target_comment(cx: &mut Tes
         let markdown = cx.new(|cx| Markdown::new("Agent response".into(), None, None, cx));
         let mut projections = collections::HashMap::default();
         projections.insert("agent-target".into(), vec![markdown]);
-        editor.replace_stack_review_agent_projection(projections, cx);
+        let mut loading = HashSet::default();
+        loading.insert("agent-target".into());
+        editor.replace_stack_review_agent_projection(projections, loading, cx);
     });
 
     cx.run_until_parked();
+    let prompt_bounds = cx
+        .debug_bounds("STACK_REVIEW_AGENT_PROMPT")
+        .expect("@agent prompt treatment must render inside its target comment");
+    let loading_bounds = cx
+        .debug_bounds("STACK_REVIEW_AGENT_LOADING")
+        .expect("Agent loading state must render inside its target comment");
     let response_bounds = cx
         .debug_bounds("STACK_REVIEW_AGENT_RESPONSE")
         .expect("agent response must render inside its target comment");
-    assert!(response_bounds.size.width > px(0.));
-    assert!(response_bounds.size.height > px(0.));
+    for bounds in [prompt_bounds, loading_bounds, response_bounds] {
+        assert!(bounds.size.width > px(0.));
+        assert!(bounds.size.height > px(0.));
+    }
 }
 
 #[gpui::test]

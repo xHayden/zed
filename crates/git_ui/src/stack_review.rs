@@ -18,9 +18,9 @@ use git::{
 };
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DragMoveEvent,
-    Entity, EntityId, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Pixels,
-    PromptLevel, Render, SharedString, Subscription, Task, Window, actions, deferred, prelude::*,
-    px, uniform_list,
+    Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Pixels, PromptLevel,
+    Render, SharedString, Subscription, Task, Window, actions, deferred, prelude::*, px,
+    uniform_list,
 };
 use language::Point;
 
@@ -3293,6 +3293,13 @@ type PendingStackReviewAiPrompts = HashMap<
     git_ui_core::stack_review_ai::StackReviewAiContextKey,
     VecDeque<PendingStackReviewAiPrompt>,
 >;
+type PendingStackReviewAiComposerContexts = HashMap<
+    git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    (
+        git_ui_core::stack_review_ai::StackReviewAiGeneration,
+        git_ui_core::stack_review_ai::StackReviewAiContext,
+    ),
+>;
 
 fn enqueue_pending_stack_review_ai_prompt(
     pending: &mut PendingStackReviewAiPrompts,
@@ -3334,6 +3341,45 @@ fn take_pending_stack_review_ai_prompts(
         .flatten()
         .filter(|(pending_generation, _, _)| *pending_generation == generation)
         .collect()
+}
+
+fn pending_stack_review_ai_context<'a>(
+    pending: &'a PendingStackReviewAiPrompts,
+    context_key: &git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    generation: git_ui_core::stack_review_ai::StackReviewAiGeneration,
+) -> Option<&'a git_ui_core::stack_review_ai::StackReviewAiContext> {
+    pending.get(context_key).and_then(|prompts| {
+        prompts
+            .iter()
+            .find(|(pending_generation, _, _)| *pending_generation == generation)
+            .map(|(_, _, context)| context)
+    })
+}
+
+fn take_pending_stack_review_ai_composer_context(
+    pending: &mut PendingStackReviewAiComposerContexts,
+    context_key: &git_ui_core::stack_review_ai::StackReviewAiContextKey,
+    generation: git_ui_core::stack_review_ai::StackReviewAiGeneration,
+    session_id: Option<&SharedString>,
+    session_owner: Option<&SharedString>,
+) -> Option<git_ui_core::stack_review_ai::StackReviewAiContext> {
+    session_id.zip(session_owner)?;
+    let matches_generation = pending
+        .get(context_key)
+        .is_some_and(|(pending_generation, _)| *pending_generation == generation);
+    matches_generation
+        .then(|| pending.remove(context_key).map(|(_, context)| context))
+        .flatten()
+}
+
+fn stack_review_loading_record_id<'a>(
+    active_projection_target: Option<&'a str>,
+    pending_context: Option<&'a git_ui_core::stack_review_ai::StackReviewAiContext>,
+    selected_context: Option<&'a git_ui_core::stack_review_ai::StackReviewAiContext>,
+) -> Option<&'a str> {
+    active_projection_target
+        .or_else(|| pending_context.and_then(|context| context.selected_record_id.as_deref()))
+        .or_else(|| selected_context.and_then(|context| context.selected_record_id.as_deref()))
 }
 
 pub struct StackReview {
@@ -3390,7 +3436,11 @@ pub struct StackReview {
         git_ui_core::stack_review_ai::StackReviewAiContextKey,
         Entity<git_ui_core::stack_review_ai::StackReviewAiProjection>,
     >,
-    ai_projected_turn_ids: HashSet<EntityId>,
+    ai_contexts: HashMap<
+        git_ui_core::stack_review_ai::StackReviewAiContextKey,
+        git_ui_core::stack_review_ai::StackReviewAiContext,
+    >,
+    pending_ai_composer_contexts: PendingStackReviewAiComposerContexts,
 
     ai_error: Option<SharedString>,
     ai_activation_tasks: HashMap<git_ui_core::stack_review_ai::StackReviewAiContextKey, Task<()>>,
@@ -3453,36 +3503,121 @@ impl StackReview {
         Ok(context)
     }
 
+    fn unbind_ai_thread(
+        &mut self,
+        context_key: &git_ui_core::stack_review_ai::StackReviewAiContextKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let binding_key = context_key.presentation_binding_key();
+        let changed = self
+            .presentation_state
+            .as_mut()
+            .and_then(|state| state.unbind_thread(&binding_key).ok().flatten())
+            .is_some();
+        if changed {
+            self.queue_presentation_state_write(window, cx);
+        }
+    }
+
     fn refresh_ai_comment_projection(&mut self, cx: &mut Context<Self>) {
+        let active_path = self
+            .selected_file_index
+            .and_then(|index| self.files.get(index))
+            .map(|file| file.path.as_str());
+        let is_active_record = |record_id: &str| {
+            active_path.is_some_and(|active_path| {
+                self.comment_records
+                    .get(record_id)
+                    .and_then(|record| record.record.path.as_deref())
+                    == Some(active_path)
+            })
+        };
         let mut projections =
             collections::HashMap::<String, Vec<Entity<markdown::Markdown>>>::default();
-        let mut projected_turn_ids = HashSet::new();
-        for projection in self.ai_projections.values() {
-            for turn in projection.read(cx).assistant_turns() {
-                if let Some(target) = turn.projection_target() {
+        let mut loading_record_ids = collections::HashSet::default();
+        for (context_key, projection) in &self.ai_projections {
+            let projection = projection.read(cx);
+            let pending_context = pending_stack_review_ai_context(
+                &self.pending_ai_prompts,
+                context_key,
+                projection.generation(),
+            );
+            let selected_context = self.ai_contexts.get(context_key);
+            let loading_record_id = match projection.status() {
+                git_ui_core::stack_review_ai::StackReviewAiStatus::Generating => {
+                    stack_review_loading_record_id(
+                        projection
+                            .active_projection_target()
+                            .map(SharedString::as_ref),
+                        None,
+                        None,
+                    )
+                }
+                git_ui_core::stack_review_ai::StackReviewAiStatus::Loading => {
+                    stack_review_loading_record_id(
+                        projection
+                            .active_projection_target()
+                            .map(SharedString::as_ref),
+                        pending_context,
+                        selected_context,
+                    )
+                }
+                git_ui_core::stack_review_ai::StackReviewAiStatus::Ready
+                | git_ui_core::stack_review_ai::StackReviewAiStatus::Canceled
+                | git_ui_core::stack_review_ai::StackReviewAiStatus::Failed(_)
+                | git_ui_core::stack_review_ai::StackReviewAiStatus::MissingThread
+                | git_ui_core::stack_review_ai::StackReviewAiStatus::NoModel => None,
+            };
+            if let Some(record_id) =
+                loading_record_id.filter(|record_id| is_active_record(record_id))
+            {
+                loading_record_ids.insert(record_id.to_owned());
+            }
+            for turn in projection.assistant_turns() {
+                if let Some(target) = turn
+                    .projection_target()
+                    .filter(|target| is_active_record(target))
+                {
                     let markdown = turn.markdown();
                     let target_turns = projections.entry(target.to_string()).or_default();
                     if !target_turns
                         .iter()
                         .any(|existing| existing.entity_id() == markdown.entity_id())
                     {
-                        projected_turn_ids.insert(markdown.entity_id());
                         target_turns.push(markdown.clone());
                     }
                 }
             }
         }
-        if projected_turn_ids == self.ai_projected_turn_ids {
-            return;
+        for (context_key, generation) in &self.ai_activation_generations {
+            let pending_context =
+                pending_stack_review_ai_context(&self.pending_ai_prompts, context_key, *generation);
+            if let Some(record_id) = stack_review_loading_record_id(
+                None,
+                pending_context,
+                self.ai_contexts.get(context_key),
+            )
+            .filter(|record_id| is_active_record(record_id))
+            {
+                loading_record_ids.insert(record_id.to_owned());
+            }
         }
-        self.ai_projected_turn_ids = projected_turn_ids;
         if let Some(diff_view) = &self.diff_view {
             diff_view.read(cx).editor().update(cx, |editor, cx| {
-                editor.replace_stack_review_agent_projection(projections.clone(), cx);
+                editor.replace_stack_review_agent_projection(
+                    projections.clone(),
+                    loading_record_ids.clone(),
+                    cx,
+                );
             });
             if let Some(left_editor) = diff_view.read(cx).left_editor(cx) {
                 left_editor.update(cx, |editor, cx| {
-                    editor.replace_stack_review_agent_projection(projections, cx);
+                    editor.replace_stack_review_agent_projection(
+                        projections,
+                        loading_record_ids,
+                        cx,
+                    );
                 });
             }
         }
@@ -3496,11 +3631,12 @@ impl StackReview {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (projection_generation, session_id, status, durable_binding_allowed) = {
+        let (projection_generation, session_id, session_owner, status, durable_binding_allowed) = {
             let projection = projection.read(cx);
             (
                 projection.generation(),
                 projection.session_id().cloned(),
+                projection.session_owner().cloned(),
                 projection.status().clone(),
                 projection.durable_binding_allowed(),
             )
@@ -3524,6 +3660,46 @@ impl StackReview {
             }
         }
         self.refresh_ai_comment_projection(cx);
+        if let (Some(session_id), Some(session_owner), Some(context)) = (
+            session_id.as_ref(),
+            session_owner.as_ref(),
+            take_pending_stack_review_ai_composer_context(
+                &mut self.pending_ai_composer_contexts,
+                context_key,
+                generation,
+                session_id.as_ref(),
+                session_owner.as_ref(),
+            ),
+        ) {
+            let prepare_result = git_ui_core::stack_review_ai::stack_review_ai_host(cx)
+                .map_err(anyhow::Error::from)
+                .and_then(|host| {
+                    host.prepare_composer(
+                        context,
+                        session_id,
+                        session_owner,
+                        self.workspace.clone(),
+                        window,
+                        cx,
+                    )
+                });
+            if let Err(error) = prepare_result {
+                self.ai_error = Some(error.to_string().into());
+                self.ai_projections.remove(context_key);
+                self.pending_ai_composer_contexts.remove(context_key);
+                if self
+                    .ai_projection
+                    .as_ref()
+                    .is_some_and(|active| active.entity_id() == projection.entity_id())
+                {
+                    self.ai_projection = None;
+                }
+                self.unbind_ai_thread(context_key, window, cx);
+                self.refresh_ai_comment_projection(cx);
+                cx.notify();
+                return;
+            }
+        }
         if session_id.is_some() {
             for (_, prompt, context) in take_pending_stack_review_ai_prompts(
                 &mut self.pending_ai_prompts,
@@ -3577,6 +3753,8 @@ impl StackReview {
             }
         };
         let context_key = context.key.clone();
+        self.ai_contexts
+            .insert(context_key.clone(), context.clone());
         if let Some(prompt) = pending_prompt.as_ref()
             && enqueue_pending_stack_review_ai_prompt_for_activation(
                 &mut self.pending_ai_prompts,
@@ -3588,11 +3766,12 @@ impl StackReview {
         {
             self.ai_context = Some(context);
             self.ai_error = None;
+            self.refresh_ai_comment_projection(cx);
             cx.notify();
             return;
         }
         if let Some(projection) = self.ai_projections.get(&context_key).cloned() {
-            let (generation, session_id, session_owner, failed_without_session) = {
+            let (generation, session_id, session_owner, failed_projection) = {
                 let projection = projection.read(cx);
                 (
                     projection.generation(),
@@ -3603,11 +3782,21 @@ impl StackReview {
                         git_ui_core::stack_review_ai::StackReviewAiStatus::Failed(_)
                             | git_ui_core::stack_review_ai::StackReviewAiStatus::MissingThread
                             | git_ui_core::stack_review_ai::StackReviewAiStatus::NoModel
-                    ) && projection.session_id().is_none(),
+                    ),
                 )
             };
-            if failed_without_session {
+            if failed_projection {
                 self.ai_projections.remove(&context_key);
+                self.pending_ai_composer_contexts.remove(&context_key);
+                if self
+                    .ai_projection
+                    .as_ref()
+                    .is_some_and(|active| active.entity_id() == projection.entity_id())
+                {
+                    self.ai_projection = None;
+                }
+                self.unbind_ai_thread(&context_key, window, cx);
+                self.refresh_ai_comment_projection(cx);
             } else {
                 let prepare_composer = pending_prompt.is_none();
                 if let Some(prompt) = pending_prompt {
@@ -3638,9 +3827,23 @@ impl StackReview {
                         cx,
                     ) {
                         self.ai_error = Some(error.to_string().into());
+                        self.ai_projections.remove(&context_key);
+                        self.pending_ai_composer_contexts.remove(&context_key);
+                        if self
+                            .ai_projection
+                            .as_ref()
+                            .is_some_and(|active| active.entity_id() == projection.entity_id())
+                        {
+                            self.ai_projection = None;
+                        }
+                        self.unbind_ai_thread(&context_key, window, cx);
+                        self.refresh_ai_comment_projection(cx);
                         cx.notify();
                         return;
                     }
+                } else if prepare_composer {
+                    self.pending_ai_composer_contexts
+                        .insert(context_key.clone(), (generation, context.clone()));
                 }
                 self.ai_context = Some(context);
                 self.ai_projection = Some(projection.clone());
@@ -3657,6 +3860,7 @@ impl StackReview {
             cx.notify();
             return;
         };
+        self.pending_ai_composer_contexts.remove(&context_key);
         let host = match git_ui_core::stack_review_ai::stack_review_ai_host(cx) {
             Ok(host) => host,
             Err(error) => {
@@ -3674,6 +3878,7 @@ impl StackReview {
         self.ai_generation = generation;
         self.ai_activation_generations
             .insert(context_key.clone(), generation);
+        self.refresh_ai_comment_projection(cx);
         let prepare_composer = pending_prompt.is_none();
         if let Some(prompt) = pending_prompt {
             enqueue_pending_stack_review_ai_prompt(
@@ -3742,7 +3947,7 @@ impl StackReview {
                 .ok();
             }
             Err(error) => {
-                this.update(cx, |this, cx| {
+                this.update_in(cx, |this, window, cx| {
                     let is_current = this
                         .ai_activation_generations
                         .get(&activation_context_key)
@@ -3763,6 +3968,10 @@ impl StackReview {
                     }
                     if is_current {
                         this.pending_ai_prompts.remove(&activation_context_key);
+                        this.pending_ai_composer_contexts
+                            .remove(&activation_context_key);
+                        this.unbind_ai_thread(&activation_context_key, window, cx);
+                        this.refresh_ai_comment_projection(cx);
                     }
                 })
                 .ok();
@@ -4177,7 +4386,8 @@ impl StackReview {
             ai_context: None,
             ai_projection: None,
             ai_projections: HashMap::new(),
-            ai_projected_turn_ids: HashSet::new(),
+            ai_contexts: HashMap::new(),
+            pending_ai_composer_contexts: HashMap::new(),
 
             ai_error: None,
             ai_activation_tasks: HashMap::new(),
@@ -4216,6 +4426,8 @@ impl StackReview {
         self.ai_context = None;
         self.ai_projection = None;
         self.ai_projections.clear();
+        self.ai_contexts.clear();
+        self.pending_ai_composer_contexts.clear();
         self.ai_error = None;
         self.ai_activation_tasks.clear();
         self.ai_activation_generations.clear();
@@ -4903,6 +5115,7 @@ impl StackReview {
                             cx,
                         );
                     }
+                    this.refresh_ai_comment_projection(cx);
                     this.error = None;
                     if let Some(target) = this.pending_citation_reveal.take() {
                         if let Err(error) = this.reveal_citation_range(&target, window, cx) {
@@ -6583,7 +6796,8 @@ impl StackReview {
             "stack-review-shortcuts",
             "Shortcuts",
             ContextMenu::build(window, cx, move |menu, _, _| {
-                menu.context(shortcut_focus)
+                let menu = menu
+                    .context(shortcut_focus)
                     .action("Previous file", Box::new(StackReviewPreviousFile))
                     .action("Next file", Box::new(StackReviewNextFile))
                     .action(
@@ -6612,7 +6826,14 @@ impl StackReview {
                     .action(
                         "Show or hide migrations",
                         Box::new(StackReviewToggleMigrations),
-                    )
+                    );
+                if ai_enabled {
+                    menu.separator()
+                        .action("Use file in Agent", Box::new(StackReviewUseFileInAgent))
+                        .action("Open Agent", Box::new(StackReviewOpenAgent))
+                } else {
+                    menu
+                }
             }),
         );
         let resolved_comment_count = self
@@ -7294,6 +7515,91 @@ mod tests {
         assert_eq!(prompts, ["first", "second"]);
     }
 
+    #[test]
+    fn pending_stack_review_composer_context_waits_for_session_ownership() {
+        let key = git_ui_core::stack_review_ai::StackReviewAiContextKey::review("base-head");
+        let context = pending_ai_test_context(key.clone());
+        let generation = git_ui_core::stack_review_ai::StackReviewAiGeneration::default()
+            .next()
+            .unwrap();
+        let other_generation = generation.next().unwrap();
+        let mut pending = HashMap::from([(key.clone(), (generation, context.clone()))]);
+        let session_id: SharedString = "session".into();
+        let session_owner: SharedString = "owner".into();
+
+        assert!(
+            take_pending_stack_review_ai_composer_context(
+                &mut pending,
+                &key,
+                generation,
+                None,
+                Some(&session_owner),
+            )
+            .is_none()
+        );
+        assert!(pending.contains_key(&key));
+        assert!(
+            take_pending_stack_review_ai_composer_context(
+                &mut pending,
+                &key,
+                other_generation,
+                Some(&session_id),
+                Some(&session_owner),
+            )
+            .is_none()
+        );
+        assert!(pending.contains_key(&key));
+        assert_eq!(
+            take_pending_stack_review_ai_composer_context(
+                &mut pending,
+                &key,
+                generation,
+                Some(&session_id),
+                Some(&session_owner),
+            ),
+            Some(context)
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn loading_indicator_stays_on_the_captured_turn_target() {
+        let mut queued = pending_ai_test_context(
+            git_ui_core::stack_review_ai::StackReviewAiContextKey::comment("base-head", "thread-a"),
+        );
+        queued.selected_record_id = Some("comment-a".into());
+        let mut selected = queued.clone();
+        selected.selected_record_id = Some("comment-b".into());
+        let mut stale = queued.clone();
+        stale.selected_record_id = Some("comment-stale".into());
+        let generation = git_ui_core::stack_review_ai::StackReviewAiGeneration::default()
+            .next()
+            .unwrap();
+        let stale_generation = generation.next().unwrap();
+        let key = queued.key.clone();
+        let pending = HashMap::from([(
+            key.clone(),
+            VecDeque::from([
+                (stale_generation, "stale".into(), stale),
+                (generation, "current".into(), queued.clone()),
+            ]),
+        )]);
+        let captured = pending_stack_review_ai_context(&pending, &key, generation);
+
+        assert_eq!(
+            stack_review_loading_record_id(None, captured, Some(&selected)),
+            Some("comment-a")
+        );
+        assert_eq!(
+            stack_review_loading_record_id(Some("comment-c"), Some(&queued), Some(&selected)),
+            Some("comment-c")
+        );
+        assert_eq!(
+            stack_review_loading_record_id(None, None, Some(&selected)),
+            Some("comment-b")
+        );
+    }
+
     fn init_test(cx: &mut TestAppContext) {
         zlog::init_test();
         cx.update(|cx| {
@@ -7340,6 +7646,7 @@ mod tests {
                         generation,
                         session_id: Some("test-stack-review-session".into()),
                         status: git_ui_core::stack_review_ai::StackReviewAiStatus::Ready,
+                        active_projection_target: None,
                         assistant_turns: Vec::new(),
                     },
                     cx,
@@ -11172,7 +11479,8 @@ mod tests {
                     ai_context: None,
                     ai_projection: None,
                     ai_projections: HashMap::new(),
-                    ai_projected_turn_ids: HashSet::new(),
+                    ai_contexts: HashMap::new(),
+                    pending_ai_composer_contexts: HashMap::new(),
                     ai_error: None,
                     ai_activation_tasks: HashMap::new(),
                     ai_activation_generations: HashMap::new(),

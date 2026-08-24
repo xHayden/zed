@@ -817,6 +817,10 @@ fn update_command_palette_filter(cx: &mut App) {
             TypeId::of::<zed_actions::assistant::OpenSkillCreator>(),
             TypeId::of::<zed_actions::assistant::CreateSkillFromUrl>(),
         ];
+        let stack_review_agent_actions = [
+            "git::StackReviewUseFileInAgent",
+            "git::StackReviewOpenAgent",
+        ];
 
         if disable_ai {
             filter.hide_namespace("agent");
@@ -828,7 +832,9 @@ fn update_command_palette_filter(cx: &mut App) {
 
             filter.hide_action_types(&edit_prediction_actions);
             filter.hide_action_types(&[TypeId::of::<zed_actions::OpenZedPredictOnboarding>()]);
+            filter.hide_action_names(stack_review_agent_actions);
         } else {
+            filter.show_action_names(stack_review_agent_actions);
             if agent_enabled {
                 filter.show_namespace("agent");
                 filter.show_namespace("agents");
@@ -1053,6 +1059,18 @@ mod tests {
                 !filter.is_hidden(&zed_actions::assistant::OpenProjectAgentsMdRules),
                 "OpenProjectAgentsMdRules should be visible by default"
             );
+            assert!(!filter.is_action_name_hidden("git::StackReviewUseFileInAgent"));
+            assert!(!filter.is_action_name_hidden("git::StackReviewOpenAgent"));
+        });
+
+        cx.update(|cx| {
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: true }, cx);
+            update_command_palette_filter(cx);
+            let filter = CommandPaletteFilter::try_global(cx).unwrap();
+            assert!(filter.is_action_name_hidden("git::StackReviewUseFileInAgent"));
+            assert!(filter.is_action_name_hidden("git::StackReviewOpenAgent"));
+            DisableAiSettings::override_global(DisableAiSettings { disable_ai: false }, cx);
+            update_command_palette_filter(cx);
         });
 
         // Disable agent

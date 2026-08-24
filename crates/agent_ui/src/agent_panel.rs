@@ -3232,12 +3232,9 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> Result<Entity<ConversationView>> {
         let metadata = ThreadMetadataStore::try_global(cx)
-            .and_then(|store| store.read(cx).entry_by_session(&session_id).cloned());
-        let agent = metadata
-            .as_ref()
-            .map(|metadata| Agent::from(metadata.agent_id.clone()))
-            .unwrap_or(agent);
-        if let Some(thread_id) = self.thread_id_for_session(&session_id, cx)
+            .and_then(|store| store.read(cx).entry_by_session(&session_id).cloned())
+            .filter(|metadata| Agent::from(metadata.agent_id.clone()) == agent);
+        if let Some(thread_id) = self.thread_id_for_agent_session(&agent, &session_id, cx)
             && let Some(conversation_view) = self.conversation_view_for_id(&thread_id, cx).cloned()
         {
             if let Some(error) = conversation_view.read(cx).load_error() {
@@ -3347,14 +3344,7 @@ impl AgentPanel {
         thread_view.update(cx, |thread_view, cx| {
             let editor = thread_view.message_editor.clone();
             editor.update(cx, |editor, cx| {
-                let mut next = editor
-                    .draft_content_blocks_snapshot(cx)
-                    .into_iter()
-                    .filter(|block| !crate::stack_review_ai::is_stack_review_context_block(block))
-                    .collect::<Vec<_>>();
-                next.extend(blocks.iter().cloned());
-                editor.set_message(next, window, cx);
-                editor.set_managed_context_blocks(blocks.clone());
+                editor.replace_managed_context_blocks(blocks.clone(), window, cx);
             });
         });
         Ok(())
@@ -3436,35 +3426,6 @@ impl AgentPanel {
         }
     }
 
-    pub(crate) fn thread_id_for_session(
-        &self,
-        session_id: &acp::SessionId,
-        cx: &App,
-    ) -> Option<ThreadId> {
-        let matches_session = |conversation_view: &Entity<ConversationView>| {
-            let conversation_view = conversation_view.read(cx);
-            conversation_view.root_session_id.as_ref() == Some(session_id)
-                || conversation_view
-                    .root_thread(cx)
-                    .is_some_and(|thread| thread.read(cx).session_id() == session_id)
-        };
-        self.active_conversation_view()
-            .filter(|conversation_view| matches_session(conversation_view))
-            .map(|conversation_view| conversation_view.read(cx).thread_id)
-            .or_else(|| {
-                self.retained_threads
-                    .iter()
-                    .find_map(|(thread_id, conversation_view)| {
-                        matches_session(conversation_view).then_some(*thread_id)
-                    })
-            })
-            .or_else(|| {
-                self.draft_thread.as_ref().and_then(|conversation_view| {
-                    matches_session(conversation_view).then(|| conversation_view.read(cx).thread_id)
-                })
-            })
-    }
-
     pub(crate) fn thread_id_for_owned_session(
         &self,
         session_owner: &str,
@@ -3480,6 +3441,37 @@ impl AgentPanel {
                 || conversation_view
                     .root_thread(cx)
                     .is_some_and(|thread| thread.read(cx).session_id() == session_id)
+        };
+        self.active_conversation_view()
+            .filter(|conversation_view| matches(conversation_view))
+            .map(|conversation_view| conversation_view.read(cx).thread_id)
+            .or_else(|| {
+                self.retained_threads
+                    .iter()
+                    .find_map(|(thread_id, conversation_view)| {
+                        matches(conversation_view).then_some(*thread_id)
+                    })
+            })
+            .or_else(|| {
+                self.draft_thread.as_ref().and_then(|conversation_view| {
+                    matches(conversation_view).then(|| conversation_view.read(cx).thread_id)
+                })
+            })
+    }
+
+    pub(crate) fn thread_id_for_agent_session(
+        &self,
+        agent: &Agent,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<ThreadId> {
+        let matches = |conversation_view: &Entity<ConversationView>| {
+            let conversation_view = conversation_view.read(cx);
+            conversation_view.agent_key() == agent
+                && (conversation_view.root_session_id.as_ref() == Some(session_id)
+                    || conversation_view
+                        .root_thread(cx)
+                        .is_some_and(|thread| thread.read(cx).session_id() == session_id))
         };
         self.active_conversation_view()
             .filter(|conversation_view| matches(conversation_view))

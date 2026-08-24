@@ -78,6 +78,7 @@ pub struct StackReviewAiProjection {
     session_id: Option<SharedString>,
     session_owner: Option<SharedString>,
     status: StackReviewAiStatus,
+    active_projection_target: Option<SharedString>,
     assistant_turns: Vec<StackReviewAiTurn>,
     durable_binding_allowed: bool,
     subscriptions: Vec<Subscription>,
@@ -90,6 +91,7 @@ impl StackReviewAiProjection {
             session_id: None,
             session_owner: None,
             status: StackReviewAiStatus::Loading,
+            active_projection_target: None,
             assistant_turns: Vec::new(),
             durable_binding_allowed: false,
             subscriptions: Vec::new(),
@@ -114,6 +116,10 @@ impl StackReviewAiProjection {
 
     pub fn status(&self) -> &StackReviewAiStatus {
         &self.status
+    }
+
+    pub fn active_projection_target(&self) -> Option<&SharedString> {
+        self.active_projection_target.as_ref()
     }
 
     pub fn assistant_turns(&self) -> &[StackReviewAiTurn] {
@@ -141,6 +147,12 @@ impl StackReviewAiProjection {
         if generation != self.generation {
             return false;
         }
+        if !matches!(
+            status,
+            StackReviewAiStatus::Loading | StackReviewAiStatus::Generating
+        ) {
+            self.active_projection_target = None;
+        }
         self.status = status;
         cx.notify();
         true
@@ -159,6 +171,7 @@ impl StackReviewAiProjection {
         self.session_id = None;
         self.session_owner = None;
         self.status = StackReviewAiStatus::Loading;
+        self.active_projection_target = None;
         self.assistant_turns.clear();
         cx.notify();
         true
@@ -175,6 +188,7 @@ impl StackReviewAiProjection {
 
         self.session_id = update.session_id;
         self.status = update.status;
+        self.active_projection_target = update.active_projection_target;
         self.assistant_turns = update.assistant_turns;
         cx.notify();
         true
@@ -186,6 +200,7 @@ pub struct StackReviewAiProjectionUpdate {
     pub generation: StackReviewAiGeneration,
     pub session_id: Option<SharedString>,
     pub status: StackReviewAiStatus,
+    pub active_projection_target: Option<SharedString>,
     pub assistant_turns: Vec<StackReviewAiTurn>,
 }
 
@@ -566,11 +581,11 @@ impl StackReviewTurnEnvelope {
         self.schema_version
     }
 
-    pub fn to_json(&self) -> anyhow::Result<String> {
+    fn to_json(&self) -> anyhow::Result<String> {
         Ok(serde_json::to_string(self)?)
     }
 
-    pub fn from_json(json: &str) -> anyhow::Result<Self> {
+    fn from_json(json: &str) -> anyhow::Result<Self> {
         let envelope: Self = serde_json::from_str(json)?;
         anyhow::ensure!(
             envelope.schema_version == STACK_REVIEW_TURN_ENVELOPE_SCHEMA_VERSION,
@@ -1249,7 +1264,8 @@ mod tests {
                 StackReviewAiProjectionUpdate {
                     generation,
                     session_id: Some("session-1".into()),
-                    status: StackReviewAiStatus::Ready,
+                    status: StackReviewAiStatus::Generating,
+                    active_projection_target: Some("comment-a".into()),
                     assistant_turns: vec![turn.clone()],
                 },
                 cx,
@@ -1264,7 +1280,13 @@ mod tests {
                 projection.session_id().map(SharedString::as_ref),
                 Some("session-1")
             );
-            assert_eq!(projection.status(), &StackReviewAiStatus::Ready);
+            assert_eq!(projection.status(), &StackReviewAiStatus::Generating);
+            assert_eq!(
+                projection
+                    .active_projection_target()
+                    .map(SharedString::as_ref),
+                Some("comment-a")
+            );
             assert_eq!(projection.assistant_turns().len(), 1);
             let projected_turn = &projection.assistant_turns()[0];
             assert_eq!(projected_turn.turn_id().as_ref(), "turn-1");
@@ -1303,6 +1325,7 @@ mod tests {
                     generation: stale_generation,
                     session_id: Some("stale-session".into()),
                     status: StackReviewAiStatus::Ready,
+                    active_projection_target: None,
                     assistant_turns: Vec::new(),
                 },
                 cx,
