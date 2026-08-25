@@ -1139,7 +1139,11 @@ impl DisplayMap {
     }
 
     #[instrument(skip_all)]
-    pub fn resize_blocks(&mut self, heights: HashMap<CustomBlockId, u32>, cx: &mut Context<Self>) {
+    pub fn resize_blocks(
+        &mut self,
+        heights: HashMap<CustomBlockId, u32>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let (self_wrap_snapshot, self_wrap_edits) = self.sync_through_wrap(cx);
 
         Self::with_synced_companion_mut(
@@ -1153,7 +1157,7 @@ impl DisplayMap {
                         self_wrap_edits.clone(),
                         companion_view,
                     )
-                    .resize(heights);
+                    .resize(heights)
             },
         )
     }

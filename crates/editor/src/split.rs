@@ -2384,7 +2384,7 @@ mod tests {
     use collections::{HashMap, HashSet};
     use fs::FakeFs;
     use gpui::{AppContext as _, Entity, Pixels, VisualTestContext};
-    use gpui::{BorrowAppContext as _, Element as _};
+    use gpui::{BorrowAppContext as _, Element as _, IntoElement as _, Styled as _};
     use language::language_settings::SoftWrap;
     use language::{Buffer, Capability};
     use multi_buffer::{MultiBuffer, PathKey};
@@ -4854,7 +4854,13 @@ mod tests {
                         placement: BlockPlacement::Above(anchor),
                         height: Some(1),
                         style: BlockStyle::StickyMirrored,
-                        render: Arc::new(|_| div().child("mirrored block").into_any()),
+                        render: Arc::new(|cx| {
+                            let rows = if cx.max_width < px(400.) { 4. } else { 1. };
+                            div()
+                                .h(cx.line_height * rows)
+                                .child("mirrored block")
+                                .into_any()
+                        }),
                         priority: 0,
                     }],
                     None,
@@ -4952,6 +4958,17 @@ mod tests {
             heights.insert(balancing_block_id, 4);
             lhs.resize_blocks(heights, None, cx);
         });
+        assert_eq!(block_heights(cx), (4, 4));
+
+        let draw_size = gpui::size(px(1200.), px(800.));
+        editor.update(&mut *cx, |editor, cx| {
+            editor.set_split_left_ratio(0.2, cx);
+        });
+        cx.simulate_resize(draw_size);
+        cx.draw(gpui::Point::default(), draw_size, |_, _| {
+            editor.clone().into_any_element()
+        });
+        cx.run_until_parked();
         assert_eq!(block_heights(cx), (4, 4));
 
         rhs_editor.update(&mut *cx, |rhs, cx| {

@@ -333,6 +333,7 @@ pub struct BlockContext<'a, 'b> {
     pub block_id: BlockId,
     pub height: u32,
     pub selected: bool,
+    pub is_mirrored_companion: bool,
     pub editor_style: &'b EditorStyle,
     pub indent_guide_padding: Pixels,
 }
@@ -1910,19 +1911,20 @@ impl BlockMapWriter<'_> {
     }
 
     #[ztracing::instrument(skip_all)]
-    pub fn resize(&mut self, heights: HashMap<CustomBlockId, u32>) {
-        self.resize_internal(heights, true);
+    pub fn resize(&mut self, heights: HashMap<CustomBlockId, u32>) -> bool {
+        self.resize_internal(heights, true)
     }
 
     fn resize_internal(
         &mut self,
         mut heights: HashMap<CustomBlockId, u32>,
         record_measurements: bool,
-    ) {
+    ) -> bool {
         let wrap_snapshot = self.block_map.wrap_snapshot.borrow().clone();
         let buffer = wrap_snapshot.buffer_snapshot();
         let mut edits = Patch::default();
         let mut last_block_buffer_row = None;
+        let mut changed = false;
 
         let mut companion_heights = HashMap::default();
         for block in &mut self.block_map.custom_blocks {
@@ -1941,6 +1943,7 @@ impl BlockMapWriter<'_> {
                 }
 
                 if block.height != Some(new_height) {
+                    changed = true;
                     let new_block = CustomBlock {
                         id: block.id,
                         placement: block.placement.clone(),
@@ -2012,10 +2015,11 @@ impl BlockMapWriter<'_> {
         if let Some(companion) = &mut self.companion
             && let Some(inverse) = &mut companion.inverse
         {
-            inverse
+            changed |= inverse
                 .companion_writer
                 .resize_internal(companion_heights, false);
         }
+        changed
     }
 
     #[ztracing::instrument(skip_all)]

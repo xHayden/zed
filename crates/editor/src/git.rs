@@ -38,6 +38,21 @@ pub fn format_stack_review_comment_timestamp(timestamp: &str) -> String {
     )
 }
 
+pub(super) fn stack_review_overlay_block_style(
+    is_stack_review: bool,
+    has_published_comments: bool,
+) -> BlockStyle {
+    if is_stack_review && has_published_comments {
+        BlockStyle::StickyMirrored
+    } else {
+        BlockStyle::Sticky
+    }
+}
+
+pub(super) fn stack_review_overlay_shows_transient_state(is_mirrored_companion: bool) -> bool {
+    !is_mirrored_companion
+}
+
 #[derive(Clone)]
 pub struct ResolvedDiffHunk {
     pub buffer_range: Range<text::Anchor>,
@@ -1491,17 +1506,14 @@ impl Editor {
         } else {
             self.calculate_overlay_height(&hunk_key, true, composer_visible, &buffer_snapshot)
         };
+        let has_published_comments = self.hunk_comment_count(&hunk_key, &buffer_snapshot) > 0;
 
         // Create the overlay block
         let prompt_editor_for_render = prompt_editor.clone();
         let hunk_key_for_render = hunk_key.clone();
         let editor_handle = cx.entity().downgrade();
         let block = BlockProperties {
-            style: if self.is_stack_review {
-                BlockStyle::StickyMirrored
-            } else {
-                BlockStyle::Sticky
-            },
+            style: stack_review_overlay_block_style(self.is_stack_review, has_published_comments),
             placement: BlockPlacement::Below(anchor),
             height: Some(initial_height),
             render: Arc::new(move |cx| {
@@ -1568,6 +1580,15 @@ impl Editor {
         let author = overlay.comment_author.clone();
         let reply_to = overlay.pending_reply_to;
         let reply_to_record_id = overlay.pending_reply_to_record_id.clone();
+        let publish_overlay_after_submit = if self.is_stack_review {
+            let snapshot = self.buffer.read(cx).snapshot(cx);
+            self.hunk_comment_count(&hunk_key, &snapshot) == 0
+                && self
+                    .review_file_path_at(anchor_range.start.to_point(&snapshot), cx)
+                    .is_some()
+        } else {
+            false
+        };
 
         if self.is_stack_review && (reply_to.is_some() || reply_to_record_id.is_some()) {
             let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -1606,6 +1627,17 @@ impl Editor {
             reply_to_record_id,
             cx,
         );
+
+        if publish_overlay_after_submit {
+            let overlay = self.diff_review_overlays.remove(overlay_index);
+            self.remove_blocks(HashSet::from_iter([overlay.block_id]), None, cx);
+            let snapshot = self.buffer.read(cx).snapshot(cx);
+            let row = DisplayRow(hunk_key.hunk_start_anchor.to_point(&snapshot).row);
+            self.show_diff_review_overlay_internal(row..row, false, Some(hunk_key), window, cx);
+            window.focus(&self.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
 
         // Clear the prompt editor but keep the overlay open
         if let Some(overlay) = self.diff_review_overlays.get(overlay_index) {
@@ -3887,11 +3919,11 @@ impl Editor {
         let (
             comments,
             comments_expanded,
-            composer_visible,
-            pending_reply_to,
-            pending_reply_to_record_id,
+            mut composer_visible,
+            mut pending_reply_to,
+            mut pending_reply_to_record_id,
             is_stack_review,
-            inline_editors,
+            mut inline_editors,
             agent_projections,
             agent_loading_record_ids,
             user_avatar_uri,
@@ -3969,6 +4001,13 @@ impl Editor {
                 None,
                 None,
             ));
+
+        if !stack_review_overlay_shows_transient_state(cx.is_mirrored_companion) {
+            composer_visible = false;
+            pending_reply_to = None;
+            pending_reply_to_record_id = None;
+            inline_editors.clear();
+        }
 
         let comment_count = comments.len();
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);

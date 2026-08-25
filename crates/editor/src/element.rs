@@ -3254,6 +3254,8 @@ impl EditorElement {
                             block_id,
                             height: custom.height.unwrap_or(1),
                             selected,
+                            is_mirrored_companion: custom.style()
+                                == BlockStyle::StickyMirroredCompanion,
                             max_width: text_hitbox.size.width.max(*scroll_width),
                             editor_style: &self.style,
                             indent_guide_padding: indent_guides
@@ -8746,21 +8748,23 @@ impl Element for EditorElement {
                     } = blocks;
                     if let Some(resized_blocks) = resized_blocks {
                         if request_layout.has_remaining_prepaint_depth() {
-                            self.editor.update(cx, |editor, cx| {
+                            let changed = self.editor.update(cx, |editor, cx| {
                                 editor.resize_blocks(
                                     resized_blocks,
                                     autoscroll_request.map(|(autoscroll, _)| autoscroll),
                                     cx,
                                 )
                             });
-                            return self.prepaint(
-                                None,
-                                _inspector_id,
-                                bounds,
-                                request_layout,
-                                window,
-                                cx,
-                            );
+                            if changed {
+                                return self.prepaint(
+                                    None,
+                                    _inspector_id,
+                                    bounds,
+                                    request_layout,
+                                    window,
+                                    cx,
+                                );
+                            }
                         } else {
                             debug_panic!(
                                 "dropping block resize because prepaint depth \

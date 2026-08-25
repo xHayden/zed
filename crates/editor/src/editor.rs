@@ -8496,13 +8496,17 @@ impl Editor {
         heights: HashMap<CustomBlockId, u32>,
         autoscroll: Option<Autoscroll>,
         cx: &mut Context<Self>,
-    ) {
-        self.display_map
+    ) -> bool {
+        let changed = self
+            .display_map
             .update(cx, |display_map, cx| display_map.resize_blocks(heights, cx));
-        if let Some(autoscroll) = autoscroll {
-            self.request_autoscroll(autoscroll, cx);
+        if changed {
+            if let Some(autoscroll) = autoscroll {
+                self.request_autoscroll(autoscroll, cx);
+            }
+            cx.notify();
         }
-        cx.notify();
+        changed
     }
 
     pub fn replace_blocks(

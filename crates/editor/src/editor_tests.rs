@@ -40425,6 +40425,28 @@ fn test_diff_review_overlay_dismiss_via_cancel(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+#[test]
+fn test_stack_review_mirrors_only_published_overlay_blocks() {
+    assert_eq!(
+        crate::git::stack_review_overlay_block_style(true, false),
+        BlockStyle::Sticky
+    );
+    assert_eq!(
+        crate::git::stack_review_overlay_block_style(true, true),
+        BlockStyle::StickyMirrored
+    );
+    assert_eq!(
+        crate::git::stack_review_overlay_block_style(false, true),
+        BlockStyle::Sticky
+    );
+    assert!(crate::git::stack_review_overlay_shows_transient_state(
+        false
+    ));
+    assert!(!crate::git::stack_review_overlay_shows_transient_state(
+        true
+    ));
+}
+
 #[gpui::test]
 fn test_stack_review_cancel_keeps_overlays_with_saved_comments(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
