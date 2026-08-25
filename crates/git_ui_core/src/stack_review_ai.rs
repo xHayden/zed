@@ -544,6 +544,7 @@ pub struct StackReviewAiActivationRequest {
 
 pub const STACK_REVIEW_TURN_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 pub const STACK_REVIEW_TURN_ENVELOPE_URI: &str = "zed:///agent/stack-review-turn";
+pub const STACK_REVIEW_COMMENT_RESPONSE_INSTRUCTIONS: &str = "Stack Review response instructions: Reply compactly. Return only a separate reply to the comment. Do not rewrite or edit the original comment.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -632,12 +633,27 @@ impl StackReviewTurnEnvelope {
         let mut url = url::Url::parse(STACK_REVIEW_TURN_ENVELOPE_URI)?;
         url.query_pairs_mut()
             .append_pair("payload", &self.to_json()?);
-        Ok(format!("<!--{url}-->"))
+        let metadata = format!("<!--{url}-->");
+        if self.projection_target.is_some() {
+            Ok(format!(
+                "{STACK_REVIEW_COMMENT_RESPONSE_INSTRUCTIONS}\n\n{metadata}"
+            ))
+        } else {
+            Ok(metadata)
+        }
     }
 
     pub fn from_metadata_text(text: &str) -> anyhow::Result<Self> {
-        let url = text
-            .trim()
+        let text = text.trim();
+        let metadata =
+            if let Some(metadata) = text.strip_prefix(STACK_REVIEW_COMMENT_RESPONSE_INSTRUCTIONS) {
+                metadata
+                    .strip_prefix("\n\n")
+                    .context("Stack Review response instructions wrapper is invalid")?
+            } else {
+                text
+            };
+        let url = metadata
             .strip_prefix("<!--")
             .and_then(|text| text.strip_suffix("-->"))
             .context("Stack Review turn metadata wrapper is invalid")?;
@@ -1098,10 +1114,23 @@ mod tests {
         let metadata = envelope
             .to_metadata_text()
             .expect("serialize turn envelope metadata");
+        assert!(metadata.starts_with(STACK_REVIEW_COMMENT_RESPONSE_INSTRUCTIONS));
         assert_eq!(
             StackReviewTurnEnvelope::from_metadata_text(&metadata)
                 .expect("decode turn envelope metadata"),
             envelope
+        );
+        let review_metadata = StackReviewTurnEnvelope::new("turn-2", "project-a", &context, None)
+            .to_metadata_text()
+            .expect("serialize review turn metadata");
+        assert!(!review_metadata.contains(STACK_REVIEW_COMMENT_RESPONSE_INSTRUCTIONS));
+        assert!(
+            StackReviewTurnEnvelope::from_metadata_text(&metadata.replacen(
+                "Reply compactly",
+                "Reply at length",
+                1
+            ))
+            .is_err()
         );
         assert!(
             StackReviewTurnEnvelope::from_metadata_text(&metadata.replacen(

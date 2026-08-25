@@ -301,6 +301,13 @@ impl MultiDiffView {
         self.editor.clone()
     }
 
+    pub(crate) fn focused_editor(&self, cx: &App) -> Entity<Editor> {
+        self.split_editor
+            .as_ref()
+            .map(|split_editor| split_editor.read(cx).focused_editor().clone())
+            .unwrap_or_else(|| self.editor.clone())
+    }
+
     pub(crate) fn left_editor(&self, cx: &App) -> Option<Entity<Editor>> {
         self.split_editor
             .as_ref()

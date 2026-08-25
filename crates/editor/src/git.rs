@@ -357,6 +357,7 @@ pub(super) struct DiffHunkKey {
     pub(super) file_path: Arc<util::rel_path::RelPath>,
     /// An anchor at the start of the hunk. This tracks position as the buffer changes.
     pub(super) hunk_start_anchor: Anchor,
+    pub(super) review_range_end_anchor: Option<Anchor>,
 }
 
 /// A review comment stored locally before being sent to the Agent panel.
@@ -542,6 +543,22 @@ fn stack_review_agent_prompt_body(value: &str) -> Option<&str> {
         return None;
     }
     Some(remainder.trim())
+}
+
+pub(super) fn stack_review_comment_row_is_activatable(is_editing: bool) -> bool {
+    !is_editing
+}
+
+pub(super) fn review_overlay_group_anchor(
+    is_stack_review: bool,
+    diff_hunk_start: Anchor,
+    selected_range_start: Anchor,
+) -> Anchor {
+    if is_stack_review {
+        selected_range_start
+    } else {
+        diff_hunk_start
+    }
 }
 
 pub(super) fn stack_review_comment_instance_debug_selector(
@@ -1199,6 +1216,7 @@ impl Editor {
             let hunk_key = DiffHunkKey {
                 file_path: Arc::from(file_path),
                 hunk_start_anchor: start,
+                review_range_end_anchor: Some(end),
             };
             let stored_comment = StoredReviewComment {
                 id: comment.id,
@@ -1220,11 +1238,10 @@ impl Editor {
                         .any(|stashed| stashed == record_id)
                 }),
             };
-            if let Some((_, existing_comments)) = restored.iter_mut().find(|(existing, _)| {
-                existing.file_path == hunk_key.file_path
-                    && existing.hunk_start_anchor.to_point(&snapshot)
-                        == hunk_key.hunk_start_anchor.to_point(&snapshot)
-            }) {
+            if let Some((_, existing_comments)) = restored
+                .iter_mut()
+                .find(|(existing, _)| Self::hunk_keys_match(existing, &hunk_key, &snapshot))
+            {
                 existing_comments.push(stored_comment);
             } else {
                 restored.push((hunk_key, vec![stored_comment]));
@@ -1337,15 +1354,23 @@ impl Editor {
             .stored_review_comments
             .iter()
             .filter(|(_, comments)| !comments.is_empty())
-            .map(|(hunk, _)| {
+            .map(|(hunk, comments)| {
                 (
                     hunk.clone(),
                     DisplayRow(hunk.hunk_start_anchor.to_point(&snapshot).row),
+                    comments[0].range.clone(),
                 )
             })
             .collect::<Vec<_>>();
-        for (hunk_key, row) in comments_to_reveal {
-            self.show_diff_review_overlay_internal(row..row, false, Some(hunk_key), window, cx);
+        for (hunk_key, row, anchor_range) in comments_to_reveal {
+            self.show_diff_review_overlay_internal(
+                row..row,
+                false,
+                Some(hunk_key),
+                Some(anchor_range),
+                window,
+                cx,
+            );
         }
     }
 
@@ -1355,7 +1380,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_diff_review_overlay_internal(display_range, true, None, window, cx);
+        self.show_diff_review_overlay_internal(display_range, true, None, None, window, cx);
     }
 
     fn show_diff_review_overlay_internal(
@@ -1363,6 +1388,7 @@ impl Editor {
         display_range: Range<DisplayRow>,
         composer_visible: bool,
         restored_hunk_key: Option<DiffHunkKey>,
+        restored_anchor_range: Option<Range<Anchor>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1378,15 +1404,16 @@ impl Editor {
         let end_point = editor_snapshot
             .display_snapshot
             .display_point_to_point(end.as_display_point(), Bias::Left);
-        let end_multi_buffer_row = MultiBufferRow(end_point.row);
-
         // Create anchor range for the selected lines (start of first line to end of last line)
         let line_end = Point::new(
             end_point.row,
-            buffer_snapshot.line_len(end_multi_buffer_row),
+            buffer_snapshot.line_len(MultiBufferRow(end_point.row)),
         );
-        let anchor_range =
+        let selected_anchor_range =
             buffer_snapshot.anchor_after(start_point)..buffer_snapshot.anchor_before(line_end);
+        let anchor_range = restored_anchor_range.unwrap_or(selected_anchor_range);
+        let start_point = anchor_range.start.to_point(&buffer_snapshot);
+        let end_point = anchor_range.end.to_point(&buffer_snapshot);
 
         // Compute the hunk key for this display row
         let file_path = match self.review_file_path_at(start_point, cx) {
@@ -1399,7 +1426,11 @@ impl Editor {
         {
             return;
         }
-        let hunk_start_anchor = buffer_snapshot.anchor_before(start_point);
+        let hunk_start_anchor = review_overlay_group_anchor(
+            self.is_stack_review,
+            buffer_snapshot.anchor_before(start_point),
+            anchor_range.start,
+        );
         let new_hunk_key = if let Some(restored_hunk_key) = restored_hunk_key {
             if restored_hunk_key.file_path != file_path {
                 return;
@@ -1409,12 +1440,14 @@ impl Editor {
             DiffHunkKey {
                 file_path,
                 hunk_start_anchor,
+                review_range_end_anchor: self.is_stack_review.then_some(anchor_range.end),
             }
         };
 
         // Check if we already have an overlay for this hunk
         if let Some(overlay_index) = self.diff_review_overlays.iter().position(|overlay| {
             Self::hunk_keys_match(&overlay.hunk_key, &new_hunk_key, &buffer_snapshot)
+                && Self::review_ranges_match(&overlay.anchor_range, &anchor_range, &buffer_snapshot)
         }) {
             let (prompt_editor, hunk_key, composer_was_hidden) = {
                 let existing_overlay = &mut self.diff_review_overlays[overlay_index];
@@ -1473,6 +1506,7 @@ impl Editor {
 
         // Create anchor at the end of the last row so the block appears immediately below it
         // Use multibuffer coordinates for anchor creation
+        let end_multi_buffer_row = MultiBufferRow(end_point.row);
         let line_len = buffer_snapshot.line_len(end_multi_buffer_row);
         let anchor = buffer_snapshot.anchor_after(Point::new(end_multi_buffer_row.0, line_len));
 
@@ -1620,7 +1654,7 @@ impl Editor {
         self.add_review_comment_with_metadata(
             hunk_key.clone(),
             comment_text,
-            anchor_range,
+            anchor_range.clone(),
             author,
             StackReviewCommentSource::LocalHuman,
             reply_to,
@@ -1633,7 +1667,14 @@ impl Editor {
             self.remove_blocks(HashSet::from_iter([overlay.block_id]), None, cx);
             let snapshot = self.buffer.read(cx).snapshot(cx);
             let row = DisplayRow(hunk_key.hunk_start_anchor.to_point(&snapshot).row);
-            self.show_diff_review_overlay_internal(row..row, false, Some(hunk_key), window, cx);
+            self.show_diff_review_overlay_internal(
+                row..row,
+                false,
+                Some(hunk_key),
+                Some(anchor_range),
+                window,
+                cx,
+            );
             window.focus(&self.focus_handle(cx), cx);
             cx.notify();
             return;
@@ -1667,6 +1708,17 @@ impl Editor {
         self.diff_review_overlays
             .first()
             .map(|overlay| &overlay.prompt_editor)
+    }
+
+    #[cfg(test)]
+    pub(super) fn stack_review_inline_edit_editor(
+        &self,
+        record_id: &str,
+    ) -> Option<Entity<Editor>> {
+        let key = ReviewCommentKey::Stable(record_id.to_owned());
+        self.diff_review_overlays
+            .iter()
+            .find_map(|overlay| overlay.inline_edit_editors.get(&key).cloned())
     }
 
     pub fn visible_stack_review_comment_count(&self, cx: &App) -> usize {
@@ -1761,13 +1813,13 @@ impl Editor {
         );
 
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let key_point = hunk_key.hunk_start_anchor.to_point(&snapshot);
 
         // Find existing entry for this hunk or add a new one
-        if let Some((_, comments)) = self.stored_review_comments.iter_mut().find(|(k, _)| {
-            k.file_path == hunk_key.file_path
-                && k.hunk_start_anchor.to_point(&snapshot) == key_point
-        }) {
+        if let Some((_, comments)) = self
+            .stored_review_comments
+            .iter_mut()
+            .find(|(key, _)| Self::hunk_keys_match(key, &hunk_key, &snapshot))
+        {
             comments.push(stored_comment);
         } else {
             self.stored_review_comments
@@ -2135,12 +2187,9 @@ impl Editor {
         key: &DiffHunkKey,
         snapshot: &MultiBufferSnapshot,
     ) -> &'a [StoredReviewComment] {
-        let key_point = key.hunk_start_anchor.to_point(snapshot);
         self.stored_review_comments
             .iter()
-            .find(|(k, _)| {
-                k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
-            })
+            .find(|(candidate, _)| Self::hunk_keys_match(candidate, key, snapshot))
             .map(|(_, comments)| comments.as_slice())
             .unwrap_or(&[])
     }
@@ -2151,12 +2200,9 @@ impl Editor {
         key: &DiffHunkKey,
         snapshot: &MultiBufferSnapshot,
     ) -> usize {
-        let key_point = key.hunk_start_anchor.to_point(snapshot);
         self.stored_review_comments
             .iter()
-            .find(|(k, _)| {
-                k.file_path == key.file_path && k.hunk_start_anchor.to_point(snapshot) == key_point
-            })
+            .find(|(candidate, _)| Self::hunk_keys_match(candidate, key, snapshot))
             .map(|(_, v)| v.len())
             .unwrap_or(0)
     }
@@ -3882,6 +3928,20 @@ impl Editor {
     fn hunk_keys_match(a: &DiffHunkKey, b: &DiffHunkKey, snapshot: &MultiBufferSnapshot) -> bool {
         a.file_path == b.file_path
             && a.hunk_start_anchor.to_point(snapshot) == b.hunk_start_anchor.to_point(snapshot)
+            && match (a.review_range_end_anchor, b.review_range_end_anchor) {
+                (Some(a), Some(b)) => a.to_point(snapshot) == b.to_point(snapshot),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    fn review_ranges_match(
+        a: &Range<Anchor>,
+        b: &Range<Anchor>,
+        snapshot: &MultiBufferSnapshot,
+    ) -> bool {
+        a.start.to_point(snapshot) == b.start.to_point(snapshot)
+            && a.end.to_point(snapshot) == b.end.to_point(snapshot)
     }
 
     fn render_diff_review_overlay(
@@ -4401,7 +4461,9 @@ impl Editor {
         let resolution_record_id = comment.record_id.clone();
         let edit_record_id = comment.record_id.clone();
         let delete_record_id = comment.record_id.clone();
-        let selection_record_id = comment.record_id.clone();
+        let selection_record_id = stack_review_comment_row_is_activatable(is_editing)
+            .then(|| comment.record_id.clone())
+            .flatten();
         let keyboard_selection_record_id = selection_record_id.clone();
         let stash_record_id = comment.record_id.clone();
         let content_selector = if is_stack_review {

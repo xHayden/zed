@@ -815,6 +815,52 @@ fn stack_review_layer_pull_requests(
     }
 }
 
+fn stack_review_scope_endpoints(
+    snapshot: &StackSnapshot,
+) -> Vec<(StackReviewScope, String, String)> {
+    let mut endpoints = Vec::new();
+    for from in 0..snapshot.layers.len() {
+        for to in from.saturating_add(1)..=snapshot.layers.len() {
+            let Some((base_oid, head_oid)) = snapshot.refs_between(from, to) else {
+                continue;
+            };
+            let scope = if to == from.saturating_add(1) {
+                StackReviewScope::Layer(from)
+            } else if from == 0 {
+                StackReviewScope::AggregateThrough(to.saturating_sub(1))
+            } else {
+                StackReviewScope::Range { from, to }
+            };
+            endpoints.push((scope, base_oid.to_owned(), head_oid.to_owned()));
+        }
+    }
+    endpoints
+}
+
+#[cfg(test)]
+fn commented_stack_review_scopes<'a>(
+    snapshot: &StackSnapshot,
+    records: impl IntoIterator<Item = &'a StackReviewCommentRecord>,
+) -> Vec<(StackReviewScope, usize)> {
+    let endpoint_scopes = stack_review_scope_endpoints(snapshot);
+
+    let mut counts = Vec::<(StackReviewScope, usize)>::new();
+    for record in records {
+        let Some((scope, _, _)) = endpoint_scopes.iter().find(|(_, base_oid, head_oid)| {
+            base_oid == &record.base_oid && head_oid == &record.head_oid
+        }) else {
+            continue;
+        };
+        if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| candidate == scope) {
+            *count += 1;
+        } else {
+            counts.push((*scope, 1));
+        }
+    }
+    counts.sort_by_key(|(scope, _)| scope.boundaries());
+    counts
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StackReviewTimeFilter {
     All,
@@ -1688,6 +1734,44 @@ async fn load_all_comment_records(
         );
     }
     Ok(records)
+}
+
+async fn load_commented_stack_review_scope_counts(
+    fs: &Arc<dyn Fs>,
+    state_root: &Path,
+    endpoints: &[(StackReviewScope, String, String)],
+) -> (Vec<(StackReviewScope, usize)>, Option<SharedString>) {
+    let mut counts = Vec::new();
+    let mut failed_scope_count = 0usize;
+    for (scope, base_oid, head_oid) in endpoints {
+        let storage_key = stack_review_storage_key(base_oid, head_oid);
+        match load_all_comment_records(
+            fs,
+            &state_root.join("comments").join(&storage_key),
+            &state_root.join("github").join(&storage_key),
+            base_oid,
+            head_oid,
+        )
+        .await
+        {
+            Ok(records) if !records.is_empty() => counts.push((*scope, records.len())),
+            Ok(_) => {}
+            Err(error) => {
+                failed_scope_count += 1;
+                log::warn!(
+                    "unable to index comments for inactive Stack Review scope {base_oid}..{head_oid}: {error:#}"
+                );
+            }
+        }
+    }
+    let error = (failed_scope_count > 0).then(|| {
+        format!(
+            "Commented Diffs index incomplete · {failed_scope_count} unreadable scope{}",
+            if failed_scope_count == 1 { "" } else { "s" }
+        )
+        .into()
+    });
+    (counts, error)
 }
 
 fn merge_reloaded_local_comments(
@@ -3276,6 +3360,8 @@ struct LoadedStackReview {
     file_comment_statuses: HashMap<String, FileCommentSummary>,
     visible_comment_count: usize,
     stashed_thread_count: usize,
+    commented_scope_counts: Vec<(StackReviewScope, usize)>,
+    commented_scope_error: Option<SharedString>,
     commenter_cutoffs: Vec<CommenterCutoff>,
     reviewer_login: Option<String>,
     github_snapshot_key: String,
@@ -3434,6 +3520,8 @@ pub struct StackReview {
     review_comment_count: usize,
     visible_comment_count: usize,
     stashed_thread_count: usize,
+    commented_scope_counts: Vec<(StackReviewScope, usize)>,
+    commented_scope_error: Option<SharedString>,
     rendered_left_comment_ids: HashSet<usize>,
     rendered_right_comment_ids: HashSet<usize>,
     comment_records: HashMap<String, LoadedCommentRecord>,
@@ -4460,6 +4548,8 @@ impl StackReview {
             review_comment_count: 0,
             visible_comment_count: 0,
             stashed_thread_count: 0,
+            commented_scope_counts: Vec::new(),
+            commented_scope_error: None,
             rendered_left_comment_ids: HashSet::new(),
             rendered_right_comment_ids: HashSet::new(),
             comment_records: HashMap::new(),
@@ -4629,9 +4719,17 @@ impl StackReview {
         let hide_migrations = self.hide_migrations;
         let split_left_ratio = self.split_left_ratio;
         let layer_pull_requests = stack_review_layer_pull_requests(&self.snapshot, scope);
+        let commented_scope_endpoints = stack_review_scope_endpoints(&self.snapshot);
         self.load_task = cx.spawn_in(window, async move |this, cx| {
             let result: Result<LoadedStackReview> = async {
                 let diff = receiver.await??;
+                let (commented_scope_counts, commented_scope_error) =
+                    load_commented_stack_review_scope_counts(
+                        &fs,
+                        &state_root,
+                        &commented_scope_endpoints,
+                    )
+                    .await;
                 let counts = diff.provenance_counts();
                 let mut provenance_parts = Vec::new();
                 if counts.merge > 0 {
@@ -4803,6 +4901,8 @@ impl StackReview {
                     file_comment_statuses,
                     visible_comment_count: comment_projection.visible_comment_count,
                     stashed_thread_count: comment_projection.stashed_thread_count,
+                    commented_scope_counts,
+                    commented_scope_error,
                     commenter_cutoffs,
                     reviewer_login,
                     github_snapshot_key,
@@ -4862,6 +4962,8 @@ impl StackReview {
                     this.file_comment_statuses = loaded.file_comment_statuses;
                     this.visible_comment_count = loaded.visible_comment_count;
                     this.stashed_thread_count = loaded.stashed_thread_count;
+                    this.commented_scope_counts = loaded.commented_scope_counts;
+                    this.commented_scope_error = loaded.commented_scope_error;
                     this.commenter_cutoffs = loaded.commenter_cutoffs;
                     this.reviewer_login = loaded.reviewer_login;
                     this.comments_directory = Some(loaded.comments_directory);
@@ -4999,6 +5101,21 @@ impl StackReview {
             self.state_error = Some("Unable to project comments without review state".into());
             return;
         };
+        if let Some((active_scope, _, _)) = stack_review_scope_endpoints(&self.snapshot)
+            .into_iter()
+            .find(|(_, base_oid, head_oid)| {
+                base_oid == &review_state.base_oid && head_oid == &review_state.head_oid
+            })
+        {
+            self.commented_scope_counts
+                .retain(|(scope, _)| *scope != active_scope);
+            if !self.comment_records.is_empty() {
+                self.commented_scope_counts
+                    .push((active_scope, self.comment_records.len()));
+            }
+            self.commented_scope_counts
+                .sort_by_key(|(scope, _)| scope.boundaries());
+        }
         let Some(presentation_state) = self.confirmed_presentation_state.as_ref() else {
             self.state_error = Some("Unable to project comments without presentation state".into());
             return;
@@ -5721,9 +5838,12 @@ impl StackReview {
 
     fn add_comment_at_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(diff_view) = &self.diff_view {
-            diff_view.read(cx).editor().update(cx, |editor, cx| {
-                editor.show_stack_review_comment_at_cursor(window, cx);
-            });
+            diff_view
+                .read(cx)
+                .focused_editor(cx)
+                .update(cx, |editor, cx| {
+                    editor.show_stack_review_comment_at_cursor(window, cx);
+                });
         }
     }
 
@@ -6850,6 +6970,96 @@ impl StackReview {
         )
     }
 
+    fn commented_scope_choices(&self) -> Vec<(StackReviewScope, usize)> {
+        let mut choices = self.commented_scope_counts.clone();
+        if !self.comment_records.is_empty()
+            && let Some(review_state) = self.review_state.as_ref()
+            && let Some((active_scope, _, _)) = stack_review_scope_endpoints(&self.snapshot)
+                .into_iter()
+                .find(|(_, base_oid, head_oid)| {
+                    base_oid == &review_state.base_oid && head_oid == &review_state.head_oid
+                })
+        {
+            choices.retain(|(scope, _)| *scope != active_scope);
+            choices.push((active_scope, self.comment_records.len()));
+        }
+        choices.sort_by_key(|(scope, _)| scope.boundaries());
+        choices
+    }
+
+    fn commented_scope_label(&self, scope: StackReviewScope, count: usize) -> SharedString {
+        let boundary_label = |index: usize| {
+            self.snapshot
+                .boundary(index)
+                .map(|boundary| {
+                    boundary.pull_request_number.map_or_else(
+                        || boundary.branch.clone(),
+                        |number| format!("PR #{number} · {}", boundary.branch),
+                    )
+                })
+                .unwrap_or_else(|| "Missing boundary".into())
+        };
+        let scope_label = match scope {
+            StackReviewScope::Layer(index) => boundary_label(index.saturating_add(1)),
+            StackReviewScope::AggregateThrough(index) => format!(
+                "{} → {}",
+                boundary_label(0),
+                boundary_label(index.saturating_add(1))
+            ),
+            StackReviewScope::Range { from, to } => {
+                format!("{} → {}", boundary_label(from), boundary_label(to))
+            }
+        };
+        format!(
+            "{scope_label} · {count} comment{}",
+            if count == 1 { "" } else { "s" }
+        )
+        .into()
+    }
+
+    fn render_commented_scope_dropdown(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<DropdownMenu> {
+        let choices = self.commented_scope_choices();
+        if choices.is_empty() {
+            return None;
+        }
+        let selected_position = choices
+            .iter()
+            .position(|(scope, _)| scope.boundaries() == self.selected_scope.boundaries());
+        let entries = choices
+            .iter()
+            .map(|(scope, count)| (*scope, self.commented_scope_label(*scope, *count)))
+            .collect::<Vec<_>>();
+        let review = cx.weak_entity();
+        Some(DropdownMenu::new(
+            "stack-review-commented-diffs",
+            format!("Commented Diffs ({})", entries.len()),
+            ContextMenu::build(window, cx, move |mut menu, window, cx| {
+                for (scope, label) in &entries {
+                    let scope = *scope;
+                    let review = review.clone();
+                    menu = menu.entry(label.clone(), None, move |window, cx| {
+                        if let Err(error) = review.update(cx, |this, cx| {
+                            this.custom_from_boundary = None;
+                            this.load_scope(scope, window, cx);
+                        }) {
+                            log::error!("unable to select commented Stack Review diff: {error:#}");
+                        }
+                    });
+                }
+                if let Some(selected_position) = selected_position {
+                    for _ in 0..=selected_position {
+                        menu.select_next(&Default::default(), window, cx);
+                    }
+                }
+                menu
+            }),
+        ))
+    }
+
     fn render_header(
         &self,
         window: &mut Window,
@@ -6859,6 +7069,7 @@ impl StackReview {
         let current_scope = StackReviewScope::Layer(self.current_layer);
         let from_dropdown = self.render_boundary_dropdown(true, window, cx);
         let to_dropdown = self.render_boundary_dropdown(false, window, cx);
+        let commented_scope_dropdown = self.render_commented_scope_dropdown(window, cx);
         let ai_enabled = !DisableAiSettings::get_global(cx).disable_ai;
         let ai_context_active = self.ai_context.is_some();
         let ai_thread_ready = self
@@ -7031,6 +7242,16 @@ impl StackReview {
                 ))
                 .color(Color::Muted),
             )
+            .when_some(commented_scope_dropdown, |status, dropdown| {
+                status.child(
+                    div()
+                        .debug_selector(|| "STACK_REVIEW_COMMENTED_DIFFS".into())
+                        .child(dropdown),
+                )
+            })
+            .when_some(self.commented_scope_error.clone(), |status, error| {
+                status.child(Label::new(error).color(Color::Warning))
+            })
             .when_some(stashed_thread_menu, |status, menu| status.child(menu))
             .when(self.stashed_thread_count > 0, |status| {
                 status.child(
@@ -7679,6 +7900,132 @@ mod tests {
     }
 
     #[test]
+    fn commented_stack_review_scopes_count_saved_records_by_immutable_diff() {
+        let snapshot = StackSnapshot {
+            number: None,
+            trunk: git::stack_review::ResolvedStackBranch {
+                branch: "main".into(),
+                oid: "base".into(),
+                pull_request_number: None,
+            },
+            layers: vec![
+                git::stack_review::ResolvedStackLayer {
+                    base: git::stack_review::ResolvedStackBranch {
+                        branch: "main".into(),
+                        oid: "base".into(),
+                        pull_request_number: None,
+                    },
+                    head: git::stack_review::ResolvedStackBranch {
+                        branch: "feature-a".into(),
+                        oid: "head-a".into(),
+                        pull_request_number: Some(10),
+                    },
+                },
+                git::stack_review::ResolvedStackLayer {
+                    base: git::stack_review::ResolvedStackBranch {
+                        branch: "feature-a".into(),
+                        oid: "head-a".into(),
+                        pull_request_number: Some(10),
+                    },
+                    head: git::stack_review::ResolvedStackBranch {
+                        branch: "feature-b".into(),
+                        oid: "head-b".into(),
+                        pull_request_number: Some(11),
+                    },
+                },
+            ],
+        };
+        let record = |id: &str, base: &str, head: &str| {
+            StackReviewCommentRecord::new_inline(
+                id.into(),
+                base.into(),
+                head.into(),
+                "src/lib.rs".into(),
+                0,
+                0,
+                0,
+                1,
+                "Comment".into(),
+                StackReviewCommentAuthor::default(),
+                StackReviewCommentSource::LocalHuman,
+                None,
+                stack_review_timestamp(),
+            )
+        };
+        let records = [
+            record("layer-a-1", "base", "head-a"),
+            record("layer-a-2", "base", "head-a"),
+            record("aggregate", "base", "head-b"),
+            record("stale", "old-base", "old-head"),
+        ];
+
+        assert_eq!(
+            commented_stack_review_scopes(&snapshot, records.iter()),
+            vec![
+                (StackReviewScope::Layer(0), 2),
+                (StackReviewScope::AggregateThrough(1), 1),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn corrupt_inactive_commented_scope_does_not_block_active_scope_load(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        let state_root = Path::new("/repo/.git/zed-stack-review");
+        let valid_key = stack_review_storage_key("base", "head-a");
+        let corrupt_key = stack_review_storage_key("head-a", "head-b");
+        let valid_directory = state_root.join("comments").join(valid_key);
+        let corrupt_directory = state_root.join("comments").join(corrupt_key);
+        fs.create_dir(&valid_directory)
+            .await
+            .expect("valid directory");
+        fs.create_dir(&corrupt_directory)
+            .await
+            .expect("corrupt directory");
+        let record = StackReviewCommentRecord::new_inline(
+            Uuid::now_v7().to_string(),
+            "base".into(),
+            "head-a".into(),
+            "src/lib.rs".into(),
+            0,
+            0,
+            0,
+            1,
+            "Comment".into(),
+            StackReviewCommentAuthor::default(),
+            StackReviewCommentSource::LocalHuman,
+            None,
+            stack_review_timestamp(),
+        );
+        fs.atomic_write(
+            valid_directory.join(comment_file_name(&record)),
+            record.to_json().expect("serialize valid record"),
+        )
+        .await
+        .expect("write valid record");
+        fs.atomic_write(
+            corrupt_directory.join("local-corrupt.json"),
+            "not json".into(),
+        )
+        .await
+        .expect("write corrupt record");
+
+        let endpoints = vec![
+            (StackReviewScope::Layer(0), "base".into(), "head-a".into()),
+            (StackReviewScope::Layer(1), "head-a".into(), "head-b".into()),
+        ];
+        let (counts, error) =
+            load_commented_stack_review_scope_counts(&(fs as Arc<dyn Fs>), state_root, &endpoints)
+                .await;
+
+        assert_eq!(counts, vec![(StackReviewScope::Layer(0), 1)]);
+        assert!(error.is_some());
+    }
+
+    #[test]
     fn loading_indicator_stays_on_the_captured_turn_target() {
         let mut queued = pending_ai_test_context(
             git_ui_core::stack_review_ai::StackReviewAiContextKey::comment("base-head", "thread-a"),
@@ -7963,10 +8310,9 @@ mod tests {
 
     #[test]
     fn stack_review_agent_comment_prompt_requires_explicit_prefix() {
-        assert_eq!(
-            stack_review_agent_comment_prompt(" @agent explain this comment ").as_deref(),
-            Some("explain this comment")
-        );
+        let prompt = stack_review_agent_comment_prompt(" @agent explain this comment ")
+            .expect("explicit Agent prompt");
+        assert_eq!(prompt, "explain this comment");
         assert_eq!(stack_review_agent_comment_prompt("@agent"), None);
         assert_eq!(stack_review_agent_comment_prompt("normal comment"), None);
         assert_eq!(stack_review_agent_comment_prompt("@agentic behavior"), None);
@@ -11587,6 +11933,8 @@ mod tests {
                     review_comment_count: 0,
                     visible_comment_count: 0,
                     stashed_thread_count: 0,
+                    commented_scope_counts: Vec::new(),
+                    commented_scope_error: None,
                     rendered_left_comment_ids: HashSet::new(),
                     rendered_right_comment_ids: HashSet::new(),
                     comment_records: HashMap::new(),
@@ -11763,8 +12111,16 @@ mod tests {
                 window,
                 cx,
             );
+            review.commented_scope_counts = vec![(StackReviewScope::Layer(0), 2)];
+            cx.notify();
         });
         visual_context.run_until_parked();
+        assert!(
+            visual_context
+                .debug_bounds("STACK_REVIEW_COMMENTED_DIFFS")
+                .is_some_and(|bounds| bounds.size.width > px(0.) && bounds.size.height > px(0.)),
+            "commented diff picker must render once the active immutable scope has comments"
+        );
         review.update_in(&mut visual_context, |review, window, cx| {
             review.select_ai_comment_context(&ordinary_record_id, window, cx);
         });

@@ -4815,6 +4815,23 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_focused_editor_tracks_the_active_split_side(cx: &mut gpui::TestAppContext) {
+        let (editor, cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Split).await;
+        editor.update(cx, |editor, _cx| {
+            assert_eq!(
+                editor.focused_editor().entity_id(),
+                editor.rhs_editor.entity_id()
+            );
+            let lhs_id = {
+                let lhs = editor.lhs.as_mut().expect("left editor");
+                lhs.was_last_focused = true;
+                lhs.editor.entity_id()
+            };
+            assert_eq!(editor.focused_editor().entity_id(), lhs_id);
+        });
+    }
+
+    #[gpui::test]
     async fn test_mirrored_custom_block_renders_in_both_split_views(cx: &mut gpui::TestAppContext) {
         use gpui::ParentElement as _;
         use rope::Point;

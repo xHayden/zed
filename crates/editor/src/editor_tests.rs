@@ -40054,6 +40054,76 @@ async fn test_diff_review_button_shown_when_ai_enabled(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+async fn test_stack_review_multiline_anchor_survives_publish_and_editor_replacement(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({ "file.txt": "first\nsecond\nthird\n" }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace");
+    let cx = &mut VisualTestContext::from_window(*window, cx);
+    let editor = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(
+                PathBuf::from(path!("/root/file.txt")),
+                OpenOptions::default(),
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("open file")
+        .downcast::<Editor>()
+        .expect("editor");
+    let comment = ::git::stack_review::StackReviewComment {
+        id: 0,
+        record_id: Some("stable-multiline".into()),
+        path: "file.txt".into(),
+        start_row: 0,
+        start_column: 0,
+        end_row: 1,
+        end_column: 6,
+        body: "Multiline".into(),
+        created_at: String::new(),
+        resolved: false,
+        author: ::git::stack_review::StackReviewCommentAuthor::default(),
+        source: ::git::stack_review::StackReviewCommentSource::LocalHuman,
+        reply_to: None,
+        reply_to_record_id: None,
+    };
+
+    for _ in 0..2 {
+        editor.update_in(cx, |editor, window, cx| {
+            editor.enable_stack_review_mode(cx);
+            editor.replace_stack_review_comment_projection(
+                std::slice::from_ref(&comment),
+                &[],
+                window,
+                cx,
+            );
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+            let range = &editor.diff_review_overlays[0].anchor_range;
+            assert_eq!(range.start.to_point(&snapshot), Point::new(0, 0));
+            assert_eq!(range.end.to_point(&snapshot), Point::new(1, 6));
+            let projected = editor.stack_review_comments(cx);
+            assert_eq!(projected.len(), 1);
+            assert_eq!(projected[0].start_row, 0);
+            assert_eq!(projected[0].end_row, 1);
+        });
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
 async fn test_stack_review_mode_is_editor_local(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let fs = FakeFs::new(cx.executor());
@@ -40098,6 +40168,7 @@ fn test_hunk_key(file_path: &str) -> DiffHunkKey {
             Arc::from(util::rel_path::RelPath::from_unix_str(file_path).unwrap())
         },
         hunk_start_anchor: Anchor::Min,
+        review_range_end_anchor: None,
     }
 }
 
@@ -40110,6 +40181,7 @@ fn test_hunk_key_with_anchor(file_path: &str, anchor: Anchor) -> DiffHunkKey {
             Arc::from(util::rel_path::RelPath::from_unix_str(file_path).unwrap())
         },
         hunk_start_anchor: anchor,
+        review_range_end_anchor: None,
     }
 }
 
@@ -40538,6 +40610,129 @@ fn test_stack_review_submit_keeps_comment_inline_and_hides_composer(cx: &mut Tes
         .unwrap();
 }
 
+#[test]
+fn test_stack_review_new_comment_uses_selected_range_anchor() {
+    assert_eq!(
+        crate::git::review_overlay_group_anchor(true, Anchor::Min, Anchor::Max),
+        Anchor::Max
+    );
+    assert_eq!(
+        crate::git::review_overlay_group_anchor(false, Anchor::Min, Anchor::Max),
+        Anchor::Min
+    );
+}
+
+#[gpui::test]
+fn test_stack_review_comments_at_distinct_ranges_do_not_share_an_overlay(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| {
+        let buffer = cx.new(|cx| Buffer::local("first\nsecond\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, _window, cx| {
+            editor.enable_stack_review_mode(cx);
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            let diff_hunk_start = snapshot.anchor_before(Point::new(0, 0));
+            let first = snapshot.anchor_before(Point::new(0, 0));
+            let second = snapshot.anchor_before(Point::new(1, 0));
+            let file_path: Arc<util::rel_path::RelPath> =
+                Arc::from(util::rel_path::RelPath::empty());
+            editor.add_review_comment(
+                DiffHunkKey {
+                    file_path: file_path.clone(),
+                    hunk_start_anchor: crate::git::review_overlay_group_anchor(
+                        true,
+                        diff_hunk_start,
+                        first,
+                    ),
+                    review_range_end_anchor: Some(first),
+                },
+                "First".into(),
+                first..first,
+                cx,
+            );
+            editor.add_review_comment(
+                DiffHunkKey {
+                    file_path,
+                    hunk_start_anchor: crate::git::review_overlay_group_anchor(
+                        true,
+                        diff_hunk_start,
+                        second,
+                    ),
+                    review_range_end_anchor: Some(second),
+                },
+                "Second".into(),
+                second..second,
+                cx,
+            );
+            editor.add_review_comment(
+                DiffHunkKey {
+                    file_path: Arc::from(util::rel_path::RelPath::empty()),
+                    hunk_start_anchor: crate::git::review_overlay_group_anchor(
+                        true,
+                        diff_hunk_start,
+                        first,
+                    ),
+                    review_range_end_anchor: Some(second),
+                },
+                "Expanded first".into(),
+                first..second,
+                cx,
+            );
+            assert_eq!(editor.stored_review_comments.len(), 3);
+            assert_eq!(editor.stored_review_comments[0].1[0].comment, "First");
+            assert_eq!(editor.stored_review_comments[1].1[0].comment, "Second");
+            assert_eq!(
+                editor.stored_review_comments[2].1[0].comment,
+                "Expanded first"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_stack_review_inline_edit_accepts_space(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    let record_id = editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            editor.enable_stack_review_mode(cx);
+            let prompt_editor = editor
+                .diff_review_prompt_editor()
+                .cloned()
+                .expect("review prompt");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("Original", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+            let record_id = editor.stored_review_comments[0].1[0]
+                .record_id
+                .clone()
+                .expect("stable record id");
+            editor.edit_stack_review_comment(&record_id, window, cx);
+            record_id
+        })
+        .unwrap();
+    editor
+        .update(cx, |editor, window, cx| {
+            assert!(!crate::git::stack_review_comment_row_is_activatable(true));
+            let inline_editor = editor
+                .stack_review_inline_edit_editor(&record_id)
+                .expect("inline editor");
+            assert!(inline_editor.focus_handle(cx).is_focused(window));
+            inline_editor.update(cx, |inline_editor, cx| {
+                inline_editor.insert(" ", window, cx);
+            });
+            assert_eq!(inline_editor.read(cx).text(cx), " ");
+        })
+        .unwrap();
+}
+
 #[gpui::test]
 fn test_stack_review_reply_persists_parent_and_author(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
@@ -40879,6 +41074,12 @@ fn test_stack_review_agent_projection_renders_inside_target_comment(cx: &mut Tes
         let mut loading = HashSet::default();
         loading.insert("agent-target".into());
         editor.replace_stack_review_agent_projection(projections, loading, cx);
+        assert_eq!(editor.stored_review_comments.len(), 1);
+        assert_eq!(editor.stored_review_comments[0].1.len(), 1);
+        assert_eq!(
+            editor.stored_review_comments[0].1[0].comment,
+            "@agent explain this"
+        );
     });
 
     cx.run_until_parked();
@@ -41953,6 +42154,7 @@ fn test_orphaned_comments_are_cleaned_up(cx: &mut TestAppContext) {
             let key = DiffHunkKey {
                 file_path: Arc::from(util::rel_path::RelPath::empty()),
                 hunk_start_anchor: anchor,
+                review_range_end_anchor: None,
             };
             editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
             assert_eq!(editor.total_review_comment_count(), 1);
@@ -41996,6 +42198,7 @@ fn test_orphaned_comments_cleanup_called_on_buffer_edit(cx: &mut TestAppContext)
             let key = DiffHunkKey {
                 file_path: Arc::from(util::rel_path::RelPath::empty()),
                 hunk_start_anchor: anchor,
+                review_range_end_anchor: None,
             };
             editor.add_review_comment(key, "Comment on line 2".to_string(), anchor..anchor, cx);
             assert_eq!(editor.total_review_comment_count(), 1);
@@ -42038,10 +42241,12 @@ fn test_comments_stored_for_multiple_hunks(cx: &mut TestAppContext) {
         let key1 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file1.rs").unwrap()),
             hunk_start_anchor: anchor,
+            review_range_end_anchor: None,
         };
         let key2 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file2.rs").unwrap()),
             hunk_start_anchor: anchor,
+            review_range_end_anchor: None,
         };
 
         // Add comments to first hunk
@@ -42110,10 +42315,12 @@ fn test_same_hunk_detected_by_matching_keys(cx: &mut TestAppContext) {
         let key1 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file.rs").unwrap()),
             hunk_start_anchor: anchor,
+            review_range_end_anchor: None,
         };
         let key2 = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("file.rs").unwrap()),
             hunk_start_anchor: anchor,
+            review_range_end_anchor: None,
         };
 
         // Add comment to first key
@@ -42131,6 +42338,7 @@ fn test_same_hunk_detected_by_matching_keys(cx: &mut TestAppContext) {
         let different_file_key = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::from_unix_str("other.rs").unwrap()),
             hunk_start_anchor: anchor,
+            review_range_end_anchor: None,
         };
 
         // Different file should not find the comment
@@ -42378,6 +42586,7 @@ fn test_calculate_overlay_height(cx: &mut TestAppContext) {
         let key = DiffHunkKey {
             file_path: Arc::from(util::rel_path::RelPath::empty()),
             hunk_start_anchor: anchor,
+            review_range_end_anchor: None,
         };
 
         // No comments: base height of 2
