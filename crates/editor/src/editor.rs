@@ -942,6 +942,7 @@ pub struct Editor {
     select_next_state: Option<SelectNextState>,
     select_prev_state: Option<SelectNextState>,
     selection_history: SelectionHistory,
+    started_transactions: Vec<Option<TransactionId>>,
     defer_selection_effects: bool,
     deferred_selection_effects_state: Option<DeferredSelectionEffectsState>,
     autoclose_regions: Vec<AutocloseRegion>,
@@ -1431,6 +1432,40 @@ impl SelectionHistory {
         transaction_id: TransactionId,
     ) -> Option<&mut TransactionSelections> {
         self.selections_by_transaction.get_mut(&transaction_id)
+    }
+
+    fn finish_transaction(
+        &mut self,
+        started_transaction_id: Option<TransactionId>,
+        completed_transaction_id: TransactionId,
+        redo: Arc<[Selection<Anchor>]>,
+    ) -> bool {
+        let Some(started_transaction_id) = started_transaction_id else {
+            return false;
+        };
+        let Some(mut started_transaction) = self
+            .selections_by_transaction
+            .remove(&started_transaction_id)
+        else {
+            return false;
+        };
+        if let Some(completed_transaction) = self
+            .selections_by_transaction
+            .get_mut(&completed_transaction_id)
+        {
+            completed_transaction.redo = Some(redo);
+        } else {
+            started_transaction.redo = Some(redo);
+            self.selections_by_transaction
+                .insert(completed_transaction_id, started_transaction);
+        }
+        true
+    }
+
+    fn discard_transaction(&mut self, transaction_id: Option<TransactionId>) {
+        if let Some(transaction_id) = transaction_id {
+            self.selections_by_transaction.remove(&transaction_id);
+        }
     }
 
     fn push(&mut self, entry: SelectionHistoryEntry) {
@@ -2266,6 +2301,7 @@ impl Editor {
             select_next_state: None,
             select_prev_state: None,
             selection_history: SelectionHistory::default(),
+            started_transactions: Vec::new(),
             defer_selection_effects: false,
             deferred_selection_effects_state: None,
             autoclose_regions: Vec::new(),
@@ -8408,10 +8444,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<TransactionId> {
         self.end_selection(window, cx);
-        if let Some(tx_id) = self
+        let transaction_id = self
             .buffer
-            .update(cx, |buffer, cx| buffer.start_transaction_at(now, cx))
-        {
+            .update(cx, |buffer, cx| buffer.start_transaction_at(now, cx));
+        self.started_transactions.push(transaction_id);
+        if let Some(tx_id) = transaction_id {
             self.selection_history
                 .insert_transaction(tx_id, self.selections.disjoint_anchors_arc());
             cx.emit(EditorEvent::TransactionBegun {
@@ -8428,19 +8465,24 @@ impl Editor {
         now: Instant,
         cx: &mut Context<Self>,
     ) -> Option<TransactionId> {
+        let started_transaction_id = self.started_transactions.pop().flatten();
         if let Some(transaction_id) = self
             .buffer
             .update(cx, |buffer, cx| buffer.end_transaction_at(now, cx))
         {
-            if let Some(transaction) = self.selection_history.transaction_mut(transaction_id) {
-                transaction.redo = Some(self.selections.disjoint_anchors_arc());
-            } else {
+            if !self.selection_history.finish_transaction(
+                started_transaction_id,
+                transaction_id,
+                self.selections.disjoint_anchors_arc(),
+            ) {
                 log::error!("unexpectedly ended a transaction that wasn't started by this editor");
             }
 
             cx.emit(EditorEvent::Edited { transaction_id });
             Some(transaction_id)
         } else {
+            self.selection_history
+                .discard_transaction(started_transaction_id);
             None
         }
     }

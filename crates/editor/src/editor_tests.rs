@@ -217,6 +217,54 @@ fn test_edit_events(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_grouped_shared_buffer_transaction_preserves_each_editors_selection_history(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let buffer = cx.new(|cx| {
+        let mut buffer = language::Buffer::local("123456", cx);
+        buffer.set_group_interval(Duration::from_secs(1));
+        buffer
+    });
+    let editor1 = cx.add_window({
+        let buffer = buffer.clone();
+        move |window, cx| Editor::for_buffer(buffer, None, window, cx)
+    });
+    let editor2 = cx.add_window(move |window, cx| Editor::for_buffer(buffer, None, window, cx));
+
+    let first_transaction_id = editor1
+        .update(cx, |editor, window, cx| {
+            editor.insert("X", window, cx);
+            editor
+                .buffer()
+                .read(cx)
+                .last_transaction_id(cx)
+                .expect("first transaction")
+        })
+        .unwrap();
+    let grouped_transaction_id = editor2
+        .update(cx, |editor, window, cx| {
+            editor.delete(&Delete, window, cx);
+            editor
+                .buffer()
+                .read(cx)
+                .last_transaction_id(cx)
+                .expect("grouped transaction")
+        })
+        .unwrap();
+
+    assert_eq!(grouped_transaction_id, first_transaction_id);
+    assert!(
+        editor2
+            .update(cx, |editor, _window, _cx| {
+                editor.modify_transaction_selection_history(grouped_transaction_id, |_| {})
+            })
+            .unwrap(),
+        "editor 2 must retain selection history under the grouped canonical transaction ID"
+    );
+}
+
+#[gpui::test]
 fn test_undo_redo_with_selection_restoration(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
